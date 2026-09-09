@@ -51,7 +51,7 @@
 - [x] 5.1 Run every exact scenario filter listed in `verification.md`; each must report at least one executed test.
 - [x] 5.2 Run `cargo fmt --all -- --check`, strict Clippy for both crates, both crate suites with `--no-fail-fast`, and `git diff --check`.
 - [x] 5.3 Wire the exact portable lock/release/path-identity/request filters into Linux `Check` and Windows `MCP transports + secure broker`, and validate the workflow with `actionlint`.
-- [x] 5.4 Run the exact `inventory::no_new_runtime_or_compatibility_surface` audit against the recorded base; confirm no new dependency, runtime thread/scheduler, persistent format, lease record, configuration knob, or MCP wire change.
+- [x] 5.4 Audit this change against the recorded base for new dependencies, runtime threads/schedulers, persistent formats, lease records, configuration knobs, and MCP wire changes. This is a one-time PR diff review, not a permanent restriction on later changes.
 - [x] 5.5 Fill actual evidence in `verification.md` and run `openspec validate enforce-workspace-lease-operation-profiles --strict --no-interactive`.
 
 ## 6. Maintainer review closure
@@ -59,5 +59,15 @@
 - [x] 6.1 Close the five blocking review findings: keep broker accept cached-only, require non-zero CI filters, preserve retryable startup transactions, re-arm graph recovery only on fresh work, and remove alias tests.
 - [x] 6.2 Strengthen the held-lock and caller-inventory gates without restoring request-time lease work.
 
+## 7. Inventory portability and prepared-build retention
+
+- [x] 7.1 Remove the historical Git-baseline audit from permanent unit tests; keep source inventories working without Git history and with native Windows paths and CRLF checkouts.
+- [x] 7.2 Add all remaining inventory tests to both Linux and Windows CI with non-zero exact filters.
+- [x] 7.3 Retry only the prepared index swap on transient refusal, preserving the existing deadline and pending rerun; prove no rebuild or repeated paid call and no lost fresh-work signal.
+- [x] 7.4 Run focused regressions, crate suites, strict workspace Clippy, formatting, workflow lint, and OpenSpec validation; record evidence.
+- [x] 7.5 Isolate temporary graph databases for overlapping backend generations in one process; prove refused/failed builds preserve another build's file and rerun the superseded-daemon lifecycle integration.
+
 <!-- GOAL_CURSOR -->
-All implementation tasks are complete. Publication, live CI, maintainer acceptance, and issue closure are later delivery actions, not gates for completing this local implementation change.
+Tasks 0-7 are complete with final local verification recorded on 2026-09-09.
+The user authorized publication of the follow-up and live CI verification. Maintainer acceptance
+and issue closure remain separate delivery actions.

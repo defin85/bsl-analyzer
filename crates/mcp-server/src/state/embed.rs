@@ -1160,88 +1160,102 @@ impl SharedState {
                         },
                     ) {
                         Ok(bsl_search::FenceOutcome::Applied(index)) => {
-                            #[cfg(test)]
-                            if let Some(hook) = EMBED_FENCE_HOOK
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .as_mut()
-                            {
-                                hook(EmbedFencePoint::Swap);
-                            }
                             let mut prepared_index = Some(index);
-                            let swapped = match engine.lock() {
-                                Ok(mut guard) => match guard.as_mut() {
-                                    Some(engine) => worker_lease.publish_short(
-                                        &mut prepared_index,
-                                        |prepared| {
-                                            engine.set_vector_index(
-                                                prepared.take().expect("prepared index exists"),
+                            // Retry only the swap: keep the built index and any pending rerun.
+                            loop {
+                                #[cfg(test)]
+                                if let Some(hook) = EMBED_FENCE_HOOK
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .as_mut()
+                                {
+                                    hook(EmbedFencePoint::Swap);
+                                }
+                                let swapped = match engine.lock() {
+                                    Ok(mut guard) => match guard.as_mut() {
+                                        Some(engine) => worker_lease.publish_short(
+                                            &mut prepared_index,
+                                            |prepared| {
+                                                engine.set_vector_index(
+                                                    prepared.take().expect("prepared index exists"),
+                                                );
+                                                Ok::<_, std::convert::Infallible>(())
+                                            },
+                                        ),
+                                        None => {
+                                            tracing::warn!("embedding pass: engine unavailable");
+                                            Self::set_semantic_runtime_status(
+                                                &runtime,
+                                                SemanticRuntimeStatus::Failed(
+                                                    "embedding engine unavailable".to_owned(),
+                                                ),
                                             );
-                                            Ok::<_, std::convert::Infallible>(())
-                                        },
-                                    ),
-                                    None => {
-                                        tracing::warn!("embedding pass: engine unavailable");
+                                            status_guard.finish();
+                                            return;
+                                        }
+                                    },
+                                    Err(e) => {
+                                        tracing::warn!("embedding pass: engine lock error: {e}");
+                                        Self::set_semantic_runtime_status(
+                                            &runtime,
+                                            SemanticRuntimeStatus::Failed(format!(
+                                                "embedding engine lock error: {e}"
+                                            )),
+                                        );
+                                        status_guard.finish();
+                                        return;
+                                    }
+                                };
+                                match swapped {
+                                    crate::workspace_lease::LeaseOperationOutcome::Applied(()) => {
+                                        #[cfg(test)]
+                                        {
+                                            let mut hook = EMBED_POST_PASS_HOOK
+                                                .lock()
+                                                .unwrap_or_else(|p| p.into_inner());
+                                            if let Some(h) = hook.as_mut() {
+                                                h(&db_path);
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    crate::workspace_lease::LeaseOperationOutcome::TransientRefusal => {
+                                        let delay = super::overlay_retry::retry_delay(publish_retry.streak());
+                                        if let RetryDecision::RetryAfter(delay) =
+                                            publish_retry.refused(Instant::now(), delay)
+                                        {
+                                            std::thread::sleep(delay);
+                                            if !publish_retry.expired(Instant::now()) {
+                                                continue;
+                                            }
+                                        }
+                                        retry_refusal = true;
+                                        break;
+                                    }
+                                    crate::workspace_lease::LeaseOperationOutcome::Superseded
+                                    | crate::workspace_lease::LeaseOperationOutcome::Released => {
                                         Self::set_semantic_runtime_status(
                                             &runtime,
                                             SemanticRuntimeStatus::Failed(
-                                                "embedding engine unavailable".to_owned(),
+                                                "embedding stopped after workspace ownership was superseded"
+                                                    .to_owned(),
                                             ),
                                         );
                                         status_guard.finish();
                                         return;
                                     }
-                                },
-                                Err(e) => {
-                                    tracing::warn!("embedding pass: engine lock error: {e}");
-                                    Self::set_semantic_runtime_status(
-                                        &runtime,
-                                        SemanticRuntimeStatus::Failed(format!(
-                                            "embedding engine lock error: {e}"
-                                        )),
-                                    );
-                                    status_guard.finish();
-                                    return;
-                                }
-                            };
-                            match swapped {
-                                crate::workspace_lease::LeaseOperationOutcome::Applied(()) => {
-                                    #[cfg(test)]
-                                    {
-                                        let mut hook = EMBED_POST_PASS_HOOK
-                                            .lock()
-                                            .unwrap_or_else(|p| p.into_inner());
-                                        if let Some(h) = hook.as_mut() {
-                                            h(&db_path);
-                                        }
+                                    crate::workspace_lease::LeaseOperationOutcome::OperationError(
+                                        error,
+                                    ) => {
+                                        Self::set_semantic_runtime_status(
+                                            &runtime,
+                                            SemanticRuntimeStatus::Failed(format!(
+                                                "embedding publication failed: {error:?}"
+                                            )),
+                                        );
+                                        status_guard.finish();
+                                        return;
                                     }
-                                }
-                                crate::workspace_lease::LeaseOperationOutcome::TransientRefusal => {
-                                    retry_refusal = true;
-                                }
-                                crate::workspace_lease::LeaseOperationOutcome::Superseded
-                                | crate::workspace_lease::LeaseOperationOutcome::Released => {
-                                    Self::set_semantic_runtime_status(
-                                        &runtime,
-                                        SemanticRuntimeStatus::Failed(
-                                            "embedding stopped after workspace ownership was superseded"
-                                                .to_owned(),
-                                        ),
-                                    );
-                                    status_guard.finish();
-                                    return;
-                                }
-                                crate::workspace_lease::LeaseOperationOutcome::OperationError(
-                                    error,
-                                ) => {
-                                    Self::set_semantic_runtime_status(
-                                        &runtime,
-                                        SemanticRuntimeStatus::Failed(format!(
-                                            "embedding publication failed: {error:?}"
-                                        )),
-                                    );
-                                    status_guard.finish();
-                                    return;
                                 }
                             }
                         }
@@ -1370,6 +1384,7 @@ mod tests {
         fn drop(&mut self) {
             super::FORCE_EMBED_PREFLIGHT_REFUSALS.store(0, Ordering::SeqCst);
             super::FORCE_EMBED_PUBLICATION_REFUSALS.store(0, Ordering::SeqCst);
+            *super::EMBED_FENCE_HOOK.lock().unwrap_or_else(|p| p.into_inner()) = None;
         }
     }
 
@@ -3415,6 +3430,84 @@ mod tests {
             .load_pending_embedding_documents("code")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn prepared_index_survives_transient_swap_without_rebuild() {
+        use super::EmbedFencePoint;
+
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        for request_rerun in [false, true] {
+            let _reset = ResetEmbeddingRefusals;
+            let (server, calls) = spawn_counting_embedding_server();
+            let dir = tempdir().unwrap();
+            let cache = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path());
+            cache.ensure().unwrap();
+            let db_path = cache.search_db_path();
+            seed_pending_embedding(&db_path);
+            let engine = Arc::new(Mutex::new(Some(
+                SearchEngine::new(&db_path, mock_semantic_config(&server)).unwrap(),
+            )));
+            let runtime = Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Indexing));
+            let flight = super::EmbedFlight::new();
+            let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let observed = Arc::clone(&events);
+            let hook_lease = lease.clone();
+            let hook_flight = Arc::clone(&flight);
+            let mut held = None;
+            let mut swaps = 0;
+            *super::EMBED_FENCE_HOOK.lock().unwrap() = Some(Box::new(move |point| {
+                observed.lock().unwrap().push(point);
+                // Let a regressed rebuild finish so the event assertion diagnoses it directly.
+                if matches!(point, EmbedFencePoint::Apply(_)) {
+                    drop(held.take());
+                }
+                if point == EmbedFencePoint::Swap {
+                    swaps += 1;
+                    if swaps == 1 {
+                        held = Some(hook_lease.hold_file_lock_for_test());
+                        if request_rerun {
+                            assert!(!hook_flight.claim());
+                        }
+                    } else {
+                        drop(held.take());
+                    }
+                }
+            }));
+            SharedState::spawn_embed_pass(
+                Arc::clone(&engine),
+                Arc::clone(&runtime),
+                bsl_search::IndexProgress::new(),
+                Arc::clone(&flight),
+                lease.clone(),
+                db_path,
+                mock_semantic_config(&server),
+                Duration::from_secs(10),
+            );
+            wait_for_embed_flight(&flight);
+
+            assert!(matches!(*runtime.lock().unwrap(), crate::state::SemanticRuntimeStatus::Ready));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(engine.lock().unwrap().as_ref().unwrap().vector_count(), 1);
+            let events = events.lock().unwrap();
+            let swaps: Vec<_> = events
+                .iter()
+                .enumerate()
+                .filter_map(|(i, point)| (*point == EmbedFencePoint::Swap).then_some(i))
+                .collect();
+            assert_eq!(
+                swaps.len(),
+                2 + usize::from(request_rerun),
+                "fresh work must survive retry"
+            );
+            assert_eq!(
+                swaps[1],
+                swaps[0] + 1,
+                "retry must not re-enter embedding or sidecar publication"
+            );
+            lease.release();
+        }
     }
 
     #[test]

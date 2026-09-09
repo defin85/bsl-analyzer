@@ -17,8 +17,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
@@ -37,6 +35,11 @@ jobs:
           run_exact tools::graph::tests::graph_data_requests_are_pool_only_under_held_lease
           run_exact tools::search::tests::all_search_modes_are_resident_only_under_held_lease
           run_exact tests::all_status_requests_are_cached_under_held_lease
+          run_exact inventory::no_generic_or_unclassified_production_lease_callers
+          run_exact inventory::fence_callers_are_exactly_classified
+          run_exact inventory::request_paths_do_not_call_lease_or_mutation_helpers
+          run_exact inventory::production_prefix_handles_checkout_line_endings
+          run_exact state::embed::tests::prepared_index_survives_transient_swap_without_rebuild
       - run: cargo test --all --no-fail-fast
 
   windows-mcp:
@@ -127,6 +130,11 @@ jobs:
           run_exact tools::graph::tests::graph_data_requests_are_pool_only_under_held_lease
           run_exact tools::search::tests::all_search_modes_are_resident_only_under_held_lease
           run_exact tests::all_status_requests_are_cached_under_held_lease
+          run_exact inventory::no_generic_or_unclassified_production_lease_callers
+          run_exact inventory::fence_callers_are_exactly_classified
+          run_exact inventory::request_paths_do_not_call_lease_or_mutation_helpers
+          run_exact inventory::production_prefix_handles_checkout_line_endings
+          run_exact state::embed::tests::prepared_index_survives_transient_swap_without_rebuild
 
   partitioned-baseline-scale:
     name: Partitioned baseline 1.6M release gate

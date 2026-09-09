@@ -42,12 +42,14 @@ Every spec scenario has exactly one row. Identifiers are planned until implement
 | Gate | Task | Exact planned evidence |
 |---|---:|---|
 | Fence callers remain exact and request paths remain lease-free | 2.11 | `inventory::fence_callers_are_exactly_classified`; `inventory::request_paths_do_not_call_lease_or_mutation_helpers` |
-| Runtime and compatibility surface is unchanged | 5.4 | `inventory::no_new_runtime_or_compatibility_surface` |
+| Source inventory works with platform checkout conventions | 7.1 | `inventory::production_prefix_handles_checkout_line_endings`; all inventory filters in Linux and Windows CI |
+| Prepared index survives swap contention and retains fresh work | 7.3 | `state::embed::tests::prepared_index_survives_transient_swap_without_rebuild` |
+| Runtime and compatibility surface is unchanged in this PR | 5.4 | One-time review of the PR diff against its merge base; not a permanent unit test |
 
 ## Required Commands
 
 - Run each Rust identifier above with an exact or fully qualified filter and confirm a non-zero test count.
-- Run all `inventory::*` identifiers above and fail on any match outside the documented allow-list. The compatibility inventory executes `git diff --exit-code edc78e22f3efbfe51ffd8e6dfd05b457976195ca -- Cargo.lock` and audits the exact added diff for thread/spawn APIs, schema/version DDL, lease-record fields, environment/config reads, and MCP serialization types.
+- Run all `inventory::*` identifiers above and fail on any match outside the documented allow-list. These tests only read checked-out Rust sources: Git history, Git executables, and a fixed `Cargo.lock` are not prerequisites. Review this PR's dependency/runtime/schema/configuration/wire diff separately against its merge base; future intentional changes are not forbidden by this PR's historical scope.
 - In Linux `Check` and Windows `MCP transports + secure broker`, run each of the six portable identifiers in row 32 as `cargo test -p mcp-server <identifier> -- --exact` and require a non-zero test count.
 - `cargo fmt --all -- --check`
 - `cargo clippy -p bsl-search -p mcp-server --all-targets --all-features -- -D warnings`
@@ -63,8 +65,11 @@ After a later explicit publication request, match the PR head SHA to the locally
 
 ## Current Status
 
-Implementation, v0.2.77 cancellation integration, maintainer-review repairs, and local verification
-are complete. Republishing the PR branch and live CI remain pending.
+PR head `949e30bb` was published and passed Linux and Windows CI on 2026-09-04.
+The 2026-09-08 follow-up for inventory portability and prepared-index retention is implemented
+locally; nine focused regressions pass on Rust 1.98. Full MCP verification is not green because
+of inotify exhaustion and a failing forced-retry references test. Publication and native Windows
+CI for this follow-up remain pending.
 
 ## Evidence Collected
 
@@ -124,3 +129,52 @@ are complete. Republishing the PR branch and live CI remain pending.
   terminal bit; CI exact filters reject zero executed tests; startup retries rerun the transaction;
   graph operation/changed failures wait for genuinely fresh work; alias tests were deleted. The
   held-lock status/graph tests and exact fence/request-path inventories close MID-1, MID-2, and MID-4.
+
+## 2026-09-08 Scoped Follow-up Evidence
+
+- Inventory no longer invokes Git or compares a lockfile to a historical SHA. All four tests
+  also passed in a source-only fixture with no `.git`, CRLF Rust files, and a deliberately changed
+  `Cargo.lock`. Native `Path` comparison replaces platform-dependent string comparison.
+- The prepared-index regression failed on the original loop: an apply event appeared between
+  two swap attempts. It passes after the fix, with and without a pending rerun; the real lease
+  lock causes refusal, only the swap is retried, and the paid embedding endpoint is called once.
+- Nine non-zero exact filters passed on Rust 1.98: all four inventory tests, prepared-index
+  retention, paid-vector retention, publication deadline, supersession, and the mid-flight rerun.
+  Linux and Windows CI now include the inventory and prepared-index filters.
+- `bsl-search` passed 405 tests with 29 ignored. The full MCP run was not accepted: its library
+  had 822 passed / 171 failed / 1 ignored, and integration targets had 154 passed / 1 failed.
+  A library-only rerun with four test threads still had 145 failures; reducing concurrency did
+  not remove the environment problem.
+- Temporary diagnostic output identified notify `MaxFilesWatch`. The host had 1,048,405 visible
+  watch references against a per-user limit of 1,048,576. The diagnostic changes were removed;
+  system limits and other processes were not changed. The poisoned-lock failures in the broad
+  run do not replace the separate, passing focused regression results.
+- The `references` integration target's `a_name_declared_after_the_last_scan_is_found_on_a_forced_retry`
+  test also failed in isolation: a newly added method returned `not_found` with graph `not_ready`. Its cause has not
+  been established by this follow-up; no references or watcher production code was changed.
+- Rust 1.98 is selected for both Cargo and its child tools by explicit toolchain paths; selecting
+  Cargo alone picked up a different `rustc` from this host's PATH. Clean workspace
+  `RUSTFLAGS='-D warnings' cargo clippy --all-targets --all-features` passed with Clippy 0.1.98,
+  using separate target and temporary directories on the workspace disk. Rustfmt 1.98,
+  workflow actionlint, strict OpenSpec validation, and `git diff --check` passed.
+
+## 2026-09-09 Final Follow-up Verification
+
+- The host inotify shortage was corrected in the active VS Code profile outside this repository.
+  The forced-retry references test passed unchanged both alone and in the complete suite.
+- The first post-inotify suite exposed a separate, reproducible graph build collision: overlapping
+  backend generations within one process used the same PID-only temporary SQLite path. Tracing
+  captured `disk I/O error` and `attempt to write a readonly database` during their concurrent
+  reloads. Temporary tracing instrumentation was removed after diagnosis.
+- Full and incremental graph builds now share a PID-plus-build-counter path allocator. The
+  superseded-build regression failed deterministically with the old PID-only path, then passed
+  with the fix; it also proves refusal and fused failure leave another build's file untouched.
+  No dependency, worker, persistent cache schema, lease record, configuration, or wire change
+  was introduced.
+- The final Rust 1.98 `cargo test -p bsl-search -p mcp-server --all-features --no-fail-fast`
+  passed: `bsl-search` 405 passed / 29 ignored, MCP library 993 passed / 1 ignored, and all
+  integration targets passed, including `superseded_daemon_lifecycle` and the references retry.
+- Strict workspace Clippy (`RUSTFLAGS='-D warnings' cargo clippy --all-targets --all-features`)
+  passed after the graph fix. Formatting, workflow lint, strict OpenSpec validation, and diff
+  checks passed. The earlier non-zero exact-filter and source-only/CRLF inventory evidence
+  remains applicable; the final library suite includes the inventory and prepared-index tests.

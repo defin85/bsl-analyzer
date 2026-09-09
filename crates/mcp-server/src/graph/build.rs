@@ -23,6 +23,13 @@ use super::types::GraphStatus;
 /// while the resident method index resolves cross-batch calls.
 pub(super) const GRAPH_BUILD_BATCH: usize = 500;
 
+fn graph_build_path(path: &Path) -> PathBuf {
+    // Backend generations can overlap within one process as well as across processes.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let build = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_extension(format!("db.building.{}.{build}", std::process::id()))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LoadFailureReason {
     TransientRefusal,
@@ -467,7 +474,7 @@ impl GraphState {
         // mirroring the full build's straddle detection: a write landing after the
         // pre-scan marks the snapshot stale.
         let fp_pre = super::scan::fingerprint_of(&pre.stats, &project.configs);
-        let tmp_path = db_path.with_extension(format!("db.building.{}", std::process::id()));
+        let tmp_path = graph_build_path(&db_path);
         let built_at = chrono::Utc::now().to_rfc3339();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let summary = crate::graph_db::update_graph_database_bodies(
@@ -806,10 +813,7 @@ fn build_and_publish_scanned(
 ) -> Result<PublishedBuild, LoadFailure> {
     let fp_pre = super::scan::fingerprint_of(&pre.stats, &project.configs);
     let out_path = graph.graph_db_path().expect("workspace graph has cache layout");
-    // Pid-suffixed temp: two daemons over the same workspace (an old topology
-    // generation draining while a new one starts) must not interleave writes into
-    // one temp file — each builds its own and the atomic rename decides.
-    let tmp_path = out_path.with_extension(format!("db.building.{}", std::process::id()));
+    let tmp_path = graph_build_path(&out_path);
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent).map_err(LoadFailure::operation)?;
     }
@@ -1329,9 +1333,13 @@ mod tests {
         );
 
         let graph_path = cache.graph_db_path();
-        let tmp_path = graph_path.with_extension(format!("db.building.{}", std::process::id()));
         assert!(!graph_path.exists(), "the rejected build never replaces the canonical graph");
-        assert!(!tmp_path.exists(), "the rejected build removes only its current temp graph");
+        assert!(
+            fs::read_dir(graph_path.parent().unwrap()).unwrap().all(|entry| {
+                !entry.unwrap().file_name().to_string_lossy().starts_with("bsl-graph.db.building.")
+            }),
+            "the rejected build removes its temp graph",
+        );
 
         newer.lock().unwrap().take().unwrap().release();
     }
@@ -1357,7 +1365,10 @@ mod tests {
         let graph = GraphState::for_workspace_with_cache(root.to_path_buf(), cache.clone())
             .with_lease(old.clone());
         let canonical = cache.graph_db_path();
-        let temp = canonical.with_extension(format!("db.building.{}", std::process::id()));
+        let temp = graph_build_path(&canonical);
+        let other_temp = graph_build_path(&canonical);
+        assert_ne!(temp, other_temp, "same-process builds must not share a temporary database");
+        fs::write(&other_temp, b"other-build-in-progress").unwrap();
 
         fs::write(&canonical, b"new-owner-graph").unwrap();
         fs::write(&temp, b"old-daemon-graph").unwrap();
@@ -1369,11 +1380,20 @@ mod tests {
         publish_or_discard(&graph, &temp, &canonical).unwrap_err();
         assert_eq!(fs::read(&canonical).unwrap(), b"new-owner-graph");
         assert!(!temp.exists(), "normal refusal removes only this build's temp file");
+        assert_eq!(fs::read(&other_temp).unwrap(), b"other-build-in-progress");
 
         let mut sink = RefusingSink;
         assert!(build_and_publish_graph_file(root, 1, &graph, Some(&mut sink)).is_err());
         assert_eq!(fs::read(&canonical).unwrap(), b"new-owner-graph");
-        assert!(!temp.exists(), "fused failure before publication removes its temp file");
+        assert!(
+            fs::read_dir(canonical.parent().unwrap()).unwrap().all(|entry| {
+                let entry = entry.unwrap();
+                entry.path() == other_temp
+                    || !entry.file_name().to_string_lossy().starts_with("bsl-graph.db.building.")
+            }),
+            "fused failure removes its temp file and leaves the other build alone",
+        );
+        assert_eq!(fs::read(&other_temp).unwrap(), b"other-build-in-progress");
     }
 
     #[test]
