@@ -178,3 +178,15 @@ CI for this follow-up remain pending.
   passed after the graph fix. Formatting, workflow lint, strict OpenSpec validation, and diff
   checks passed. The earlier non-zero exact-filter and source-only/CRLF inventory evidence
   remains applicable; the final library suite includes the inventory and prepared-index tests.
+
+## 2026-09-09 CI Fixture Follow-up
+
+- CI on `c123df62` passed Windows and the Linux formatting, Clippy, and exact-filter gates.
+  The full Linux suite exposed `names_resolve_before_the_graph_exists`: its fixture assumed
+  the background graph would still be unavailable after the independent resident became ready,
+  but the graph provider had already reached `answered`.
+- The four cold-graph name-dictionary scenarios now hold the real cache lease lock before
+  backend construction. Dictionary answers remain available while graph publication is
+  withheld; the two positive controls release the lock and still require `answered` afterward.
+  All six `name_dictionary` transport tests passed with the deterministic fixture. Production
+  behavior is unchanged. Windows CI explicitly runs this suite to verify its lock behavior too.

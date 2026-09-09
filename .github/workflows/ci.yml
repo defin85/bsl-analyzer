@@ -67,6 +67,8 @@ jobs:
         run: cargo test -p mcp-server --test http
       - name: Broker runtime tests
         run: cargo test -p mcp-server --test broker
+      - name: Name dictionary before graph publication
+        run: cargo test -p mcp-server --test name_dictionary
       - name: Superseded workspace lease lifecycle
         run: >-
           cargo test -p mcp-server workspace_lease::tests::observed_foreign_owner_is_permanent &&

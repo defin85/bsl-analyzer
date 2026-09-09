@@ -66,6 +66,7 @@
 - [x] 7.3 Retry only the prepared index swap on transient refusal, preserving the existing deadline and pending rerun; prove no rebuild or repeated paid call and no lost fresh-work signal.
 - [x] 7.4 Run focused regressions, crate suites, strict workspace Clippy, formatting, workflow lint, and OpenSpec validation; record evidence.
 - [x] 7.5 Isolate temporary graph databases for overlapping backend generations in one process; prove refused/failed builds preserve another build's file and rerun the superseded-daemon lifecycle integration.
+- [x] 7.6 Make cold-graph name-dictionary fixtures hold a real lease lock before startup, release it for ready-graph controls, and cover the transport suite on Windows too.
 
 <!-- GOAL_CURSOR -->
 Tasks 0-7 are complete with final local verification recorded on 2026-09-09.
