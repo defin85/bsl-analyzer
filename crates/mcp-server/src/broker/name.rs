@@ -138,34 +138,93 @@ const SUN_PATH_MAX: usize = 104;
 const SUN_PATH_MAX: usize = 104;
 
 /// Which parent directory a broker socket lives under. The variants are ordered by the
-/// precedence in [`socket_dir_source`]; `Xdg` and `CanonicalRunUser` are both kernel/systemd
-/// managed and uid-private, so they share the trusted-parent handling.
+/// precedence in [`socket_dir_source`]; every one but `SharedTemp` is already uid-private,
+/// so they share the trusted-parent handling.
 enum SocketDirSource {
     /// `$XDG_RUNTIME_DIR` was set.
     Xdg(PathBuf),
     /// `$XDG_RUNTIME_DIR` was unset, but the canonical `/run/user/<euid>` runtime dir exists
     /// and is ours — the same tmpfs the env var would have pointed to.
     CanonicalRunUser(PathBuf),
-    /// No per-user runtime dir at all (headless / non-systemd / macOS): use shared temp.
-    TmpFallback,
+    /// No per-user runtime dir, but the system temp dir is itself private to our uid — the
+    /// shape macOS hands every user through `$TMPDIR`.
+    PrivateTemp(PathBuf),
+    /// A temp dir shared with other users (`/tmp`): our own tagged directory goes under it.
+    SharedTemp(PathBuf),
 }
 
 /// Pure precedence decision (no filesystem or env access, so it is unit-testable): an explicit
 /// `$XDG_RUNTIME_DIR` wins, else the canonical per-user runtime dir if one was found, else the
-/// shared-temp fallback. The middle tier is what lets a spawner that *drops* `$XDG_RUNTIME_DIR`
+/// temp dir — as a trusted parent when it is already uid-private, as a shared one otherwise.
+/// The `/run/user/<euid>` tier is what lets a spawner that *drops* `$XDG_RUNTIME_DIR`
 /// (e.g. Codex launching the backend) still rendezvous with one that keeps it at the standard
-/// `/run/user/<euid>`, instead of forking a second multi-GB backend under `/tmp`. It does NOT
-/// converge a process that deliberately points `$XDG_RUNTIME_DIR` at a *non-standard* path with
-/// one that dropped the variable — the explicit env still wins above, which is the right call
-/// and an unavoidable split short of propagating the variable.
-fn socket_dir_source(xdg: Option<PathBuf>, canonical_run_user: Option<PathBuf>) -> SocketDirSource {
+/// path, instead of forking a second multi-GB backend under `/tmp`. It does NOT converge a
+/// process that deliberately points `$XDG_RUNTIME_DIR` at a *non-standard* path with one that
+/// dropped the variable — the explicit env still wins above, which is the right call and an
+/// unavoidable split short of propagating the variable.
+fn socket_dir_source(
+    xdg: Option<PathBuf>,
+    canonical_run_user: Option<PathBuf>,
+    temp: PathBuf,
+    temp_is_uid_private: bool,
+) -> SocketDirSource {
     if let Some(base) = xdg {
         return SocketDirSource::Xdg(base);
     }
     if let Some(base) = canonical_run_user {
         return SocketDirSource::CanonicalRunUser(base);
     }
-    SocketDirSource::TmpFallback
+    if temp_is_uid_private {
+        return SocketDirSource::PrivateTemp(temp);
+    }
+    SocketDirSource::SharedTemp(temp)
+}
+
+/// Directory name that holds the sockets themselves, under whichever parent
+/// [`socket_dir_source`] picked.
+const SOCKET_DIR_LEAF: &str = "bsl-mcp";
+
+/// Where the sockets go, and what we have to create and validate ourselves to get there.
+struct SocketDirLayout {
+    /// Per-user directory that must exist and be ours before the leaf is created. `None`
+    /// when the parent is already uid-private: it has no co-tenants to separate, so the
+    /// tag would buy nothing and only spend `sun_path` bytes.
+    tagged_base: Option<PathBuf>,
+    /// The socket directory itself.
+    dir: PathBuf,
+}
+
+/// Compose the layout for a source. Pure, so both the precedence and the `sun_path` cost of
+/// the result are unit-testable without touching the filesystem.
+///
+/// Tagging a *private* parent is what used to push macOS past its budget: `$TMPDIR` there is
+/// already a fixed 49-byte per-user path, and `bsl-mcp-<user>/bsl-mcp/<digest>.sock` on top of
+/// it came to 111 bytes against Darwin's 104.
+fn socket_dir_layout(source: SocketDirSource, who: &str) -> SocketDirLayout {
+    match source {
+        SocketDirSource::Xdg(base)
+        | SocketDirSource::CanonicalRunUser(base)
+        | SocketDirSource::PrivateTemp(base) => {
+            SocketDirLayout { tagged_base: None, dir: base.join(SOCKET_DIR_LEAF) }
+        }
+        SocketDirSource::SharedTemp(base) => {
+            let tagged = base.join(format!("bsl-mcp-{who}"));
+            let dir = tagged.join(SOCKET_DIR_LEAF);
+            SocketDirLayout { tagged_base: Some(tagged), dir }
+        }
+    }
+}
+
+/// Single safe path component naming the user, for the shared-temp layout. Sanitized to
+/// alnum/`_`/`-` so a spoofed `USER=../x` cannot escape the temp dir.
+fn user_tag() -> String {
+    let raw = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default();
+    let mut who: String =
+        raw.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
+    if who.is_empty() {
+        who.push_str("default");
+    }
+    who
 }
 
 /// The canonical per-user runtime dir `/run/user/<euid>` — the path `$XDG_RUNTIME_DIR` is set to
@@ -186,47 +245,69 @@ fn canonical_run_user_dir() -> Option<PathBuf> {
 }
 
 /// Per-user directory that holds broker sockets. Prefers `$XDG_RUNTIME_DIR`, then the canonical
-/// `/run/user/<euid>` (so a dropped env var doesn't split the rendezvous), then a uid/user-scoped
-/// subdir of the system temp dir. Created `0700` on unix so a co-tenant cannot enumerate or
-/// connect to another user's backend.
+/// `/run/user/<euid>` (so a dropped env var doesn't split the rendezvous), then the system temp
+/// dir — directly when that is already uid-private, otherwise under a user-scoped subdir of it.
+/// Created `0700` on unix so a co-tenant cannot enumerate or connect to another user's backend.
 pub fn runtime_socket_dir() -> io::Result<PathBuf> {
     #[cfg(unix)]
-    let canonical = canonical_run_user_dir();
+    let (canonical, temp_is_uid_private) = (canonical_run_user_dir(), temp_dir_is_uid_private());
     #[cfg(not(unix))]
-    let canonical = None;
+    let (canonical, temp_is_uid_private) = (None, false);
 
-    match socket_dir_source(dirs::runtime_dir(), canonical) {
-        // Both are kernel/systemd managed and already uid-private; trust them as the parent
-        // and create/validate only our own leaf under it.
-        SocketDirSource::Xdg(base) | SocketDirSource::CanonicalRunUser(base) => {
-            let dir = base.join("bsl-mcp");
-            create_private_dir(&dir)?;
-            Ok(dir)
-        }
-        // Fall back into a shared temp dir. Every level we descend through must be ours —
-        // otherwise an attacker who owns an ancestor could swap our socket dir after it is
-        // validated. So validate the sanitized base (rejecting an attacker-pre-created one)
-        // before creating the leaf, never descending recursively through an unvalidated
-        // parent. `/tmp`'s sticky bit then prevents anyone from renaming a base we own.
-        SocketDirSource::TmpFallback => {
-            // The user tag must be a safe single path component — sanitize to alnum/_/-
-            // so a spoofed `USER=../x` cannot escape the temp dir.
-            let raw =
-                std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default();
-            let mut who: String = raw
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-                .collect();
-            if who.is_empty() {
-                who.push_str("default");
-            }
-            let base = std::env::temp_dir().join(format!("bsl-mcp-{who}"));
-            create_private_dir(&base)?;
-            let dir = base.join("bsl-mcp");
-            create_private_dir(&dir)?;
-            Ok(dir)
-        }
+    let source = socket_dir_source(
+        dirs::runtime_dir(),
+        canonical,
+        std::env::temp_dir(),
+        temp_is_uid_private,
+    );
+    let layout = socket_dir_layout(source, &user_tag());
+    // Every level we create must be ours — otherwise an attacker who owns an ancestor could
+    // swap our socket dir after it is validated. So validate the tagged base (rejecting an
+    // attacker-pre-created one) before creating the leaf, never descending recursively through
+    // an unvalidated parent. `/tmp`'s sticky bit then prevents anyone from renaming a base we
+    // own. A trusted parent contributes no level of its own.
+    if let Some(base) = &layout.tagged_base {
+        create_private_dir(base)?;
     }
+    create_private_dir(&layout.dir)?;
+    Ok(layout.dir)
+}
+
+/// The path with any trailing separators removed.
+///
+/// `lstat` on a path that ends in a separator must resolve to a directory, so POSIX makes it
+/// follow the final component — and a check written to see a symlink would read straight
+/// through the one it exists to reject. A path that is nothing but separators IS the root and
+/// is returned unchanged.
+#[cfg(unix)]
+fn without_trailing_separators(path: &Path) -> &Path {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    let end = bytes.iter().rposition(|byte| *byte != b'/').map_or(0, |last| last + 1);
+    if end == 0 {
+        return path;
+    }
+    Path::new(OsStr::from_bytes(&bytes[..end]))
+}
+
+/// Whether the system temp dir is itself private to our uid — the shape macOS gives every user
+/// through `$TMPDIR` (`/var/folders/<…>/T`, mode `0700` and owned by us). Held to the same bar as
+/// [`canonical_run_user_dir`]: `symlink_metadata` so a symlink cannot stand in for the dir, plus
+/// owner and mode. `/tmp` is world-writable and so fails it, keeping the tagged layout there.
+///
+/// The separator is trimmed first because launchd hands `$TMPDIR` over WITH one, and
+/// `std::env::temp_dir` passes the spelling through untouched — asking about the path as
+/// given would follow the very link the check rejects.
+#[cfg(unix)]
+fn temp_dir_is_uid_private() -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let temp_dir = std::env::temp_dir();
+    let Ok(meta) = std::fs::symlink_metadata(without_trailing_separators(&temp_dir)) else {
+        return false;
+    };
+    meta.is_dir() && meta.uid() == current_euid() && (meta.permissions().mode() & 0o777) == 0o700
 }
 
 /// Current effective uid. `geteuid()` has no failure mode or preconditions.
@@ -482,20 +563,94 @@ mod tests {
         use super::{socket_dir_source, SocketDirSource};
         let xdg = PathBuf::from("/run/user/1000");
         let canonical = PathBuf::from("/run/user/1000");
+        let tmp = PathBuf::from("/tmp");
 
         // $XDG_RUNTIME_DIR set → it wins outright.
         assert!(matches!(
-            socket_dir_source(Some(xdg.clone()), Some(canonical.clone())),
+            socket_dir_source(Some(xdg.clone()), Some(canonical.clone()), tmp.clone(), false),
             SocketDirSource::Xdg(p) if p == xdg
         ));
         // The regression this fix targets: a spawner (e.g. Codex) dropped $XDG_RUNTIME_DIR but
         // the canonical /run/user/<euid> is there — use it, NOT the /tmp fallback, so both
         // processes meet at the same socket instead of forking a second backend.
         assert!(matches!(
-            socket_dir_source(None, Some(canonical.clone())),
+            socket_dir_source(None, Some(canonical.clone()), tmp.clone(), false),
             SocketDirSource::CanonicalRunUser(p) if p == canonical
         ));
-        // Neither available → shared-temp fallback.
-        assert!(matches!(socket_dir_source(None, None), SocketDirSource::TmpFallback));
+        // Neither available, and the temp dir is shared → tag it with the user.
+        assert!(matches!(
+            socket_dir_source(None, None, tmp.clone(), false),
+            SocketDirSource::SharedTemp(p) if p == tmp
+        ));
+    }
+
+    /// Darwin's `sun_path`, the tightest budget of any supported platform. Asserted by name so
+    /// the rule below still holds when the test happens to run on a roomier host.
+    const DARWIN_SUN_PATH_MAX: usize = 104;
+
+    /// A private per-user temp dir carries no co-tenants, so the socket dir hangs directly off
+    /// it. macOS depends on that: `$TMPDIR` there is a fixed 49-byte path, and inserting a
+    /// `bsl-mcp-<user>` level took the socket to 111 bytes — past Darwin's `sun_path`, so the
+    /// broker could not bind at all under the platform's own default temp dir.
+    #[test]
+    fn a_private_temp_dir_keeps_the_socket_inside_the_sun_path_budget() {
+        use super::{socket_dir_layout, socket_dir_source, SocketDirSource};
+        // The shape Darwin builds for every user: `/var/folders/<2>/<30>/T/`, 49 bytes fixed.
+        let tmp = PathBuf::from("/var/folders/ab/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/T/");
+        let source = socket_dir_source(None, None, tmp.clone(), true);
+        assert!(matches!(source, SocketDirSource::PrivateTemp(_)));
+
+        let leaf = format!("{}.sock", key("/srv/erp", McpProfile::Workspace, 7).digest());
+        let layout = socket_dir_layout(source, "user");
+        assert!(layout.tagged_base.is_none(), "a uid-private parent needs no user tag");
+
+        let socket = layout.dir.join(&leaf);
+        let len = socket.as_os_str().as_encoded_bytes().len();
+        assert!(
+            len < DARWIN_SUN_PATH_MAX,
+            "socket path is {len} bytes, over the {DARWIN_SUN_PATH_MAX}-byte budget: {}",
+            socket.display()
+        );
+
+        // The tag is what overflowed: the same temp dir treated as shared does not fit.
+        let tagged = socket_dir_layout(SocketDirSource::SharedTemp(tmp), "user");
+        assert!(tagged.dir.join(&leaf).as_os_str().as_encoded_bytes().len() >= DARWIN_SUN_PATH_MAX);
+    }
+
+    /// The privacy check must see the path it was given, not what the path points at.
+    ///
+    /// launchd hands `$TMPDIR` over with a trailing separator, and `lstat` on such a path
+    /// resolves its final component — so the anti-symlink half of the check would never fire
+    /// on the one platform it was written for.
+    #[cfg(unix)]
+    #[test]
+    fn a_trailing_separator_does_not_let_a_link_stand_in_for_the_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("t");
+        std::fs::create_dir(&target).unwrap();
+        let link = dir.path().join("l");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let with_separator = PathBuf::from(format!("{}/", link.display()));
+        assert!(
+            !std::fs::symlink_metadata(&with_separator).unwrap().file_type().is_symlink(),
+            "the hazard being trimmed for: asked with the separator, lstat follows the link",
+        );
+        assert_eq!(
+            without_trailing_separators(&with_separator),
+            link,
+            "the trimmed path is the link itself",
+        );
+        assert!(
+            std::fs::symlink_metadata(without_trailing_separators(&with_separator))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "trimmed, the check sees the link it exists to reject",
+        );
+
+        // A path that is nothing but separators is the root, and keeps every one of them.
+        assert_eq!(without_trailing_separators(Path::new("/")), Path::new("/"));
+        assert_eq!(without_trailing_separators(Path::new("/tmp")), Path::new("/tmp"));
     }
 }

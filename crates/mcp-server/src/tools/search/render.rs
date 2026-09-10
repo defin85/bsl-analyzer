@@ -28,7 +28,7 @@ use std::path::Path;
 pub(super) fn graph_id_for_hit(
     hit: &SearchHit,
     roots: Option<&bsl_search::WorkspaceRoots>,
-    graph_root: Option<&Path>,
+    graph_root: Option<&ide::StripRoot>,
 ) -> Option<String> {
     if hit.symbol_name.is_empty() {
         return None;
@@ -47,8 +47,13 @@ pub(super) fn graph_id_for_hit(
     // and that checkout may declare extensions this reader does not. Then the answer is the
     // rootless one below — a module-keyed id, never a path-keyed one — because a path built
     // from someone else's root is a wrong file dressed as a right one.
-    let anchored = roots
-        .and_then(|roots| roots.resolve(&bsl_search::FileKey::new(&hit.root_id, &hit.file_path)));
+    //
+    // The root's WALKED spelling anchors it, not its declared one. Both halves of an id are
+    // facts about the generation that registered this table, and the declared spelling is the
+    // one that can still move under a link afterwards.
+    let anchored = roots.and_then(|roots| {
+        roots.resolve_walked(&bsl_search::FileKey::new(&hit.root_id, &hit.file_path))
+    });
     match anchored {
         Some(abs) => ide::method_graph_id(&abs.to_string_lossy(), &hit.symbol_name, graph_root),
         None => ide::method_graph_id(&hit.file_path, &hit.symbol_name, None)
@@ -341,9 +346,22 @@ fn enrich_platform_reference(json: &mut Value, kind: &str, title: &str) {
 pub(super) fn format_code_hits(
     hits: &[FusedHit],
     roots: Option<&bsl_search::WorkspaceRoots>,
-    graph_root: Option<&Path>,
     max_output_tokens: usize,
 ) -> RenderedHits {
+    // The strip base is the root table's, not the daemon's live workspace path: the table came
+    // with the index answer being rendered and read the disk once, when that index was
+    // registered. Re-reading the workspace spelling here would strip an indexed generation's
+    // paths against the tree as it stands now — and a workspace reached through a retargeted
+    // link then mints nothing at all.
+    //
+    // Base and anchor therefore come from ONE table, which is what can be guaranteed from here:
+    // which generation that table belongs to is settled by whoever assembled the hits.
+    //
+    // It follows that hits arriving with no table get no base either, which is what the
+    // rootless branch of `graph_id_for_hit` already assumes: those come from a foreign
+    // baseline, and this workspace's root is not theirs to be stripped against.
+    let graph_root = roots.map(|roots| ide::StripRoot::pinned(roots.workspace_canonical()));
+    let graph_root = graph_root.as_ref();
     let blocks = hits
         .iter()
         .enumerate()
@@ -547,7 +565,7 @@ mod tests {
             fused("Лекс", Modality::Lexical),
             fused("Сем", Modality::Semantic),
         ];
-        let out = format_code_hits(&hits, None, None, usize::MAX);
+        let out = format_code_hits(&hits, None, usize::MAX);
 
         assert!(out.text.contains("#1 [L+S]"), "both-modality hit tagged L+S: {}", out.text);
         assert!(out.text.contains("#2 [L]"), "lexical-only hit tagged L: {}", out.text);
@@ -573,7 +591,7 @@ mod tests {
             FusedHit { hit: extension, modality: Modality::Lexical },
         ];
 
-        let out = format_code_hits(&hits, None, None, usize::MAX);
+        let out = format_code_hits(&hits, None, usize::MAX);
 
         assert_eq!(out.hits[0]["root_id"], "", "the configuration keeps the reserved empty id");
         assert_eq!(out.hits[1]["root_id"], "ext-a", "the extension's hit names its root");
@@ -601,7 +619,7 @@ mod tests {
         hit.line_end = 201;
         let hits = vec![FusedHit { hit, modality: Modality::Lexical }];
 
-        let out = format_code_hits(&hits, None, None, usize::MAX);
+        let out = format_code_hits(&hits, None, usize::MAX);
 
         assert_eq!(
             out.hits[0],
@@ -655,7 +673,7 @@ mod tests {
     fn code_hit_structure_omits_absent_symbol_graph_id_and_snippet() {
         let hits = vec![fused("", Modality::Semantic)];
 
-        let out = format_code_hits(&hits, None, None, usize::MAX);
+        let out = format_code_hits(&hits, None, usize::MAX);
 
         assert_eq!(
             out.hits[0],
@@ -688,14 +706,14 @@ mod tests {
         let hits: Vec<FusedHit> =
             (1..=5).map(|i| fused(&format!("Процедура{i}"), Modality::Lexical)).collect();
 
-        let full = format_code_hits(&hits, None, None, usize::MAX);
+        let full = format_code_hits(&hits, None, usize::MAX);
         assert_eq!((full.shown, full.total), (5, 5));
         assert!(!full.budget_exhausted);
 
         // A budget that fits the text of all five but not the text plus the JSON array must
         // drop hits: the response carries both, so charging for the text alone would overshoot.
         let text_only_tokens = full.text.len().div_ceil(4);
-        let cut = format_code_hits(&hits, None, None, text_only_tokens);
+        let cut = format_code_hits(&hits, None, text_only_tokens);
         assert!(cut.shown < 5, "structure must be charged too: shown={}", cut.shown);
         assert_eq!(cut.hits.len(), cut.shown);
         assert_eq!(cut.total, 5);
@@ -711,7 +729,7 @@ mod tests {
     fn one_oversized_hit_returns_the_empty_budget_envelope() {
         let hits = vec![fused("Процедура", Modality::Lexical)];
 
-        let out = format_code_hits(&hits, None, None, 1);
+        let out = format_code_hits(&hits, None, 1);
 
         assert_eq!((out.shown, out.total), (0, 1));
         assert!(out.hits.is_empty());
@@ -786,9 +804,56 @@ mod tests {
         assert!(body["freshness"]["topology_fingerprint"].is_null());
     }
 
+    /// A hit is bridged against the roots ITS index generation registered, not against the
+    /// workspace as the disk spells it by the time the listing is rendered.
+    ///
+    /// Both halves of a `method/file/<rel>::<name>` id are facts about one generation: the path
+    /// is where that index's walk found the file, and the base is the workspace that walk
+    /// descended from. Reading either off the live tree pairs them across generations — and a
+    /// workspace reached through a link that has since been retargeted then yields no rel at
+    /// all, so the hit loses the bridge it had a moment earlier.
+    #[cfg(unix)]
+    #[test]
+    fn a_hit_is_bridged_against_the_roots_its_index_was_registered_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let served = dir.path().join("served");
+        let elsewhere = dir.path().join("elsewhere");
+        let form = "CommonForms/Форма/Ext/Form/Module.bsl";
+        std::fs::create_dir_all(served.join("cf").join(form).parent().unwrap()).unwrap();
+        std::fs::write(served.join("cf").join(form), "").unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let workspace = dir.path().join("workspace");
+        std::os::unix::fs::symlink(&served, &workspace).unwrap();
+
+        let (roots, rejected) =
+            bsl_search::WorkspaceRoots::build(&workspace, &workspace.join("cf"), &[]);
+        assert!(rejected.is_empty(), "the stand declares no extensions");
+        let hits = vec![FusedHit {
+            hit: code_hit(form, "ПриОткрытии", "procedure"),
+            modality: Modality::Lexical,
+        }];
+        let expected = format!("method/file/cf/{form}::ПриОткрытии");
+
+        let before = format_code_hits(&hits, Some(&roots), usize::MAX);
+        assert_eq!(
+            before.hits[0]["graph_id"], expected,
+            "control: a form hit carries the path-fallback id the graph mints",
+        );
+
+        std::fs::remove_file(&workspace).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &workspace).unwrap();
+
+        let after = format_code_hits(&hits, Some(&roots), usize::MAX);
+        assert_eq!(
+            after.hits[0]["graph_id"], expected,
+            "these hits still belong to the index that registered those roots",
+        );
+    }
+
     /// The table a workspace with one declared extension has. Built from paths that need not
-    /// exist: `resolve` answers from the DECLARED spellings, and the stand is about which root
-    /// a hit is anchored with, not about what is on disk.
+    /// exist: a root that resolves to nothing keeps its declared spelling, so anchoring answers
+    /// from those, and the stand is about which root a hit is anchored with, not about what is
+    /// on disk.
     fn roots_with_an_extension() -> bsl_search::WorkspaceRoots {
         let (roots, rejected) = bsl_search::WorkspaceRoots::build(
             Path::new("/repo"),
@@ -806,7 +871,7 @@ mod tests {
     #[test]
     fn an_extension_hit_is_anchored_with_its_own_root() {
         let roots = roots_with_an_extension();
-        let graph_root = Path::new("/repo");
+        let graph_root = ide::StripRoot::pinned(Path::new("/repo"));
         let mut hit = code_hit(
             "Catalogs/Контрагенты/Forms/Форма/Ext/Form/Module.bsl",
             "ПриОткрытии",
@@ -815,7 +880,7 @@ mod tests {
         hit.root_id = "ext-a".to_owned();
 
         assert_eq!(
-            graph_id_for_hit(&hit, Some(&roots), Some(graph_root)),
+            graph_id_for_hit(&hit, Some(&roots), Some(&graph_root)),
             Some(
                 "method/file/ext-a/Catalogs/Контрагенты/Forms/Форма/Ext/Form/Module.bsl::ПриОткрытии"
                     .to_owned()
@@ -830,7 +895,7 @@ mod tests {
     #[test]
     fn a_hit_of_an_unregistered_root_is_not_anchored_at_all() {
         let roots = roots_with_an_extension();
-        let graph_root = Path::new("/repo");
+        let graph_root = ide::StripRoot::pinned(Path::new("/repo"));
         let mut form = code_hit(
             "Catalogs/Контрагенты/Forms/Форма/Ext/Form/Module.bsl",
             "ПриОткрытии",
@@ -842,24 +907,29 @@ mod tests {
         module.root_id = "ext-неизвестное".to_owned();
 
         assert_eq!(
-            graph_id_for_hit(&form, Some(&roots), Some(graph_root)),
+            graph_id_for_hit(&form, Some(&roots), Some(&graph_root)),
             None,
             "no path-keyed id is invented for a root this workspace has never seen",
         );
         assert_eq!(
-            graph_id_for_hit(&module, Some(&roots), Some(graph_root)),
+            graph_id_for_hit(&module, Some(&roots), Some(&graph_root)),
             Some("method/common/Утилиты/ПроверитьИНН".to_owned()),
             "the module-keyed id still resolves: it never depended on a root",
         );
     }
 
-    /// With no table — an external baseline serving while the engine is still building — both
-    /// arms answer exactly as they did before roots existed. This is a preserving guard, and it
-    /// guards a real loss: an absolute hit path yields a file-keyed id here, and folding that
-    /// arm into the rootless one would take it away.
+    /// With no table but a base in hand, both arms answer exactly as they did before roots
+    /// existed. This is a preserving guard, and it guards a real loss: an absolute hit path
+    /// yields a file-keyed id here, and folding that arm into the rootless one would take it
+    /// away.
+    ///
+    /// The two are separate arguments and this is where that shows. The listing derives its
+    /// base FROM the table, so a listing with no table hands no base either — hits that reach
+    /// it that way come from an external baseline serving while the engine is still building,
+    /// and a path built from this workspace's root is not theirs to carry.
     #[test]
     fn without_a_root_table_both_spellings_answer_as_before() {
-        let graph_root = Path::new("/repo");
+        let graph_root = ide::StripRoot::pinned(Path::new("/repo"));
         let mut absolute = code_hit(
             "/repo/src/cf/Catalogs/Контрагенты/Forms/Форма/Ext/Form/Module.bsl",
             "ПриОткрытии",
@@ -871,7 +941,7 @@ mod tests {
         relative.root_id = "ext-a".to_owned();
 
         assert_eq!(
-            graph_id_for_hit(&absolute, None, Some(graph_root)),
+            graph_id_for_hit(&absolute, None, Some(&graph_root)),
             Some(
                 "method/file/src/cf/Catalogs/Контрагенты/Forms/Форма/Ext/Form/Module.bsl::ПриОткрытии"
                     .to_owned()
@@ -879,7 +949,7 @@ mod tests {
             "an absolute hit path names its own file and keeps its file-keyed id",
         );
         assert_eq!(
-            graph_id_for_hit(&relative, None, Some(graph_root)),
+            graph_id_for_hit(&relative, None, Some(&graph_root)),
             Some("method/common/Утилиты/ПроверитьИНН".to_owned()),
             "and a relative one still gets the module-keyed id, with no path guessed",
         );
@@ -889,13 +959,13 @@ mod tests {
     fn graph_id_bridges_method_hits_in_modules() {
         let roots = roots_with_an_extension();
         let engine_root = &roots;
-        let graph_root = Path::new("/repo");
+        let graph_root = ide::StripRoot::pinned(Path::new("/repo"));
 
         assert_eq!(
             graph_id_for_hit(
                 &code_hit("CommonModules/Утилиты/Ext/Module.bsl", "ПроверитьИНН", "procedure"),
                 Some(engine_root),
-                Some(graph_root),
+                Some(&graph_root),
             ),
             Some("method/common/Утилиты/ПроверитьИНН".to_owned()),
         );
@@ -903,7 +973,7 @@ mod tests {
             graph_id_for_hit(
                 &code_hit("CommonModules/Утилиты/Ext/Module.bsl", "МодульнаяПерем", "variable"),
                 Some(engine_root),
-                Some(graph_root),
+                Some(&graph_root),
             ),
             None,
         );
@@ -915,7 +985,7 @@ mod tests {
                     "procedure",
                 ),
                 Some(engine_root),
-                Some(graph_root),
+                Some(&graph_root),
             ),
             Some(
                 "method/file/src/cf/Catalogs/Контрагенты/Forms/Форма/Ext/Form/Module.bsl::ПриОткрытии"

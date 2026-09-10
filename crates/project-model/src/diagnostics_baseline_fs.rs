@@ -13,6 +13,25 @@ pub struct ManagedBaselineDirectory {
     project_path: PathBuf,
 }
 
+/// What a stat says about one managed entry.
+///
+/// Describes the entry itself: a symlink reads as a symlink rather than as whatever it
+/// points at, so a name that swaps a file for a link is a change and not a coincidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagedEntryReading {
+    pub len: u64,
+    pub is_regular_file: bool,
+    /// The permission bits, where the platform reports them. An entry that could not be
+    /// opened for its mode reads the same as one that could on every other field, so
+    /// without this a repair that only grants access moves nothing.
+    pub mode: Option<u32>,
+    pub modified_nanos: Option<u128>,
+    /// `(device, inode)` where the platform reports them. The pair moves when an entry
+    /// is replaced rather than rewritten, which a length and a timestamp can miss inside
+    /// one timestamp granule.
+    pub identity: Option<(u64, u64)>,
+}
+
 impl ManagedBaselineDirectory {
     pub fn open_project_root(project_root: &Path) -> io::Result<Self> {
         let canonical_root = std::fs::canonicalize(project_root)?;
@@ -42,6 +61,34 @@ impl ManagedBaselineDirectory {
     /// Validates a stored portable path and returns it relative to the project root.
     pub fn validated_relative_path(&self, path: &str) -> io::Result<PathBuf> {
         Ok(self.project_path.join(validate_managed_path(path)?))
+    }
+
+    /// Stat one managed entry through this handle, following nothing on the way to it
+    /// and nothing at it.
+    ///
+    /// The counterpart of [`Self::open_file`] for callers that need to know what an
+    /// entry looks like rather than what it contains. Reaching the same entry by
+    /// re-assembling an absolute path and stat'ing that would walk intermediate links
+    /// this handle was opened to refuse.
+    ///
+    /// An entry that is absent, or that lies behind a rejected component, is an error
+    /// here rather than a reading: the caller decides what an unreadable name means.
+    pub fn entry_reading(&self, path: &str) -> io::Result<ManagedEntryReading> {
+        let (dir, name) = self.open_parent(path, false)?;
+        let metadata = dir.symlink_metadata(&name)?;
+        Ok(ManagedEntryReading {
+            len: metadata.len(),
+            is_regular_file: metadata.is_file(),
+            mode: entry_mode(&metadata),
+            modified_nanos: metadata.modified().ok().and_then(|modified| {
+                modified
+                    .into_std()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|since_epoch| since_epoch.as_nanos())
+            }),
+            identity: entry_identity(&metadata),
+        })
     }
 
     pub fn open_file(&self, path: &str) -> io::Result<std::fs::File> {
@@ -132,6 +179,28 @@ impl ManagedBaselineDirectory {
         }
         Ok((dir, name))
     }
+}
+
+#[cfg(unix)]
+fn entry_mode(metadata: &cap_std::fs::Metadata) -> Option<u32> {
+    use cap_std::fs::MetadataExt;
+    Some(metadata.mode())
+}
+
+#[cfg(not(unix))]
+fn entry_mode(_metadata: &cap_std::fs::Metadata) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn entry_identity(metadata: &cap_std::fs::Metadata) -> Option<(u64, u64)> {
+    use cap_std::fs::MetadataExt;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn entry_identity(_metadata: &cap_std::fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 fn open_dir_component(dir: &Dir, name: &Path, create: bool) -> io::Result<Dir> {
@@ -376,6 +445,37 @@ mod tests {
         let mut value = String::new();
         managed.open_file("objects/key/value.json").unwrap().read_to_string(&mut value).unwrap();
         assert_eq!(value, "winner");
+    }
+
+    /// A reading describes the entry, not what it resolves to, and refuses to walk a
+    /// link on the way to it. Stat'ing a re-assembled absolute path would do both.
+    #[cfg(unix)]
+    #[test]
+    fn a_reading_describes_the_entry_and_walks_no_link_to_reach_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("target.json"), b"outside this project").unwrap();
+        let managed = ManagedBaselineDirectory::open(root.path(), "baselines", true).unwrap();
+        managed.create_file_new("objects/real.json").unwrap().write_all(b"ok").unwrap();
+
+        let real = managed.entry_reading("objects/real.json").unwrap();
+        assert!(real.is_regular_file);
+        assert_eq!(real.len, 2);
+
+        symlink(outside.path().join("target.json"), root.path().join("baselines/link.json"))
+            .unwrap();
+        let link = managed.entry_reading("link.json").unwrap();
+        assert!(!link.is_regular_file, "a link reads as a link, not as its target");
+        assert_ne!(link.len, "outside this project".len() as u64);
+
+        symlink(outside.path(), root.path().join("baselines/objects/away")).unwrap();
+        assert!(
+            managed.entry_reading("objects/away/target.json").is_err(),
+            "a name whose parent is a link must not be reached through it"
+        );
+        assert!(managed.entry_reading("objects/absent.json").is_err());
     }
 
     #[cfg(unix)]

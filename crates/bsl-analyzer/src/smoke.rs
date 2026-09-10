@@ -205,21 +205,7 @@ pub struct InternedTrendRow {
 }
 
 pub fn read_rss_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        for line in status.lines() {
-            if let Some(rest) = line.strip_prefix("VmRSS:") {
-                let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-                return Some(kb * 1024);
-            }
-        }
-        None
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+    crate::mem_report::process_rss_bytes()
 }
 
 #[derive(Debug, Clone)]
@@ -1224,13 +1210,11 @@ mod tests {
     }
 
     #[test]
-    fn rss_reader_returns_value_on_linux() {
-        #[cfg(target_os = "linux")]
-        {
-            let rss = read_rss_bytes();
-            assert!(rss.is_some(), "/proc/self/status should expose VmRSS on Linux");
-            assert!(rss.unwrap() > 0);
-        }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn rss_reader_returns_a_value_where_the_kernel_exposes_one() {
+        let rss = read_rss_bytes();
+        assert!(rss.is_some(), "the kernel must expose a resident set size here");
+        assert!(rss.unwrap() > 0);
     }
 
     #[test]

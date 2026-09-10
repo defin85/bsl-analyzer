@@ -386,6 +386,9 @@ mod tests {
     /// claiming one file where two live. Refusing names the collision; publishing hides it.
     #[cfg(unix)]
     #[test]
+    // The fixture needs two directory names that differ only in bytes no `str` can hold, and
+    // APFS refuses to create such a name at all: the collision cannot be staged on macOS.
+    #[cfg(not(target_os = "macos"))]
     fn two_roots_that_would_share_one_identifier_stop_the_publish() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;

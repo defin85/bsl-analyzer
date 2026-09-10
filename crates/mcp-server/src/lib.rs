@@ -1243,9 +1243,6 @@ impl McpServer {
                 }
                 let configured_baseline = baseline.configured;
                 let external_baseline = baseline.external;
-                // The graph keys file ids against the repo (workspace) root; pass it so search
-                // can mint form/file `graph_id`s with the same `src/cf/…` prefix the graph uses.
-                let graph_root = self.state.workspace_root().cloned();
                 let index_progress = self.state.index_progress().clone();
                 let retry_progress = index_progress.clone();
                 let workspace_lease = self.state.workspace_lease().clone();
@@ -1258,7 +1255,6 @@ impl McpServer {
                         workspace_search_mode,
                         configured_baseline.as_ref(),
                         external_baseline,
-                        graph_root.as_deref(),
                         &index_progress,
                         &query,
                         limit,
@@ -1920,11 +1916,13 @@ impl McpServer {
                     })
                 };
 
-                // This tool's miss is an absent card for a request made BY NAME. A positional
-                // request that resolved nothing describes a place, not a name, and a re-scan
-                // cannot put a symbol where the caller pointed.
+                // This tool's miss is an absent card for a request made BY NAME, and which
+                // answers qualify is the tool's own rule — see `warrants_rescan`.
                 let outcome = session.read_retrying_a_stale_miss(read, |answer| {
-                    symbol.is_some() && matches!(answer, Ok((None, _, _)))
+                    tools::symbol_info::warrants_rescan(
+                        symbol.as_deref(),
+                        answer.as_ref().map(|(card, _, _)| card.as_ref()),
+                    )
                 });
 
                 let (card, roots, unread_files, freshness) = match outcome {
@@ -3591,11 +3589,112 @@ mod tool_descriptions {
     }
 }
 
+/// A `resolve` answer whose sources were not all consulted says so in its own envelope.
+///
+/// The reason travels from the dictionary's verdict through an envelope this action assembles
+/// for itself — not the one `node` and its neighbours share — so nothing below the handler
+/// covers it. A `resolve` that stopped carrying its `Completeness` would hand a consumer an
+/// empty list with no hint that a source was never asked, which is exactly the emptiness that
+/// cannot be told from a proven zero.
+///
+/// The graph's verdict is an INPUT here rather than something to wait for. A newer lease takes
+/// the workspace's caches BEFORE the server exists, so nothing this server starts can ever own
+/// the graph's build: it is never claimed, the graph never publishes, and the verdict holds for
+/// the whole test. Claiming the build from the stand instead would have raced the boot thread
+/// that claims it too — a narrow window, but the same kind of wager this change exists to
+/// remove.
+#[cfg(test)]
+mod resolve_envelope {
+    use super::*;
+
+    fn resolve_params(query: &str) -> Parameters<GraphParams> {
+        Parameters(GraphParams {
+            action: "resolve".to_owned(),
+            id: None,
+            query: Some(query.to_owned()),
+            ids: Vec::new(),
+            max_output_tokens: None,
+            detail: None,
+            dir: None,
+            depth: None,
+            max_nodes: None,
+            provenance: Vec::new(),
+            edge_kinds: Vec::new(),
+            top: None,
+            call_sites: None,
+            max_call_sites: None,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unconsulted_source_makes_the_resolve_envelope_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(root);
+        let newer = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
+        let state = SharedState::workspace_with_cache(root.to_path_buf(), cache)
+            .expect("valid workspace project");
+        state.diagnostics().ensure_loading();
+        crate::diagnostics_state::test_support::wait_ready(state.diagnostics());
+        let server = McpServer::new(McpProfile::Workspace, state);
+
+        let body = server
+            .graph(
+                resolve_params("ЗаведомоНесуществующееИмяСимвола"),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("resolve answers whatever the graph is doing")
+            .structured_content
+            .expect("a structured body");
+
+        let candidates = body["result"]["candidates"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the answer carries a candidate list: {body}"));
+        assert!(candidates.is_empty(), "no source holds this name: {body}");
+
+        let graph_state = body["result"]["providers"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the answer names its providers: {body}"))
+            .iter()
+            .find(|p| p["provider"] == "graph")
+            .unwrap_or_else(|| panic!("`graph` is named among the sources: {body}"))["state"]
+            .as_str()
+            .unwrap_or_else(|| panic!("`graph` carries a state: {body}"))
+            .to_owned();
+        assert_eq!(graph_state, "not_ready", "{body}");
+
+        let codes: Vec<&str> = body["freshness"]["completeness"]["reasons"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a partial answer carries reasons: {body}"))
+            .iter()
+            .filter_map(|r| r["code"].as_str())
+            .collect();
+        assert!(
+            codes.contains(&"index_building"),
+            "an empty list while a source is unconsulted must not read as complete: {body}",
+        );
+
+        server.shutdown();
+        newer.release();
+    }
+}
+
 /// Each tool consults the stale-miss rescan hatch on ITS OWN miss and on nothing else.
 ///
 /// What the consultation is worth is settled elsewhere, on stands where the answer itself
 /// changes; what is settled here is that the tool asks — and that it does not ask for an
 /// answer nobody doubted, which is what a policy applied unconditionally would do.
+///
+/// How MANY forces one consultation spends is not this module's statement: a force the storm
+/// guard declines is waited out and asked again, so a miss spends one force or two depending
+/// on whether a drift scan ran within the floor just before — which is the change hub's
+/// health, not the tool's business. That count has its own deterministic gates beside the
+/// policy, in `diagnostics_state::session`. Counted here are the CONSULTATIONS, of which the
+/// contract admits exactly one; a tolerance over forces would accept a second consultation
+/// as one whose first force happened to be declined.
 #[cfg(test)]
 mod rescan_hatch_consultations {
     use super::*;
@@ -3618,6 +3717,12 @@ mod rescan_hatch_consultations {
 
     fn token() -> tokio_util::sync::CancellationToken {
         tokio_util::sync::CancellationToken::new()
+    }
+
+    #[track_caller]
+    fn assert_hatch_consulted(diag: &DiagnosticsState, before: usize, what: &str) {
+        let consulted = diag.stale_miss_consultations() - before;
+        assert_eq!(consulted, 1, "{what} consults the hatch exactly once");
     }
 
     fn metadata_params(object_type: &str, object_name: &str) -> Parameters<MetadataParams> {
@@ -3678,7 +3783,7 @@ mod rescan_hatch_consultations {
     async fn metadata_object_consults_the_rescan_hatch_on_a_resolvable_type_miss() {
         let (_dir, server, diag) = stand();
 
-        let before = diag.forced_rescans();
+        let before = diag.stale_miss_consultations();
         let _ = server
             .metadata(
                 metadata_params("Справочник", "НетТакогоОбъекта"),
@@ -3686,9 +3791,9 @@ mod rescan_hatch_consultations {
                 tasks::TaskCapable(false),
             )
             .await;
-        assert_eq!(diag.forced_rescans(), before + 1, "a resolvable type miss consults the hatch");
+        assert_hatch_consulted(&diag, before, "a resolvable type miss");
 
-        let before = diag.forced_rescans();
+        let before = diag.stale_miss_consultations();
         let _ = server
             .metadata(
                 metadata_params("НеизвестныйТип", "НетТакогоОбъекта"),
@@ -3696,7 +3801,11 @@ mod rescan_hatch_consultations {
                 tasks::TaskCapable(false),
             )
             .await;
-        assert_eq!(diag.forced_rescans(), before, "control: an unresolvable type does not");
+        assert_eq!(
+            diag.stale_miss_consultations(),
+            before,
+            "control: an unresolvable type does not"
+        );
 
         server.shutdown();
     }
@@ -3707,14 +3816,18 @@ mod rescan_hatch_consultations {
     async fn symbol_info_consults_the_rescan_hatch_on_a_named_symbol_miss() {
         let (_dir, server, diag) = stand();
 
-        let before = diag.forced_rescans();
+        let before = diag.stale_miss_consultations();
         let _ = server.symbol_info(symbol_params(ABSENT), token(), tasks::TaskCapable(false)).await;
-        assert_eq!(diag.forced_rescans(), before + 1, "a name that missed consults the hatch");
+        assert_hatch_consulted(&diag, before, "a name that missed");
 
-        let before = diag.forced_rescans();
+        let before = diag.stale_miss_consultations();
         let _ =
             server.symbol_info(symbol_params(DECLARED), token(), tasks::TaskCapable(false)).await;
-        assert_eq!(diag.forced_rescans(), before, "control: a name that resolved does not");
+        assert_eq!(
+            diag.stale_miss_consultations(),
+            before,
+            "control: a name that resolved does not"
+        );
 
         server.shutdown();
     }
@@ -3724,16 +3837,20 @@ mod rescan_hatch_consultations {
     async fn references_consults_the_rescan_hatch_on_a_named_symbol_miss() {
         let (_dir, server, diag) = stand();
 
-        let before = diag.forced_rescans();
+        let before = diag.stale_miss_consultations();
         let _ =
             server.references(references_params(ABSENT), token(), tasks::TaskCapable(false)).await;
-        assert_eq!(diag.forced_rescans(), before + 1, "a name that missed consults the hatch");
+        assert_hatch_consulted(&diag, before, "a name that missed");
 
-        let before = diag.forced_rescans();
+        let before = diag.stale_miss_consultations();
         let _ = server
             .references(references_params(DECLARED), token(), tasks::TaskCapable(false))
             .await;
-        assert_eq!(diag.forced_rescans(), before, "control: an answer that resolved does not");
+        assert_eq!(
+            diag.stale_miss_consultations(),
+            before,
+            "control: an answer that resolved does not"
+        );
 
         server.shutdown();
     }

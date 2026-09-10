@@ -69,6 +69,10 @@ pub struct SharedState {
     debug_session: Arc<Mutex<Option<bsl_debug::session::DebugSession>>>,
     search_engine: SharedSearchEngine,
     workspace_search_initializing: Arc<AtomicBool>,
+    /// The embed pass's claim, and with it the answer to "is embedding running right now".
+    /// Read for the backend's lifetime because it is owned by the pass itself: no peer's
+    /// status write can erase it, and it is released on every exit including a panic.
+    embed_flight: Arc<embed::EmbedFlight>,
     index_progress: Arc<IndexProgress>,
     semantic_runtime: Arc<Mutex<SemanticRuntimeStatus>>,
     /// Outcome of the startup overlay warmup, so `search status` can distinguish "no local
@@ -237,16 +241,23 @@ impl SharedState {
         self.workspace_lease.owns_caches()
     }
 
+    /// Whether work this backend owns is still running, and so whether the broker must keep
+    /// the process alive past its idle TTL.
+    ///
+    /// Every term is a signal the work itself owns and releases — an atomic it raises, or a
+    /// claim it holds — never the reported status. `semantic_runtime` looks like the obvious
+    /// source and is the wrong one: embed and overlay share that single slot and each writes
+    /// it whole, so an embed finishing mid-overlay writes `Ready` over `OverlaySyncing` and
+    /// erases a running pass from view. A signal that a peer can overwrite cannot decide a
+    /// process's lifetime.
+    ///
+    /// Nothing here blocks: the serve loop asks this on every tick.
     pub(crate) fn background_work_active(&self) -> bool {
         self.workspace_search_initializing.load(Ordering::Relaxed)
             || self.reference_search.loading()
             || self.index_progress.is_active()
-            || self.semantic_runtime.try_lock().map_or(true, |status| {
-                matches!(
-                    *status,
-                    SemanticRuntimeStatus::Indexing | SemanticRuntimeStatus::OverlaySyncing
-                )
-            })
+            || self.embed_flight.is_in_flight()
+            || self.overlay_retry.as_ref().is_some_and(|retry| retry.pass_active())
     }
 
     /// Start building the diagnostics resident now instead of on the first tool call.
@@ -624,7 +635,7 @@ mod standalone_extension_tests {
 
 #[cfg(test)]
 mod background_lifetime_tests {
-    use super::SharedState;
+    use super::{SemanticRuntimeStatus, SharedState};
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -635,5 +646,28 @@ mod background_lifetime_tests {
         state.index_progress().active.store(true, Ordering::Relaxed);
 
         assert!(state.background_work_active());
+    }
+
+    /// The semantic-runtime status has two independent writers — the embed pass and the
+    /// overlay worker — and each writes the whole slot. An embed finishing mid-overlay writes
+    /// `Ready` over `OverlaySyncing`; while the backend's lifetime was read off that slot, the
+    /// clobber erased the only sign of work and the daemon could exit in the middle of it.
+    /// Activity is read from the work itself, which a peer's status write cannot touch.
+    #[test]
+    fn a_peer_status_write_cannot_release_a_running_pass() {
+        let state = SharedState::shared();
+        assert!(!state.background_work_active());
+
+        // Positive control: an unclaimed flight would satisfy the assertions below whatever
+        // the predicate reads.
+        assert!(state.embed_flight.claim_for_test(), "the stand never took the flight");
+        assert!(state.background_work_active(), "a claimed embed pass is not held");
+
+        *state.semantic_runtime.lock().unwrap() = SemanticRuntimeStatus::Ready;
+
+        assert!(
+            state.background_work_active(),
+            "a peer's status write released a pass that is still running"
+        );
     }
 }

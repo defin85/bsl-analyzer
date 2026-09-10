@@ -216,6 +216,48 @@ checked_environments = ["ТонкийКлиент", "Server", "Неизвест�
         );
     }
 
+    /// Собирательные имена конфигурация принимает, и их последствие названо
+    /// целиком.
+    ///
+    /// `Клиент` — управляемые клиенты, поэтому мобильный клиент входит в
+    /// модель исполнения, а устаревший толстый клиент обычного приложения не
+    /// включается: он входит только собственным именем. До сведения списков
+    /// это имя давало предупреждение и умолчания.
+    #[test]
+    fn aggregate_client_name_is_accepted_and_its_consequence_is_pinned() {
+        use hir::execution_env::EnvFlags;
+
+        let mut db = RootDatabaseImpl::new();
+        let features = FeaturesConfig {
+            checked_environments: Some(vec!["Клиент".to_string()]),
+            ..FeaturesConfig::default()
+        };
+        apply_features_to_db(&mut db, &features);
+        let options = db.env_options();
+        assert_eq!(
+            options.checked_environments,
+            EnvFlags::MANAGED_CLIENTS,
+            "`Клиент` обязан назвать управляемые клиенты"
+        );
+        assert!(
+            options.client_environments.contains(EnvFlags::MOBILE_CLIENT),
+            "названный клиент обязан войти в модель исполнения"
+        );
+        assert!(
+            !options.ordinary_app_support,
+            "`Клиент` не включает устаревший толстый клиент обычного приложения"
+        );
+
+        // `НаСервере` — то же имя среды, что `Сервер`; до сведения списков
+        // оно уходило в предупреждение.
+        let features = FeaturesConfig {
+            checked_environments: Some(vec!["НаСервере".to_string()]),
+            ..FeaturesConfig::default()
+        };
+        apply_features_to_db(&mut db, &features);
+        assert_eq!(db.env_options().checked_environments, EnvFlags::SERVER);
+    }
+
     #[test]
     fn unrecognized_only_list_keeps_the_default_checked_set() {
         let mut db = RootDatabaseImpl::new();

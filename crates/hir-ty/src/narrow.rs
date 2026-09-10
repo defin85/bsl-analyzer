@@ -633,12 +633,265 @@ pub fn refine_by_ternary_guard(
     refined
 }
 
-fn guard_var(guard: &Guard) -> &Name {
+/// The variable a guard talks about.
+pub fn guard_var(guard: &Guard) -> &Name {
     match guard {
         Guard::TypeCheck { var, .. }
         | Guard::IsUndefined { var }
         | Guard::IsNotUndefined { var }
         | Guard::ValueFilled { var } => var,
+    }
+}
+
+/// A guard an enclosing `Если` proves for the statements of one of its branches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchGuard {
+    pub guard: Guard,
+    /// Polarity this branch gives the condition.
+    pub on_true: bool,
+    /// The `Если` that proves it. A definition made inside this statement is
+    /// not the value the condition tested, so the guard says nothing about it.
+    pub if_stmt: StmtIdx,
+}
+
+/// What a branch guard proves about a candidate type of the variable it guards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardVerdict {
+    /// The guard says nothing about this type.
+    NoInformation,
+    /// Every arm contradicts the guard: the value cannot carry this type here.
+    Contradicted,
+    /// Part of the type survives the guard.
+    Narrowed(TypeId),
+}
+
+/// Guards the `Если` statements lexically enclosing `stmt` prove for it.
+///
+/// Statement-level narrowing is a dataflow ([`narrow_query`]) that inference cannot
+/// consult, because that query is built on top of inference. What is wanted here is
+/// purely syntactic anyway — a branch dominates its own statements — so the facts are
+/// read off the `Если` tree directly, the way [`refine_by_ternary_guard`] reads the
+/// arms of a ternary.
+pub fn branch_guards_for_stmt(body: &Body, stmt: hir_def::StmtId) -> Vec<BranchGuard> {
+    let mut acc = Vec::new();
+    collect_branch_guards(body, body.body_stmts_typed(), stmt.to_idx(), &mut acc);
+    acc
+}
+
+/// Walks the statement tree towards `target`, recording the guard every `Если`
+/// branch on the way proves. Reports whether `target` lives below `stmts`.
+fn collect_branch_guards(
+    body: &Body,
+    stmts: &[StmtIdx],
+    target: StmtIdx,
+    acc: &mut Vec<BranchGuard>,
+) -> bool {
+    for &stmt_idx in stmts {
+        if stmt_idx == target {
+            return true;
+        }
+        let found = match body.stmt_idx(stmt_idx) {
+            Stmt::If(if_stmt) => match find_if_branch(body, if_stmt, target, acc) {
+                Some(branch) => {
+                    push_branch_guards(body, if_stmt, stmt_idx, branch, acc);
+                    true
+                }
+                None => false,
+            },
+            Stmt::PreprocIf(pre) => {
+                collect_branch_guards(body, &pre.then_branch, target, acc)
+                    || pre
+                        .elsif_branches
+                        .iter()
+                        .any(|(_, _, branch)| collect_branch_guards(body, branch, target, acc))
+                    || pre
+                        .else_branch
+                        .as_ref()
+                        .is_some_and(|branch| collect_branch_guards(body, branch, target, acc))
+            }
+            Stmt::While { body: inner, .. }
+            | Stmt::For { body: inner, .. }
+            | Stmt::ForEach { body: inner, .. } => collect_branch_guards(body, inner, target, acc),
+            Stmt::Try { body: inner, except } => {
+                collect_branch_guards(body, inner, target, acc)
+                    || collect_branch_guards(body, except, target, acc)
+            }
+            _ => false,
+        };
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IfBranch {
+    Then,
+    ElsIf(usize),
+    Else,
+}
+
+/// Which branch of `if_stmt` holds `target`. The descent into that branch has
+/// already pushed the guards of any nested `Если` onto `acc`.
+fn find_if_branch(
+    body: &Body,
+    if_stmt: &hir_def::hir::IfStmt,
+    target: StmtIdx,
+    acc: &mut Vec<BranchGuard>,
+) -> Option<IfBranch> {
+    if collect_branch_guards(body, &if_stmt.then_branch, target, acc) {
+        return Some(IfBranch::Then);
+    }
+    for (index, (_, branch)) in if_stmt.elsif_branches.iter().enumerate() {
+        if collect_branch_guards(body, branch, target, acc) {
+            return Some(IfBranch::ElsIf(index));
+        }
+    }
+    let else_branch = if_stmt.else_branch.as_ref()?;
+    collect_branch_guards(body, else_branch, target, acc).then_some(IfBranch::Else)
+}
+
+/// Whether control can enter these statements without passing the condition that
+/// guards them.
+///
+/// A branch dominates its own statements only while `Перейти` cannot land inside
+/// it: the CFG draws an edge straight from the jump to the label, so a statement
+/// after a label in the branch may be reached on a path where the condition was
+/// never evaluated. The tree says nothing about that path, so a branch holding a
+/// label proves nothing.
+fn contains_label(body: &Body, stmts: &[StmtIdx]) -> bool {
+    stmts.iter().any(|&stmt_idx| match body.stmt_idx(stmt_idx) {
+        Stmt::Label(_) => true,
+        Stmt::If(if_stmt) => {
+            contains_label(body, &if_stmt.then_branch)
+                || if_stmt.elsif_branches.iter().any(|(_, branch)| contains_label(body, branch))
+                || if_stmt.else_branch.as_ref().is_some_and(|branch| contains_label(body, branch))
+        }
+        Stmt::PreprocIf(pre) => {
+            contains_label(body, &pre.then_branch)
+                || pre.elsif_branches.iter().any(|(_, _, branch)| contains_label(body, branch))
+                || pre.else_branch.as_ref().is_some_and(|branch| contains_label(body, branch))
+        }
+        Stmt::While { body: inner, .. }
+        | Stmt::For { body: inner, .. }
+        | Stmt::ForEach { body: inner, .. } => contains_label(body, inner),
+        Stmt::Try { body: inner, except } => {
+            contains_label(body, inner) || contains_label(body, except)
+        }
+        _ => false,
+    })
+}
+
+/// The statements of one branch of an `Если`.
+fn branch_stmts(if_stmt: &hir_def::hir::IfStmt, branch: IfBranch) -> &[StmtIdx] {
+    match branch {
+        IfBranch::Then => &if_stmt.then_branch,
+        IfBranch::ElsIf(index) => &if_stmt.elsif_branches[index].1,
+        IfBranch::Else => if_stmt.else_branch.as_deref().unwrap_or(&[]),
+    }
+}
+
+/// The conditions a branch settles, with the polarity that reaches it: every
+/// condition written before the branch is false there, the branch's own is true.
+fn push_branch_guards(
+    body: &Body,
+    if_stmt: &hir_def::hir::IfStmt,
+    if_stmt_idx: StmtIdx,
+    branch: IfBranch,
+    acc: &mut Vec<BranchGuard>,
+) {
+    if contains_label(body, branch_stmts(if_stmt, branch)) {
+        return;
+    }
+    let push = |condition: ExprIdx, on_true: bool, acc: &mut Vec<BranchGuard>| {
+        if let Some(guard) = recognize_guard(condition, body) {
+            acc.push(BranchGuard { guard, on_true, if_stmt: if_stmt_idx });
+        }
+    };
+    match branch {
+        IfBranch::Then => push(if_stmt.condition, true, acc),
+        IfBranch::ElsIf(index) => {
+            push(if_stmt.condition, false, acc);
+            for (earlier, (condition, _)) in if_stmt.elsif_branches.iter().enumerate() {
+                push(*condition, earlier == index, acc);
+                if earlier == index {
+                    break;
+                }
+            }
+        }
+        IfBranch::Else => {
+            push(if_stmt.condition, false, acc);
+            for (condition, _) in if_stmt.elsif_branches.iter() {
+                push(*condition, false, acc);
+            }
+        }
+    }
+}
+
+/// Whether `target` is `root` itself or one of the statements nested in it.
+pub fn stmt_covers_stmt(body: &Body, root: StmtIdx, target: StmtIdx) -> bool {
+    if root == target {
+        return true;
+    }
+    let covers = |stmts: &[StmtIdx]| stmts.iter().any(|s| stmt_covers_stmt(body, *s, target));
+    match body.stmt_idx(root) {
+        Stmt::If(if_stmt) => {
+            covers(&if_stmt.then_branch)
+                || if_stmt.elsif_branches.iter().any(|(_, branch)| covers(branch))
+                || if_stmt.else_branch.as_ref().is_some_and(|branch| covers(branch))
+        }
+        Stmt::PreprocIf(pre) => {
+            covers(&pre.then_branch)
+                || pre.elsif_branches.iter().any(|(_, _, branch)| covers(branch))
+                || pre.else_branch.as_ref().is_some_and(|branch| covers(branch))
+        }
+        Stmt::While { body: inner, .. }
+        | Stmt::For { body: inner, .. }
+        | Stmt::ForEach { body: inner, .. } => covers(inner),
+        Stmt::Try { body: inner, except } => covers(inner) || covers(except),
+        _ => false,
+    }
+}
+
+/// What `guard` on the given branch proves about `ty` held by the guarded variable.
+///
+/// `ТипЗнч(Х) = Тип(…)` deliberately proves nothing here: equality of interned type
+/// ids is not a subtyping test across facets, so a mistaken exclusion would hide a
+/// real diagnostic rather than a false one. The `Неопределено` family needs no such
+/// comparison — an arm either is that type or is not.
+pub fn apply_branch_guard(
+    db: &dyn TypeKernelDb,
+    guard: &Guard,
+    on_true: bool,
+    ty: TypeId,
+) -> GuardVerdict {
+    let arms = arm_set_from_type_id(db, ty);
+    if arms.is_empty() {
+        // `Unknown`/`Any`/`Never` carry no arms: there is nothing to contradict.
+        return GuardVerdict::NoInformation;
+    }
+    let is_undefined = |id: &TypeId| matches!(db.lookup_type(*id), TypeKind::Undefined);
+    let survivors: Vec<TypeId> = match (guard, on_true) {
+        (Guard::IsUndefined { .. }, true) | (Guard::IsNotUndefined { .. }, false) => {
+            arms.iter().copied().filter(is_undefined).collect()
+        }
+        (Guard::IsUndefined { .. }, false) | (Guard::IsNotUndefined { .. }, true) => {
+            arms.iter().copied().filter(|id| !is_undefined(id)).collect()
+        }
+        (Guard::ValueFilled { .. }, true) => {
+            arms.iter().copied().filter(|id| !is_unfilled_witness(db, *id)).collect()
+        }
+        (Guard::ValueFilled { .. }, false) | (Guard::TypeCheck { .. }, _) => {
+            return GuardVerdict::NoInformation
+        }
+    };
+    if survivors.is_empty() {
+        GuardVerdict::Contradicted
+    } else if survivors.len() == arms.len() {
+        GuardVerdict::NoInformation
+    } else {
+        GuardVerdict::Narrowed(db.union(survivors))
     }
 }
 
@@ -2450,5 +2703,186 @@ mod tests {
             Some(db.string(None, false)),
             "while-body Х must see the TrueBranch narrowing to Строка"
         );
+    }
+}
+
+#[cfg(test)]
+mod branch_guard_tests {
+    use super::*;
+    use bsl_types::testing::InMemoryDb;
+    use hir_def::hir::IfStmt;
+
+    /// `Если Х = Неопределено Тогда <then> ИначеЕсли Х = Неопределено Тогда <elsif>
+    /// Иначе <else> КонецЕсли`, with a `Продолжить` standing in for each branch body.
+    struct IfFixture {
+        body: Body,
+        if_stmt: StmtIdx,
+        then_stmt: StmtIdx,
+        elsif_stmt: StmtIdx,
+        else_stmt: StmtIdx,
+    }
+
+    fn undefined_compare(body: &mut Body, var: &str) -> ExprIdx {
+        let lhs = body.alloc_expr(Expr::Path(Name::new(var))).to_idx();
+        let rhs = body.alloc_expr(Expr::Literal(Literal::Undefined)).to_idx();
+        body.alloc_expr(Expr::BinaryOp { lhs, rhs, op: BinaryOp::Eq }).to_idx()
+    }
+
+    fn if_fixture() -> IfFixture {
+        let mut body = Body::default();
+        let condition = undefined_compare(&mut body, "Х");
+        let elsif_condition = undefined_compare(&mut body, "Х");
+        let then_stmt = body.alloc_stmt(Stmt::Continue).to_idx();
+        let elsif_stmt = body.alloc_stmt(Stmt::Continue).to_idx();
+        let else_stmt = body.alloc_stmt(Stmt::Continue).to_idx();
+        let if_stmt = body
+            .alloc_stmt(Stmt::If(Box::new(IfStmt {
+                condition,
+                then_branch: Box::new([then_stmt]),
+                elsif_branches: Box::new([(elsif_condition, Box::new([elsif_stmt]) as Box<[_]>)]),
+                else_branch: Some(Box::new([else_stmt])),
+            })))
+            .to_idx();
+        body.set_body_stmts(Box::new([if_stmt]));
+        IfFixture { body, if_stmt, then_stmt, elsif_stmt, else_stmt }
+    }
+
+    fn guards_at(fixture: &IfFixture, stmt: StmtIdx) -> Vec<BranchGuard> {
+        branch_guards_for_stmt(&fixture.body, hir_def::StmtId::from_idx(stmt))
+    }
+
+    #[test]
+    fn then_branch_takes_the_condition_as_proven() {
+        let fixture = if_fixture();
+        let guards = guards_at(&fixture, fixture.then_stmt);
+        assert_eq!(guards.len(), 1);
+        assert!(guards[0].on_true);
+        assert_eq!(guards[0].if_stmt, fixture.if_stmt);
+        assert!(matches!(guards[0].guard, Guard::IsUndefined { .. }));
+    }
+
+    #[test]
+    fn else_branch_takes_every_earlier_condition_as_refuted() {
+        let fixture = if_fixture();
+        let guards = guards_at(&fixture, fixture.else_stmt);
+        assert_eq!(guards.len(), 2);
+        assert!(guards.iter().all(|g| !g.on_true));
+    }
+
+    #[test]
+    fn elsif_branch_refutes_the_earlier_condition_and_proves_its_own() {
+        let fixture = if_fixture();
+        let guards = guards_at(&fixture, fixture.elsif_stmt);
+        assert_eq!(guards.iter().map(|g| g.on_true).collect::<Vec<_>>(), vec![false, true]);
+    }
+
+    #[test]
+    fn a_statement_outside_the_if_is_guarded_by_nothing() {
+        let mut fixture = if_fixture();
+        let after = fixture.body.alloc_stmt(Stmt::Continue).to_idx();
+        fixture.body.set_body_stmts(Box::new([fixture.if_stmt, after]));
+        assert!(guards_at(&fixture, after).is_empty());
+    }
+
+    /// The `Если` of the reported ERP shape sits inside `Для Каждого … Цикл`.
+    #[test]
+    fn guards_are_found_through_an_enclosing_loop() {
+        let mut fixture = if_fixture();
+        let collection = fixture.body.alloc_expr(Expr::Path(Name::new("Массив"))).to_idx();
+        let var = fixture.body.bindings_mut().alloc(hir_def::hir::Binding::var(Name::new("Э")));
+        let loop_stmt = fixture
+            .body
+            .alloc_stmt(Stmt::ForEach { var, collection, body: Box::new([fixture.if_stmt]) })
+            .to_idx();
+        fixture.body.set_body_stmts(Box::new([loop_stmt]));
+        assert_eq!(guards_at(&fixture, fixture.else_stmt).len(), 2);
+    }
+
+    #[test]
+    fn stmt_covers_stmt_sees_a_branch_statement_but_not_a_sibling() {
+        let mut fixture = if_fixture();
+        let after = fixture.body.alloc_stmt(Stmt::Continue).to_idx();
+        fixture.body.set_body_stmts(Box::new([fixture.if_stmt, after]));
+        assert!(stmt_covers_stmt(&fixture.body, fixture.if_stmt, fixture.else_stmt));
+        assert!(!stmt_covers_stmt(&fixture.body, fixture.if_stmt, after));
+    }
+
+    fn is_undefined_guard() -> Guard {
+        Guard::IsUndefined { var: Name::new("Х") }
+    }
+
+    #[test]
+    fn refuted_undefined_check_rules_out_a_confident_undefined() {
+        let db = InMemoryDb::new();
+        let undefined = db.undefined();
+        assert_eq!(
+            apply_branch_guard(&db, &is_undefined_guard(), false, undefined),
+            GuardVerdict::Contradicted
+        );
+        assert_eq!(
+            apply_branch_guard(
+                &db,
+                &Guard::IsNotUndefined { var: Name::new("Х") },
+                true,
+                undefined
+            ),
+            GuardVerdict::Contradicted
+        );
+    }
+
+    #[test]
+    fn refuted_undefined_check_leaves_a_type_that_never_was_undefined() {
+        let db = InMemoryDb::new();
+        assert_eq!(
+            apply_branch_guard(&db, &is_undefined_guard(), false, db.boolean()),
+            GuardVerdict::NoInformation
+        );
+    }
+
+    #[test]
+    fn refuted_undefined_check_drops_only_the_undefined_arm_of_a_union() {
+        let db = InMemoryDb::new();
+        let union = db.union(vec![db.undefined(), db.boolean()]);
+        assert_eq!(
+            apply_branch_guard(&db, &is_undefined_guard(), false, union),
+            GuardVerdict::Narrowed(db.boolean())
+        );
+    }
+
+    #[test]
+    fn an_untyped_receiver_is_never_contradicted() {
+        let db = InMemoryDb::new();
+        for ty in [db.unknown(), db.any(), db.never()] {
+            assert_eq!(
+                apply_branch_guard(&db, &is_undefined_guard(), false, ty),
+                GuardVerdict::NoInformation
+            );
+        }
+    }
+
+    #[test]
+    fn value_filled_rules_out_undefined_only_where_it_holds() {
+        let db = InMemoryDb::new();
+        let guard = Guard::ValueFilled { var: Name::new("Х") };
+        assert_eq!(
+            apply_branch_guard(&db, &guard, true, db.undefined()),
+            GuardVerdict::Contradicted
+        );
+        assert_eq!(
+            apply_branch_guard(&db, &guard, false, db.undefined()),
+            GuardVerdict::NoInformation
+        );
+    }
+
+    #[test]
+    fn a_type_check_rules_out_nothing() {
+        let db = InMemoryDb::new();
+        let guard = Guard::TypeCheck { var: Name::new("Х"), type_name: "Массив".to_owned() };
+        for on_true in [true, false] {
+            assert_eq!(
+                apply_branch_guard(&db, &guard, on_true, db.undefined()),
+                GuardVerdict::NoInformation
+            );
+        }
     }
 }

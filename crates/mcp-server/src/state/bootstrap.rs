@@ -13,7 +13,7 @@ use crate::graph::GraphState;
 use bsl_platform::PlatformDataInner;
 use bsl_search::{BaselineHashMode, CorpusId, IndexProgress, SearchEngine, SearchError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::{
     env,
     path::{Path, PathBuf},
@@ -34,6 +34,26 @@ static EMBEDDING_PUBLISH_RETRY_BUDGET_WARNINGS: std::sync::atomic::AtomicUsize =
 fn search_failure(error: SearchError) -> (String, String) {
     let reason = error.reason_code().unwrap_or("search_error").to_owned();
     (error.to_string(), reason)
+}
+
+/// Writes the verdict a reference-search worker could not write for itself.
+///
+/// `Loading` reads to the broker as live background work, so a worker that ends without
+/// reaching `Ready` or `Failed` — a panic on the way, or the stop path during shutdown —
+/// would hold the backend process for good. Every exit leaves a terminal state behind.
+struct LoadingVerdict(ReferenceSearchState);
+
+impl Drop for LoadingVerdict {
+    fn drop(&mut self) {
+        let mut lifecycle =
+            self.0.lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(*lifecycle, ReferenceSearchLifecycle::Loading) {
+            *lifecycle = ReferenceSearchLifecycle::Failed {
+                message: "reference search initialization ended without a verdict".to_owned(),
+                reason_code: "worker_gone".to_owned(),
+            };
+        }
+    }
 }
 
 impl ReferenceSearchState {
@@ -87,6 +107,7 @@ impl ReferenceSearchState {
         let state = self.clone();
         let spawn = std::thread::Builder::new().name("bsl-search-reference-init".to_owned()).spawn(
             move || {
+                let _verdict = LoadingVerdict(state.clone());
                 while !state.baseline.wait_ready(baseline_wait) {
                     if state.stopped.load(Ordering::Acquire) {
                         return;
@@ -161,10 +182,20 @@ impl ReferenceSearchState {
         self.lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
     }
 
+    /// Never blocks its caller: the broker's serve loop asks this on every tick.
+    ///
+    /// A contended lock reads as loading for that one tick, which costs an idle countdown.
+    /// A poisoned one is forever, so it is stepped over the way [`Self::lifecycle`] and
+    /// [`Self::shutdown`] already step over it — reading poison as live background work
+    /// would hold the backend process for the rest of its life.
     pub(super) fn loading(&self) -> bool {
-        self.lifecycle
-            .try_lock()
-            .map_or(true, |lifecycle| matches!(*lifecycle, ReferenceSearchLifecycle::Loading))
+        match self.lifecycle.try_lock() {
+            Ok(lifecycle) => matches!(*lifecycle, ReferenceSearchLifecycle::Loading),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                matches!(*poisoned.into_inner(), ReferenceSearchLifecycle::Loading)
+            }
+            Err(TryLockError::WouldBlock) => true,
+        }
     }
 
     pub(super) fn shutdown(&self) {
@@ -457,6 +488,7 @@ impl SharedState {
             debug_session: Arc::new(Mutex::new(None)),
             search_engine,
             workspace_search_initializing,
+            embed_flight,
             index_progress,
             semantic_runtime,
             overlay_warmup,
@@ -777,6 +809,7 @@ impl SharedState {
             debug_session: Arc::new(Mutex::new(None)),
             search_engine: Arc::clone(&reference_search.engine),
             workspace_search_initializing: Arc::new(AtomicBool::new(false)),
+            embed_flight: EmbedFlight::new(),
             index_progress: Arc::clone(&reference_search.progress),
             semantic_runtime: Arc::clone(&reference_search.semantic_runtime),
             overlay_warmup: Arc::new(Mutex::new(OverlayWarmupState::Pending)),
@@ -802,6 +835,7 @@ impl SharedState {
             debug_session: Arc::new(Mutex::new(None)),
             search_engine: Arc::new(Mutex::new(None)),
             workspace_search_initializing: Arc::new(AtomicBool::new(false)),
+            embed_flight: EmbedFlight::new(),
             index_progress: IndexProgress::new(),
             semantic_runtime: Arc::new(Mutex::new(SemanticRuntimeStatus::Disabled)),
             overlay_warmup: Arc::new(Mutex::new(OverlayWarmupState::Pending)),
@@ -1718,7 +1752,7 @@ impl SharedState {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{write_common_module_tree, EnvVarGuard, ENV_LOCK};
+    use super::super::test_support::{env_lock, write_common_module_tree, EnvVarGuard};
     use super::{
         DiagnosticsState, EmbedFlight, GraphState, OverlayInit, SemanticRuntimeStatus, SharedState,
         WorkspaceSearchMode, DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
@@ -1741,7 +1775,7 @@ mod tests {
 
     #[test]
     fn embedding_publish_retry_budget_requires_positive_representable_seconds() {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         EMBEDDING_PUBLISH_RETRY_BUDGET_WARNINGS.store(0, Ordering::SeqCst);
 
         let _env = EnvVarGuard::unset(EMBEDDING_PUBLISH_RETRY_BUDGET_ENV);
@@ -2154,7 +2188,7 @@ mod tests {
     fn workspace_state_uses_external_cache_without_touching_source_tree() {
         use std::time::{Duration, Instant};
 
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let _embedding_url = EnvVarGuard::unset("EMBEDDING_URL");
         let _embedding_model = EnvVarGuard::unset("EMBEDDING_MODEL");
 
@@ -2199,7 +2233,7 @@ mod tests {
     /// baseline, where the search init bails immediately and touches no graph at all.
     #[test]
     fn postgres_boot_starts_the_graph_even_when_the_search_init_bails() {
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let _embedding_url = EnvVarGuard::unset("EMBEDDING_URL");
 
         let dir = tempdir().unwrap();
@@ -2332,7 +2366,7 @@ mod tests {
     /// this node is about.
     #[test]
     fn the_boot_read_waits_for_the_watch_to_arm() {
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let _embedding_url = EnvVarGuard::unset("EMBEDDING_URL");
 
         let dir = tempdir().unwrap();
@@ -2415,7 +2449,7 @@ mod tests {
     /// the life of the process.
     #[test]
     fn a_boot_without_a_watch_leaves_no_cursor_behind() {
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let _embedding_url = EnvVarGuard::unset("EMBEDDING_URL");
 
         let dir = tempdir().unwrap();
@@ -2445,7 +2479,7 @@ mod tests {
     /// too, through the full scan, so a delivery test would pass either way.
     #[test]
     fn a_boot_with_a_watch_hands_the_cursor_to_a_running_sink() {
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let _embedding_url = EnvVarGuard::unset("EMBEDDING_URL");
 
         let dir = tempdir().unwrap();
@@ -2495,7 +2529,7 @@ mod tests {
     }
     #[test]
     fn workspace_external_failure_clears_local_baseline_rows_before_failing_closed() {
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let _embedding_url = EnvVarGuard::unset("EMBEDDING_URL");
         let dir = tempdir().unwrap();
         let workspace = dir.path();
@@ -2601,7 +2635,7 @@ mod tests {
     }
     #[test]
     fn workspace_external_failure_with_embeddings_fails_closed_without_hybrid_warmup() {
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let _embedding_url = EnvVarGuard::set("EMBEDDING_URL", "http://127.0.0.1:9/v1");
         // A configured embedder now requires an explicit model (no silent default), so set
         // one here; otherwise the ambient env decides whether the engine is semantic, which
@@ -2661,7 +2695,7 @@ mod tests {
     }
     #[test]
     fn workspace_standalone_semantic_fallback_publishes_before_embedding() {
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         // A configured embedder makes the engine semantic, but the URL is unreachable:
         // the point is that init must NOT run the synchronous embed here. It writes the
         // FTS chunks and defers embedding, so init returns promptly with work pending.
@@ -2748,10 +2782,7 @@ mod tests {
 
     #[test]
     fn reference_search_loading_is_single_flight_and_shutdown_joins_worker() {
-        let _env = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = env_lock();
         let dir = tempdir().unwrap();
         let _cache = EnvVarGuard::set("XDG_CACHE_HOME", dir.path().to_str().unwrap());
         let _embedding_url = EnvVarGuard::unset("EMBEDDING_URL");
@@ -2814,6 +2845,27 @@ mod tests {
         state.shutdown();
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert!(state.worker.lock().unwrap().is_none());
+        // The worker is gone, so nothing is loading any more. Saying otherwise keeps a broker
+        // backend alive for the life of the process.
+        assert!(!state.loading(), "a departed worker left the lifecycle claiming to load");
+    }
+
+    /// A mutex is poisoned for good. Reading poison as "still loading" would pin a broker
+    /// backend forever, so the lifecycle is read the way every other reader reads it.
+    #[test]
+    fn a_poisoned_lifecycle_does_not_read_as_forever_loading() {
+        let state = super::ReferenceSearchState::new(None);
+        let poisoner = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.lifecycle.lock().unwrap();
+            panic!("poison the lifecycle");
+        })
+        .join();
+
+        // Positive control: without a genuinely poisoned mutex the assertion below holds
+        // on any implementation at all.
+        assert!(state.lifecycle.is_poisoned(), "the stand poisoned nothing");
+        assert!(!state.loading(), "a poisoned lifecycle read as live background work");
     }
 
     #[test]
@@ -2911,7 +2963,7 @@ mod tests {
         use crate::diagnostics_state::DiagnosticsStatus;
         use std::time::{Duration, Instant};
 
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         // No embedder configured -> FTS-only local mode, the branch whose overlay was never
         // initialized before this fix.
         let _embedding_url = EnvVarGuard::unset("EMBEDDING_URL");
@@ -3056,7 +3108,7 @@ mod tests {
     /// dirty-marking at all.
     #[test]
     fn warm_boot_ftsonly_primes_overlay_for_edits_made_while_down() {
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let _embedding_url = EnvVarGuard::unset("EMBEDDING_URL");
         let _embedding_model = EnvVarGuard::unset("EMBEDDING_MODEL");
 
@@ -3141,7 +3193,7 @@ mod tests {
     /// the ghost row and fails this.
     #[test]
     fn deferred_boot_reconciles_deleted_file_and_stays_clean() {
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         // A configured embedder selects the semantic deferred branch; the URL is never dialed
         // (deferred indexing writes NULL embeddings), it only flips `has_semantic` true.
         let _embedding_url = EnvVarGuard::set("EMBEDDING_URL", "http://127.0.0.1:9/v1");
@@ -3304,7 +3356,7 @@ mod tests {
     /// satisfies every single-extension check.
     #[test]
     fn boot_registers_every_declared_extension_under_a_workspace_relative_id() {
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let (_dir, workspace) = workspace_with_two_extensions();
 
         let init = SharedState::init_workspace_search_engine_unmanaged(
@@ -3384,7 +3436,7 @@ mod tests {
     fn a_second_boot_over_a_matching_cache_declares_every_source_root_to_the_hub() {
         use crate::diagnostics_state::DiagnosticsStatus;
 
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let (_dir, workspace) = workspace_with_two_extensions();
         let graph_db = crate::cache::graph_db_path(&workspace);
 
@@ -3454,7 +3506,7 @@ mod tests {
     /// the configuration's walk never reaches them.
     #[test]
     fn overlapping_roots_keep_every_file_under_exactly_one_owner() {
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         let configuration = workspace.join("src").join("cf");
@@ -3551,7 +3603,7 @@ mod tests {
     /// other and serves one symbol where two exist.
     #[test]
     fn a_cold_boot_indexes_every_root_and_keeps_same_named_paths_apart() {
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         let configuration = workspace.join("src").join("cf");
@@ -3621,7 +3673,7 @@ mod tests {
     /// with none get indexed.
     #[test]
     fn a_warm_store_indexes_a_root_declared_while_it_was_down() {
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         // No embedder: this is the FTS-only branch, the one that skips a warm store.
         let _embedding_url = EnvVarGuard::unset("EMBEDDING_URL");
         let _embedding_model = EnvVarGuard::unset("EMBEDDING_MODEL");
@@ -3710,7 +3762,7 @@ mod tests {
     /// The vectors themselves are written by the background pass over HTTP and are not built here.
     #[test]
     fn a_deferred_boot_queues_the_extension_for_embedding() {
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         // A configured embedder selects the semantic deferred branch; the URL is never dialed.
         let _embedding_url = EnvVarGuard::set("EMBEDDING_URL", "http://127.0.0.1:9/v1");
         let _embedding_model = EnvVarGuard::set("EMBEDDING_MODEL", "test-model");
@@ -3745,7 +3797,7 @@ mod tests {
     /// pass the positive check.
     #[test]
     fn a_file_outside_every_declared_root_has_no_key() {
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let (_dir, workspace) = workspace_with_two_extensions();
         fs::write(workspace.join("bsl-analyzer.toml"), "[source]\nroot = \"src/cf\"\n").unwrap();
 

@@ -2049,6 +2049,38 @@ EndFunction
         assert_eq!(out[0].tag, HlTag::Procedure);
     }
 
+    /// Инструкции расширений подсвечиваются наравне с остальными.
+    ///
+    /// Эти четыре инструкции законны только в расширениях конфигурации,
+    /// поэтому в основных конфигурациях их отсутствие в подсветке никак не
+    /// проявлялось. Обе языковые формы взяты потому, что подсветка идёт от
+    /// вида лексемы, а вид у русского и английского написания один.
+    #[test]
+    fn test_highlight_extension_directives() {
+        for code in [
+            "#Вставка\nПроцедура П() КонецПроцедуры\n#КонецВставки\n#Удаление\nПроцедура У() КонецПроцедуры\n#КонецУдаления\n",
+            "#Insert\nПроцедура П() КонецПроцедуры\n#EndInsert\n#Delete\nПроцедура У() КонецПроцедуры\n#EndDelete\n",
+        ] {
+            let (db, file_id) = create_db_with_file(code);
+            let highlights = highlight(&db, file_id);
+
+            let directives: Vec<&str> = highlights
+                .highlights
+                .iter()
+                .filter(|hl| hl.tag == HlTag::Preprocessor)
+                .map(|hl| {
+                    let start: usize = hl.range.start().into();
+                    let end: usize = hl.range.end().into();
+                    &code[start..end]
+                })
+                .collect();
+
+            let expected: Vec<&str> =
+                code.lines().filter(|line| line.starts_with('#')).collect();
+            assert_eq!(directives, expected, "не все инструкции получили подсветку");
+        }
+    }
+
     #[test]
     fn test_normalize_highlights_drops_partial_overlap() {
         let outer = TextRange::new(0.into(), 6.into());

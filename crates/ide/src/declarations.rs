@@ -75,7 +75,7 @@ pub struct Declaration {
 pub fn graph_id_of_declaration(
     db: &crate::RootDatabaseImpl,
     declaration: &Declaration,
-    workspace_root: Option<&std::path::Path>,
+    workspace_root: Option<&crate::graph::StripRoot>,
 ) -> Option<String> {
     if declaration.kind != DeclarationKind::Method {
         return None;

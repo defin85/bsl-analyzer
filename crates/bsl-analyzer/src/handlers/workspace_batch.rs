@@ -79,8 +79,8 @@ pub(crate) fn over_mem_budget(budget_mb: usize) -> bool {
     if budget_mb == 0 {
         return true;
     }
-    if let Some(rss_kb) = crate::mem_report::proc_kb("VmRSS:") {
-        return (rss_kb / 1024) as usize > budget_mb;
+    if let Some(rss_bytes) = crate::mem_report::process_rss_bytes() {
+        return (rss_bytes / 1048576) as usize > budget_mb;
     }
     let allocated_mb = profile::memory_usage().allocated.megabytes();
     allocated_mb <= 0 || allocated_mb as usize > budget_mb

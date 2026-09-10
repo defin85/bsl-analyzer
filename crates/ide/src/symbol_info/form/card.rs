@@ -247,12 +247,8 @@ fn form_handler_card(
     let sigs = build_signature(db, resolved.file_id, &callee)?;
     let sig = sigs.first()?;
     let mut card = card_from_method_sig(db, symbol, sig, Some(form_container(resolved)), req);
-    card.graph_id = form_handler_graph_id(
-        db,
-        resolved.file_id,
-        &sig.name_russian,
-        req.workspace_root.as_deref(),
-    );
+    card.graph_id =
+        form_handler_graph_id(db, resolved.file_id, &sig.name_russian, req.workspace_root.as_ref());
     Some(card)
 }
 
@@ -318,7 +314,7 @@ fn form_handler_graph_id(
     db: &RootDatabaseImpl,
     form_file: FileId,
     method_name: &str,
-    workspace_root: Option<&std::path::Path>,
+    workspace_root: Option<&crate::graph::StripRoot>,
 ) -> Option<String> {
     let path = file_path(db, form_file)?;
     // The graph builder encodes a form handler's fallback id relative to the WORKSPACE root, not

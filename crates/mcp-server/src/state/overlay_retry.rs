@@ -90,8 +90,49 @@ pub(crate) struct OverlayRetry {
     state: Mutex<RetryState>,
     wake: Condvar,
     stop: AtomicBool,
+    /// Whether a pass is running right now. The backend's lifetime is read off this rather
+    /// than off the shared status slot: the status has a second writer (the embed pass), and
+    /// its `Ready` at its own finish would otherwise erase this pass from view mid-sync.
+    /// Raised and lowered by the pass itself, so no exit can leave it set.
+    pass_active: AtomicBool,
     /// Completed pass count — observability and the single-flight proof in tests.
     passes: AtomicUsize,
+}
+
+/// Marks a pass as running for as long as it lives.
+struct PassActive<'a>(&'a AtomicBool);
+
+impl<'a> PassActive<'a> {
+    fn raise(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::SeqCst);
+        Self(flag)
+    }
+}
+
+impl Drop for PassActive<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Writes the verdict a departed overlay worker can no longer write.
+///
+/// Once the worker is gone — unwound out of a pass, or returned on stop — nobody will ever
+/// settle `OverlaySyncing` again, and `search status` would report a sync that ended long ago.
+/// A status that was already settled is left alone: this writes the missing verdict, it does
+/// not overwrite an existing one.
+struct SyncingVerdict(Arc<OverlayRetry>);
+
+impl Drop for SyncingVerdict {
+    fn drop(&mut self) {
+        let mut status =
+            self.0.semantic_runtime.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(*status, SemanticRuntimeStatus::OverlaySyncing) {
+            *status = SemanticRuntimeStatus::Failed(
+                "workspace overlay sync ended without a verdict".to_owned(),
+            );
+        }
+    }
 }
 
 impl OverlayRetry {
@@ -137,6 +178,7 @@ impl OverlayRetry {
             }),
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
+            pass_active: AtomicBool::new(false),
             passes: AtomicUsize::new(0),
         })
     }
@@ -146,7 +188,10 @@ impl OverlayRetry {
         let worker = Arc::clone(self);
         std::thread::Builder::new()
             .name("bsl-search-overlay-retry".to_owned())
-            .spawn(move || worker.run())
+            .spawn(move || {
+                let _verdict = SyncingVerdict(Arc::clone(&worker));
+                worker.run()
+            })
             .ok();
     }
 
@@ -270,7 +315,17 @@ impl OverlayRetry {
         signals.map(|signals| signals.demands_a_pass()).unwrap_or(true)
     }
 
+    /// Whether an overlay pass is running right now.
+    ///
+    /// A pass that is merely due — parked on its backoff between attempts — is deliberately
+    /// not "running": nothing is being computed, and holding a whole backend process through
+    /// a growing backoff is the very unbounded hold this signal exists to avoid.
+    pub(super) fn pass_active(&self) -> bool {
+        self.pass_active.load(Ordering::SeqCst)
+    }
+
     fn run_pass(&self) -> super::WorkspaceSearchApply<OverlayWarmupState, String> {
+        let _active = PassActive::raise(&self.pass_active);
         // The syncing status is shown only for a pass that can actually reach the engine;
         // flipping it while the engine is absent would mask a terminal init `Failed`.
         let engine_present =
@@ -444,7 +499,7 @@ impl OverlayRetry {
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{
-        mock_embedding_env, mock_semantic_config, spawn_mock_embedding_server, ENV_LOCK,
+        env_lock, mock_embedding_env, mock_semantic_config, spawn_mock_embedding_server,
     };
     use super::*;
     use bsl_search::SearchEngine;
@@ -511,6 +566,69 @@ mod tests {
             lease,
             super::super::bootstrap::DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
         )
+    }
+
+    /// The signal the backend's lifetime is read from has to be raised by the pass itself and
+    /// gone when the pass is. Observed from INSIDE the pass: asserting it from outside after
+    /// the fact would hold on a flag nobody ever raised.
+    #[test]
+    fn a_running_pass_is_visible_as_background_work() {
+        struct ResetHook;
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                *RUN_PASS_FINISH_HOOK.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            }
+        }
+        let _lock = env_lock();
+        let _reset = ResetHook;
+
+        let engine: SharedSearchEngine = Arc::new(Mutex::new(None));
+        let retry = unstarted_driver_over(engine, WorkspaceLease::unmanaged());
+        assert!(!retry.pass_active(), "a driver that never ran a pass reads as running one");
+
+        let seen = Arc::new(AtomicBool::new(false));
+        let seen_in_hook = Arc::clone(&seen);
+        let retry_in_hook = Arc::clone(&retry);
+        *RUN_PASS_FINISH_HOOK.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(Box::new(move || {
+                seen_in_hook.store(retry_in_hook.pass_active(), Ordering::SeqCst);
+            }));
+
+        retry.run_pass();
+
+        assert!(seen.load(Ordering::SeqCst), "the pass never marked itself running");
+        assert!(!retry.pass_active(), "the pass stayed marked running after it ended");
+    }
+
+    /// The worker is the only writer of `OverlaySyncing`. Once it is gone nobody settles
+    /// that status again, and the broker reads a pass that is still running — holding the
+    /// backend process for the rest of its life.
+    #[test]
+    fn a_departed_worker_settles_the_syncing_status() {
+        let engine: SharedSearchEngine = Arc::new(Mutex::new(None));
+        let retry = unstarted_driver_over(engine, WorkspaceLease::unmanaged());
+        *retry.semantic_runtime.lock().unwrap() = SemanticRuntimeStatus::OverlaySyncing;
+
+        drop(SyncingVerdict(Arc::clone(&retry)));
+
+        assert!(
+            matches!(&*retry.semantic_runtime.lock().unwrap(), SemanticRuntimeStatus::Failed(_)),
+            "a departed worker left the status claiming to sync"
+        );
+    }
+
+    /// The other half of the same contract, and the control on the test above: a verdict
+    /// that was already written stands, so the guard cannot be a blanket overwrite that
+    /// would pass the check above no matter what the worker had settled.
+    #[test]
+    fn a_settled_status_survives_the_departing_worker() {
+        let engine: SharedSearchEngine = Arc::new(Mutex::new(None));
+        let retry = unstarted_driver_over(engine, WorkspaceLease::unmanaged());
+        *retry.semantic_runtime.lock().unwrap() = SemanticRuntimeStatus::Ready;
+
+        drop(SyncingVerdict(Arc::clone(&retry)));
+
+        assert!(matches!(&*retry.semantic_runtime.lock().unwrap(), SemanticRuntimeStatus::Ready));
     }
 
     fn wait_for(deadline_ms: u64, mut check: impl FnMut() -> bool) -> bool {
@@ -637,7 +755,7 @@ mod tests {
 
     #[test]
     fn transient_budget_fails_once_ignores_active_kicks_and_rearms_on_new_drift() {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
         let dir = tempdir().unwrap();
@@ -702,7 +820,7 @@ mod tests {
     /// clean first pass the condition goes quiet, so no kick storm re-runs it.
     #[test]
     fn concurrent_kicks_collapse_into_one_pass() {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
         let dir = tempdir().unwrap();
@@ -733,7 +851,7 @@ mod tests {
     /// once the engine appears the next kick completes the startup pass — it was never lost.
     #[test]
     fn a_transient_engine_absence_keeps_the_obligation() {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
         let engine_arc: SharedSearchEngine = Arc::new(Mutex::new(None));
@@ -830,7 +948,7 @@ mod tests {
     /// cannot start another pass or report the old daemon semantically ready.
     #[test]
     fn observed_supersession_never_resumes() {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
         let dir = tempdir().unwrap();
@@ -885,7 +1003,7 @@ mod tests {
             }
         }
         let _reset = ResetHook;
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
         let dir = tempdir().unwrap();
@@ -922,7 +1040,7 @@ mod tests {
     /// new owner's re-reads after a restart.
     #[test]
     fn a_lost_lease_refuses_the_publish_fence() {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
         let dir = tempdir().unwrap();
@@ -966,7 +1084,7 @@ mod tests {
     #[test]
     fn an_incomplete_pass_is_caught_up_after_the_subtree_returns() {
         use std::os::unix::fs::PermissionsExt;
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
         let dir = tempdir().unwrap();
@@ -1024,7 +1142,7 @@ mod tests {
     /// lexical-only (its mark consumed) still drives a pass that attaches the vectors.
     #[test]
     fn a_lexical_only_entry_drives_a_vector_catch_up_pass() {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
         let dir = tempdir().unwrap();

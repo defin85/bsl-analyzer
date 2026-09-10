@@ -2236,7 +2236,11 @@ mod tests {
     #[test]
     fn a_patch_records_only_the_holes_whose_rows_it_rewrote() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
+        // The artefact keys rows by the walk's canonical spelling, and production
+        // hands the patch paths from that same walk. A root reached through a link
+        // (the temp dir is one on macOS) would have this stand comparing spellings
+        // production never compares.
+        let root = &dir.path().canonicalize().unwrap();
         sample_workspace(root);
         write_common_module(
             root,
@@ -2326,7 +2330,8 @@ mod tests {
 
         let (db, files) = load_workspace_db(root).expect("workspace loads");
         let analysis = Analysis::from_database(db.clone());
-        let overview = analysis.graph_overview(GRAPH_SOURCE_ROOT, Some(root), 10);
+        let overview =
+            analysis.graph_overview(GRAPH_SOURCE_ROOT, Some(&ide::StripRoot::resolve(root)), 10);
 
         let out = root.join(".build/bsl-graph.db");
         fs::create_dir_all(out.parent().unwrap()).unwrap();
@@ -2879,7 +2884,8 @@ mod tests {
 
         let (db, files) = load_workspace_db(root).expect("workspace loads");
         let analysis = Analysis::from_database(db);
-        let fold = analysis.graph_overview(GRAPH_SOURCE_ROOT, Some(root), 50);
+        let fold =
+            analysis.graph_overview(GRAPH_SOURCE_ROOT, Some(&ide::StripRoot::resolve(root)), 50);
         let fold_mdo: Vec<&str> = fold
             .top_by_centrality
             .iter()
@@ -2947,15 +2953,23 @@ mod tests {
 
         let id = "method/common/Сервер/Считать";
 
-        let mem_overview =
-            serde_json::to_value(analysis.graph_overview(GRAPH_SOURCE_ROOT, Some(root), 10))
-                .unwrap();
+        let mem_overview = serde_json::to_value(analysis.graph_overview(
+            GRAPH_SOURCE_ROOT,
+            Some(&ide::StripRoot::resolve(root)),
+            10,
+        ))
+        .unwrap();
         let sql_overview = serde_json::to_value(gdb.overview(10, None).unwrap()).unwrap();
         assert_eq!(mem_overview, sql_overview, "overview JSON");
 
         let mem_node = serde_json::to_value(
             analysis
-                .graph_node(GRAPH_SOURCE_ROOT, Some(root), id, ide::GraphDetail::Bodies)
+                .graph_node(
+                    GRAPH_SOURCE_ROOT,
+                    Some(&ide::StripRoot::resolve(root)),
+                    id,
+                    ide::GraphDetail::Bodies,
+                )
                 .unwrap(),
         )
         .unwrap();
@@ -2976,7 +2990,9 @@ mod tests {
             max_call_sites: 0,
         };
         let mem_nb = serde_json::to_value(
-            analysis.graph_neighbors(GRAPH_SOURCE_ROOT, Some(root), &params).unwrap(),
+            analysis
+                .graph_neighbors(GRAPH_SOURCE_ROOT, Some(&ide::StripRoot::resolve(root)), &params)
+                .unwrap(),
         )
         .unwrap();
         let sql_nb = serde_json::to_value(gdb.neighbors(&params, None).unwrap().unwrap()).unwrap();
@@ -2987,7 +3003,13 @@ mod tests {
         // projection that grew the fields on one side only would diverge right here.
         let with_places = ide::NeighborsParams { call_sites: true, max_call_sites: 20, ..params };
         let mem_sites = serde_json::to_value(
-            analysis.graph_neighbors(GRAPH_SOURCE_ROOT, Some(root), &with_places).unwrap(),
+            analysis
+                .graph_neighbors(
+                    GRAPH_SOURCE_ROOT,
+                    Some(&ide::StripRoot::resolve(root)),
+                    &with_places,
+                )
+                .unwrap(),
         )
         .unwrap();
         let sql_sites =
@@ -2999,9 +3021,13 @@ mod tests {
         );
 
         let ids = [id.to_string()];
-        let mem_src =
-            serde_json::to_value(analysis.graph_source(GRAPH_SOURCE_ROOT, Some(root), &ids, 4000))
-                .unwrap();
+        let mem_src = serde_json::to_value(analysis.graph_source(
+            GRAPH_SOURCE_ROOT,
+            Some(&ide::StripRoot::resolve(root)),
+            &ids,
+            4000,
+        ))
+        .unwrap();
         let sql_src = serde_json::to_value(gdb.source(&ids, 4000).unwrap()).unwrap();
         assert_eq!(mem_src, sql_src, "source JSON");
 
@@ -3308,9 +3334,12 @@ mod tests {
 
         // Overview parity covers node/edge tallies, provenance, and the
         // centrality ranking (whose nodes carry the canonical Mdo spelling).
-        let mem_overview =
-            serde_json::to_value(analysis.graph_overview(GRAPH_SOURCE_ROOT, Some(root), 10))
-                .unwrap();
+        let mem_overview = serde_json::to_value(analysis.graph_overview(
+            GRAPH_SOURCE_ROOT,
+            Some(&ide::StripRoot::resolve(root)),
+            10,
+        ))
+        .unwrap();
         let sql_overview = serde_json::to_value(gdb.overview(10, None).unwrap()).unwrap();
         assert_eq!(mem_overview, sql_overview, "overview JSON from a multi-module batch");
         // The module count is the true distinct-module population (both common modules
@@ -3318,9 +3347,13 @@ mod tests {
         assert_eq!(sql_overview["modules"], 2, "both common modules counted: {sql_overview}");
 
         // `resolve` parity: a bare method name yields the same candidates from both paths.
-        let mem_resolve =
-            serde_json::to_value(analysis.graph_resolve(GRAPH_SOURCE_ROOT, Some(root), "ШагБ", 10))
-                .unwrap();
+        let mem_resolve = serde_json::to_value(analysis.graph_resolve(
+            GRAPH_SOURCE_ROOT,
+            Some(&ide::StripRoot::resolve(root)),
+            "ШагБ",
+            10,
+        ))
+        .unwrap();
         let sql_resolve = serde_json::to_value(gdb.resolve("ШагБ", 10).unwrap()).unwrap();
         assert_eq!(mem_resolve, sql_resolve, "resolve candidates from a multi-module batch");
         assert!(
@@ -3352,7 +3385,9 @@ mod tests {
             max_call_sites: 0,
         };
         let mem_nb = serde_json::to_value(
-            analysis.graph_neighbors(GRAPH_SOURCE_ROOT, Some(root), &params).unwrap(),
+            analysis
+                .graph_neighbors(GRAPH_SOURCE_ROOT, Some(&ide::StripRoot::resolve(root)), &params)
+                .unwrap(),
         )
         .unwrap();
         let sql_nb = serde_json::to_value(gdb.neighbors(&params, None).unwrap().unwrap()).unwrap();
@@ -3409,7 +3444,9 @@ mod tests {
             call_sites: false,
             max_call_sites: 0,
         };
-        let mem = analysis.graph_neighbors(GRAPH_SOURCE_ROOT, Some(root), &params).unwrap();
+        let mem = analysis
+            .graph_neighbors(GRAPH_SOURCE_ROOT, Some(&ide::StripRoot::resolve(root)), &params)
+            .unwrap();
         let sql = gdb.neighbors(&params, None).unwrap().unwrap();
 
         assert_eq!(mem.total, 3, "all three tied callers counted");

@@ -301,9 +301,11 @@ pub fn resolve_vfs_path_query(
 /// Resolve a CONSTRUCTED candidate path whose trailing components may differ
 /// from the real spelling only by the caller-declared match modes. The exact
 /// spelling is tried first (a canonical tree pays one map lookup); on a miss,
-/// one scan of the file set compares componentwise: every leading component
-/// exactly (it came from a real path), the last `tail_modes.len()` components
-/// by their mode — object-name positions stay exact there too.
+/// the file set is scanned once per candidate. The scan is memoised on
+/// `(source root, candidate, modes)` rather than on the asking file: a fixed
+/// host path such as `Ext/ApplicationModule.bsl` is asked by every file of a
+/// configuration and answered by the root alone, so a per-file memo would
+/// repeat the whole-set scan once per file.
 pub fn resolve_vfs_path_ci_query(
     db: &dyn salsa::Database,
     source_root_input: SourceRootInput,
@@ -316,6 +318,21 @@ pub fn resolve_vfs_path_ci_query(
     if tail_modes.is_empty() {
         return None;
     }
+    resolve_vfs_path_ci_scan_query(db, source_root_input, vfs_path_str, tail_modes.to_vec())
+}
+
+/// One scan of the file set for a candidate that missed its exact spelling,
+/// comparing componentwise: every leading component exactly (it came from a
+/// real path), the last `tail_modes.len()` components by their mode —
+/// object-name positions stay exact there too. Reading the root records the
+/// file-set dependency, so a changed set re-runs the scan.
+#[salsa::tracked(lru = 256, heap_size = stdx::heap::zero, returns(copy))]
+fn resolve_vfs_path_ci_scan_query(
+    db: &dyn salsa::Database,
+    source_root_input: SourceRootInput,
+    vfs_path_str: String,
+    tail_modes: Vec<bsl_conventions::SegmentMatch>,
+) -> Option<FileId> {
     let candidate: Vec<String> =
         vfs_path_str.replace('\\', "/").split('/').map(str::to_owned).collect();
     let source_root = source_root_input.root(db);
@@ -335,7 +352,7 @@ pub fn resolve_vfs_path_ci_query(
         let tail_ok = real[head..]
             .iter()
             .zip(&candidate[head..])
-            .zip(tail_modes)
+            .zip(&tail_modes)
             .all(|((r, c), mode)| mode.matches(r, c));
         if tail_ok {
             return Some(file);
@@ -346,27 +363,64 @@ pub fn resolve_vfs_path_ci_query(
 
 #[cfg(test)]
 mod ci_resolution_tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use bsl_conventions::SegmentMatch as M;
+    use salsa::Setter;
     use vfs::file_set::FileSet;
     use vfs::VfsPath;
 
     #[salsa::db]
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct ResolveDb {
         storage: salsa::Storage<Self>,
+        executed: Arc<Mutex<Vec<salsa::IngredientIndex>>>,
     }
 
     #[salsa::db]
     impl salsa::Database for ResolveDb {}
 
-    fn db_with(paths: &[&str]) -> (ResolveDb, SourceRootInput) {
-        let db = ResolveDb::default();
+    impl Default for ResolveDb {
+        fn default() -> Self {
+            let executed = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&executed);
+            let storage = salsa::Storage::builder()
+                .event_callback(Box::new(move |event| {
+                    if let salsa::EventKind::WillExecute { database_key } = event.kind {
+                        sink.lock().unwrap().push(database_key.ingredient_index());
+                    }
+                }))
+                .build();
+            Self { storage, executed }
+        }
+    }
+
+    impl ResolveDb {
+        fn scans(&self) -> usize {
+            use salsa::Database;
+            self.executed
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|idx| {
+                    self.ingredient_debug_name(**idx).contains("resolve_vfs_path_ci_scan_query")
+                })
+                .count()
+        }
+    }
+
+    fn file_set_of(paths: &[&str]) -> FileSet {
         let mut file_set = FileSet::default();
         for (i, path) in paths.iter().enumerate() {
             file_set.insert(vfs::FileId(i as u32), VfsPath::new(*path));
         }
-        let input = SourceRootInput::new(&db, crate::SourceRoot::new_local(file_set));
+        file_set
+    }
+
+    fn db_with(paths: &[&str]) -> (ResolveDb, SourceRootInput) {
+        let db = ResolveDb::default();
+        let input = SourceRootInput::new(&db, crate::SourceRoot::new_local(file_set_of(paths)));
         (db, input)
     }
 
@@ -404,5 +458,54 @@ mod ci_resolution_tests {
             &[M::Ci, M::StemExactExtCi],
         );
         assert!(found.is_none(), "головные компоненты пришли из реального пути и точны");
+    }
+
+    #[test]
+    fn a_repeated_miss_scans_the_file_set_once() {
+        let (db, root) = db_with(&["/w/cf/CommonModules/A/Ext/Module.bsl"]);
+        let candidate = "/w/cf/Ext/ApplicationModule.bsl";
+        for _ in 0..3 {
+            let found =
+                resolve_vfs_path_ci_query(&db, root, candidate.to_string(), &[M::Ci, M::Ci]);
+            assert_eq!(found, None);
+        }
+        assert_eq!(db.scans(), 1, "один кандидат — один скан, сколько бы файлов ни спрашивало");
+    }
+
+    #[test]
+    fn a_changed_file_set_rescans_and_finds_the_new_file() {
+        let (mut db, root) = db_with(&["/w/cf/CommonModules/A/Ext/Module.bsl"]);
+        let candidate = "/w/cf/Ext/ApplicationModule.bsl";
+        assert_eq!(
+            resolve_vfs_path_ci_query(&db, root, candidate.to_string(), &[M::Ci, M::Ci]),
+            None
+        );
+
+        let grown = file_set_of(&[
+            "/w/cf/CommonModules/A/Ext/Module.bsl",
+            "/w/cf/EXT/APPLICATIONMODULE.BSL",
+        ]);
+        root.set_root(&mut db).to(crate::SourceRoot::new_local(grown));
+
+        let found = resolve_vfs_path_ci_query(&db, root, candidate.to_string(), &[M::Ci, M::Ci]);
+        assert_eq!(found, Some(vfs::FileId(1)), "новый файл виден после смены file set");
+        assert_eq!(db.scans(), 2, "смена file set инвалидирует memo скана");
+    }
+
+    #[test]
+    fn the_mask_is_part_of_the_memo_key() {
+        let (db, root) = db_with(&["/w/cf/Ext/Товар.XML"]);
+        let candidate = "/w/cf/Ext/Товар.xml";
+        let lenient = resolve_vfs_path_ci_query(
+            &db,
+            root,
+            candidate.to_string(),
+            &[M::Ci, M::StemExactExtCi],
+        );
+        assert_eq!(lenient, Some(vfs::FileId(0)));
+        let strict =
+            resolve_vfs_path_ci_query(&db, root, candidate.to_string(), &[M::Ci, M::Exact]);
+        assert_eq!(strict, None, "точная маска не получает ответ мягкой из memo");
+        assert_eq!(db.scans(), 2, "разные маски одного кандидата — разные ключи");
     }
 }

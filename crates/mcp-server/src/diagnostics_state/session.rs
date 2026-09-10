@@ -39,6 +39,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::lifecycle::DiagnosticsState;
 use super::resident::DiagnosticsResident;
@@ -147,9 +148,10 @@ impl ResidentSession {
         &self.cancel
     }
 
-    /// Ask for a drift re-scan before the next read (storm-guarded by the state).
-    pub(crate) fn force_rescan(&self) {
-        self.diag.force_rescan();
+    /// Ask for a drift re-scan before the next read (storm-guarded by the state), and
+    /// report what that guard owes — see [`DiagnosticsState::force_rescan`].
+    pub(crate) fn force_rescan(&self) -> Option<Duration> {
+        self.diag.force_rescan()
     }
 
     /// Read once, and read again behind a forced re-scan when the first answer is a miss
@@ -169,6 +171,12 @@ impl ResidentSession {
     /// scan rather than only inside the retry, because that scan walks the tree — the most
     /// expensive thing to do for a caller that has already gone.
     ///
+    /// A force the storm guard DECLINES is not a retry that ran. It is the same blind read
+    /// a second time, and its miss reaches the caller wearing the finality of one that
+    /// walked. So the floor is waited out — at most the floor itself — and the force asked
+    /// for again. The guard keeps its rate (still one walk per floor); what it loses is the
+    /// power to answer for the walk it prevented.
+    ///
     /// WHICH answers qualify belongs to the tool: only it knows what its own miss looks
     /// like.
     pub(crate) fn read_retrying_a_stale_miss<T>(
@@ -183,7 +191,26 @@ impl ResidentSession {
         if !is_stale_miss(answer) || self.is_cancelled() {
             return outcome;
         }
-        self.force_rescan();
+        #[cfg(test)]
+        {
+            self.diag.note_stale_miss_consultation();
+            self.diag.fire_pre_force_probe();
+        }
+        if let Some(owed) = self.force_rescan() {
+            // Blocking is the right shape here: this whole body already runs on a blocking
+            // thread (`resident_call`), the wait is bounded by the floor, and nothing of
+            // this state is held across it.
+            std::thread::sleep(owed);
+            if self.is_cancelled() {
+                return outcome;
+            }
+            // If the floor declines this one too, another walk finished during the wait and
+            // its verdict is taken. Waiting again would bound nothing: the count of retries
+            // is what stops a loop of genuinely absent lookups from walking the tree once
+            // per attempt, and one wait already turns "no walk at all" into "a walk no
+            // older than the floor".
+            self.force_rescan();
+        }
         read()
     }
 
@@ -247,7 +274,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diagnostics_state::test_support::{write, write_common_module};
+    use crate::diagnostics_state::drift::FORCE_RESCAN_FLOOR;
+    use crate::diagnostics_state::lock_recover;
+    use crate::diagnostics_state::test_support::{
+        wait_ready, wait_until, write, write_common_module,
+    };
     use crate::walk_probe::{await_walk_start, entered, install, reset, WALK_GATE};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::{Duration, Instant};
@@ -302,28 +333,16 @@ mod tests {
     }
 
     /// The whole `references` answer for the popular name — anchor, walk and render.
+    /// Reduced to whether it answered at all: these gates time the walk, they do not read it.
     fn walk(session: &ResidentSession) -> ResidentOutcome<bool> {
-        session.read(|resident, db, _| {
-            let params = crate::tools::references::Params {
-                symbol: Some(DECLARED),
-                anchor_root_id: None,
-                root_id: None,
-                path: None,
-                line: None,
-                column: None,
-                line_content: None,
-                area_root_id: None,
-                area_path_prefix: None,
-                kinds: &[],
-                include_declaration: Some(true),
-                limit: None,
-                max_files: None,
-                include_preview: None,
-            };
-            // No external sources: this probe measures how long the resident is held, and a
-            // graph source would add its own work to the very interval being timed.
-            crate::tools::references::answer(resident, db.database(), &params, 6000, &[]).is_ok()
-        })
+        match references_read(session, DECLARED)() {
+            ResidentOutcome::Ready(answer, freshness) => {
+                ResidentOutcome::Ready(answer.is_ok(), freshness)
+            }
+            ResidentOutcome::Loading => ResidentOutcome::Loading,
+            ResidentOutcome::Disabled => ResidentOutcome::Disabled,
+            ResidentOutcome::Failed(msg) => ResidentOutcome::Failed(msg),
+        }
     }
 
     /// How long a second resident call waits behind a first one, with and without a
@@ -643,6 +662,121 @@ mod tests {
         (state, session)
     }
 
+    /// A state whose throttle cache reads as walked JUST NOW, so every force meets the
+    /// storm guard's decline. No resident behind it: these gates count reads and forces,
+    /// and building a database would only add time to a wait they measure.
+    fn a_state_the_storm_guard_is_protecting(root: &std::path::Path) -> DiagnosticsState {
+        let state = DiagnosticsState::for_workspace(root.to_path_buf());
+        *lock_recover(&state.scan) = Some(crate::diagnostics_state::drift::ScanCache {
+            at: Instant::now(),
+            stats: Vec::new(),
+            config_fp: 0,
+            baseline_epoch: 0,
+            verdict: crate::graph::universe::ScanVerdict::for_test(0, 0),
+        });
+        state
+    }
+
+    /// A declined force is waited out and asked again — one wait, one extra consultation,
+    /// and the retry that was owed. Counted here rather than answered: the end-to-end gate
+    /// below reads what the walk found, this one pins the policy's shape.
+    #[test]
+    fn a_force_the_floor_declines_costs_one_wait_and_one_more_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = a_state_the_storm_guard_is_protecting(dir.path());
+        let session =
+            ResidentSession { diag: state.clone(), cancel: Arc::new(RequestCancel::default()) };
+        let reads = AtomicUsize::new(0);
+
+        let started = Instant::now();
+        let outcome = session.read_retrying_a_stale_miss(
+            || {
+                reads.fetch_add(1, AtomicOrdering::SeqCst);
+                ResidentOutcome::Ready(MISS, fresh())
+            },
+            |answer| *answer == MISS,
+        );
+
+        assert!(matches!(outcome, ResidentOutcome::Ready(..)), "a Ready outcome stays Ready");
+        assert_eq!(
+            reads.load(AtomicOrdering::SeqCst),
+            2,
+            "the retry the caller was owed still ran"
+        );
+        assert_eq!(
+            state.forced_rescans(),
+            2,
+            "one force the floor declined and one asked after the wait — a policy that took \
+             the decline for an answer would consult once",
+        );
+        assert!(
+            started.elapsed() >= FORCE_RESCAN_FLOOR,
+            "and it waited the floor out rather than asking again straight away, which the \
+             guard would decline exactly as it declined the first",
+        );
+    }
+
+    /// A cancel arriving DURING that wait stops the retry, for the same reason a cancel
+    /// before it does: the force it would ask for walks the tree, and the caller has gone.
+    /// The positive control is the same stand with no cancel, which does retry — without it
+    /// a policy that never retried behind a declined force would pass this gate too.
+    #[test]
+    fn a_cancel_arriving_during_the_wait_stops_the_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = a_state_the_storm_guard_is_protecting(dir.path());
+
+        let cancel = Arc::new(RequestCancel::default());
+        let session = ResidentSession { diag: state.clone(), cancel: Arc::clone(&cancel) };
+        // Fired from outside, because a cancel raised by the read itself lands BEFORE the
+        // force and never reaches the window this gate is about — and fired on the EVENT,
+        // not on a clock. The hatch counter rises inside the declined force, which is the
+        // statement immediately before the sleep, so waiting on it puts the cancel after
+        // the force this gate requires to have happened and inside the wait it is about.
+        // A timer would have to land between the two, and a stand that hopes to hit a
+        // window is measuring the scheduler.
+        let armed = state.clone();
+        let ticker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while armed.forced_rescans() == 0 && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            cancel.cancel_all();
+        });
+        let reads = AtomicUsize::new(0);
+        let _ = session.read_retrying_a_stale_miss(
+            || {
+                reads.fetch_add(1, AtomicOrdering::SeqCst);
+                ResidentOutcome::Ready(MISS, fresh())
+            },
+            |answer| *answer == MISS,
+        );
+        ticker.join().expect("the canceller");
+        assert_eq!(reads.load(AtomicOrdering::SeqCst), 1, "a caller that left is not read for");
+        assert_eq!(
+            state.forced_rescans(),
+            1,
+            "and the walk the wait was for is never asked: only the declined force was",
+        );
+
+        let live = ResidentSession {
+            diag: a_state_the_storm_guard_is_protecting(dir.path()),
+            cancel: Arc::new(RequestCancel::default()),
+        };
+        let reads = AtomicUsize::new(0);
+        let _ = live.read_retrying_a_stale_miss(
+            || {
+                reads.fetch_add(1, AtomicOrdering::SeqCst);
+                ResidentOutcome::Ready(MISS, fresh())
+            },
+            |answer| *answer == MISS,
+        );
+        assert_eq!(
+            reads.load(AtomicOrdering::SeqCst),
+            2,
+            "control: an uncancelled call waits the floor out and reads again",
+        );
+    }
+
     /// A miss the tool calls stale earns exactly one forced re-scan and exactly one more
     /// read. Two retries would let a loop of genuinely absent lookups walk the tree once
     /// per attempt; none would leave the caller a final-looking miss the disk contradicts.
@@ -776,5 +910,370 @@ mod tests {
         );
         assert_eq!(reads.load(AtomicOrdering::SeqCst), 2, "control: an uncancelled call retries");
         assert_eq!(state.forced_rescans(), 1, "control: and consults the hatch once");
+    }
+
+    // --- the whole cycle, on a real resident and through a real tool ------------------
+    //
+    // The gates above take the policy apart: that a miss consults the hatch, that the
+    // retry's outcome is the answer, that each half of the hatch moves the resident. Every
+    // one of them watches a link and reads a counter or the resident's own tables; none
+    // watches an ANSWER. So the thing a caller is actually owed — a name that is on disk
+    // stops coming back as a final-looking miss — was held together by argument across
+    // four gates rather than by an input.
+    //
+    // These two hold it by input, once per tool with a miss shape of its own: a single
+    // answer that is `resolved` where a plain read of the same name at the same moment is
+    // `not_found`, with the tool's predicate, the policy, the forced walk and the drift
+    // apply all inside the measurement.
+
+    /// The body both modules of the stand carry. One method name for both is deliberate:
+    /// the subject asks for `Опоздавший.Считать` while `Сервер.Считать` is already
+    /// resident, so a resolver that stopped honouring the module part of a qualified name
+    /// would fail the control instead of quietly passing it.
+    const MODULE: &str = "&НаСервере\nПроцедура Считать() Экспорт\nКонецПроцедуры\n";
+
+    /// The method that arrives after the resident was built.
+    const LATE: &str = "Опоздавший.Считать";
+
+    /// A name nothing ever declared: whatever the retry walks, it cannot make this one
+    /// resolve.
+    const NEVER_DECLARED: &str = "Призрак.Считать";
+
+    type ReferencesAnswer = Result<crate::tools::references::Answer, rmcp::ErrorData>;
+    type SymbolInfoAnswer = Result<Option<ide::SymbolInfoCard>, rmcp::ErrorData>;
+
+    /// A resident that is behind the disk with no way to catch up but a forced re-scan.
+    ///
+    /// No change hub at all, so there is no event path to deliver the module and no watcher
+    /// timing in the measurement; and a drift window long enough to outlive the test, so
+    /// the throttled scan keeps answering from the universe it walked before the module
+    /// existed. Handed back with that cache warm and already older than the storm floor —
+    /// a force younger than the floor is the one the guard declines, and a stand built on
+    /// a declined force would measure the guard instead of the retry.
+    ///
+    /// The late artefact is a whole new module rather than a method appended to a resident
+    /// one, because file text is read from disk lazily and checked against the revision the
+    /// resident recorded: an unapplied edit to a file it already holds is not a stale answer
+    /// but a hard refusal. "Behind the disk" is only representable as a file it has never
+    /// seen.
+    fn a_resident_behind_the_disk() -> (tempfile::TempDir, DiagnosticsState) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_common_module(root, "Сервер", true, MODULE);
+
+        let mut state = DiagnosticsState::for_workspace(root.to_path_buf());
+        state.drift_interval = Duration::from_secs(600);
+        state.ensure_loading();
+        wait_ready(&state);
+
+        // A successful build leaves the throttle cache empty, and an empty cache is walked
+        // by the very next read — the read this stand needs to be blind. Armed until it
+        // STAYS armed: the build publishes `Ready` under the resident lock and empties the
+        // cache just after it, so a window armed the instant `Ready` appears can be wiped
+        // from under the stand by the thread that published it.
+        wait_until("the drift window stays armed", || {
+            let _ = state.read(|_, _| ());
+            std::thread::sleep(Duration::from_millis(20));
+            match lock_recover(&state.scan).is_some() {
+                true => Ok(()),
+                false => Err("the build emptied the cache after it was armed"),
+            }
+        });
+
+        std::thread::sleep(FORCE_RESCAN_FLOOR + Duration::from_millis(50));
+        write_common_module(root, "Опоздавший", true, MODULE);
+        (dir, state)
+    }
+
+    /// Stamp the throttle cache as walked JUST NOW — the single state in which the storm
+    /// guard declines a force, and the one every gate above steps over on purpose.
+    ///
+    /// Set rather than waited for: a stand that hoped to land inside the floor would be
+    /// measuring the scheduler, and the input it needs would be the first thing a loaded
+    /// machine takes away.
+    fn a_scan_the_storm_guard_still_protects(state: &DiagnosticsState) {
+        lock_recover(&state.scan)
+            .as_mut()
+            .expect("the stand hands back a warm throttle cache")
+            .at = Instant::now();
+    }
+
+    fn session_over(state: &DiagnosticsState) -> ResidentSession {
+        ResidentSession { diag: state.clone(), cancel: Arc::new(RequestCancel::default()) }
+    }
+
+    /// The whole `references` answer for one name, as the handler computes it.
+    fn references_read<'a>(
+        session: &'a ResidentSession,
+        symbol: &'a str,
+    ) -> impl Fn() -> ResidentOutcome<ReferencesAnswer> + 'a {
+        move || {
+            session.read(|resident, analysis, _| {
+                let params = crate::tools::references::Params {
+                    symbol: Some(symbol),
+                    anchor_root_id: None,
+                    root_id: None,
+                    path: None,
+                    line: None,
+                    column: None,
+                    line_content: None,
+                    area_root_id: None,
+                    area_path_prefix: None,
+                    kinds: &[],
+                    include_declaration: Some(true),
+                    limit: None,
+                    max_files: None,
+                    include_preview: None,
+                };
+                // No external sources: a graph source answers from a store of its own — it
+                // would hide what the resident does or does not know, and add work of its
+                // own to an interval the cancellation gates time.
+                crate::tools::references::answer(resident, analysis.database(), &params, 6000, &[])
+            })
+        }
+    }
+
+    /// The tool's own verdict on its answer, exactly as the handler asks it.
+    fn references_missed(answer: &ReferencesAnswer) -> bool {
+        matches!(answer, Ok(answer) if crate::tools::references::warrants_rescan(answer))
+    }
+
+    /// The wire `outcome` of a `references` answer — the field a caller reads as final.
+    fn references_outcome(served: ResidentOutcome<ReferencesAnswer>) -> String {
+        let ResidentOutcome::Ready(answer, freshness) = served else {
+            panic!("the resident must be ready on this stand");
+        };
+        let body = crate::tools::references::finish(
+            answer.expect("references answered"),
+            freshness.revision,
+            freshness.topology,
+            freshness.stale,
+        )
+        .structured_content
+        .expect("the answer is structured content");
+        body["outcome"].as_str().expect("an answer names its outcome").to_owned()
+    }
+
+    /// One `references` call answers `resolved` for a declaration the resident cannot see,
+    /// and only because its first answer was a miss that earned a forced re-scan.
+    ///
+    /// The controls are what make that readable. A plain read of the same name at the same
+    /// moment answers `not_found`, so the subject's answer is the retry's and not the
+    /// stand's. And a name nothing ever declared stays `not_found` through the same policy,
+    /// so the retry is shown to walk the disk rather than to soften a miss.
+    ///
+    /// What this colours is the cache-dropping half of the force. The other half — routing
+    /// a HEALTHY hub's read onto the scan — cannot be coloured here, because a stand with
+    /// no hub is on the scan path already; it has a gate of its own beside `force_rescan`.
+    #[test]
+    fn references_resolves_a_late_declaration_only_behind_the_forced_retry() {
+        // Walking references moves the process-global span counter the cancellation
+        // gates measure with; taking their gate keeps this test out of their numbers.
+        let _serialised = WALK_GATE.blocking_lock();
+        let (_dir, state) = a_resident_behind_the_disk();
+        let session = session_over(&state);
+
+        assert_eq!(
+            references_outcome(references_read(&session, LATE)()),
+            "not_found",
+            "control: a read with no retry behind it must not see the new declaration, or \
+             this stand cannot tell the retry from the stand"
+        );
+
+        assert_eq!(
+            references_outcome(
+                session
+                    .read_retrying_a_stale_miss(references_read(&session, LATE), references_missed)
+            ),
+            "resolved",
+            "a declaration that exists on disk came back as a final-looking miss: the \
+             forced re-scan, or the read behind it, did not happen"
+        );
+
+        // The subject's scan re-stamped the cache, so this control's own force would be the
+        // one the storm guard declines — and a control that never walked would say nothing
+        // about what a walk finds.
+        std::thread::sleep(FORCE_RESCAN_FLOOR + Duration::from_millis(50));
+        let walks = state.scan_count();
+        assert_eq!(
+            references_outcome(session.read_retrying_a_stale_miss(
+                references_read(&session, NEVER_DECLARED),
+                references_missed,
+            )),
+            "not_found",
+            "control: the retry walks the disk, and the disk does not declare this name"
+        );
+        assert_eq!(
+            state.scan_count(),
+            walks + 1,
+            "control: and it really walked — a miss the storm guard silently declined to \
+             re-scan says nothing about what a walk finds"
+        );
+    }
+
+    /// The card for one name, as the handler resolves it.
+    fn symbol_info_read<'a>(
+        session: &'a ResidentSession,
+        symbol: &'a str,
+    ) -> impl Fn() -> ResidentOutcome<SymbolInfoAnswer> + 'a {
+        move || {
+            session.read(|resident, analysis, _| {
+                crate::tools::symbol_info::resolve_card(
+                    resident,
+                    analysis.database(),
+                    Some(symbol),
+                    None,
+                    None,
+                    None,
+                    None,
+                    crate::tools::symbol_info::sections_from(&[]),
+                    crate::tools::symbol_info::locale_from(None).expect("the default locale"),
+                )
+            })
+        }
+    }
+
+    /// The tool's own verdict on its answer, exactly as the handler asks it.
+    fn symbol_info_missed(symbol: &str) -> impl Fn(&SymbolInfoAnswer) -> bool + '_ {
+        move |answer| {
+            crate::tools::symbol_info::warrants_rescan(
+                Some(symbol),
+                answer.as_ref().map(Option::as_ref),
+            )
+        }
+    }
+
+    /// The card a `symbol_info` answer carries, or `None` where the resident resolved
+    /// nothing — the miss a caller reads as final.
+    fn symbol_info_card(served: ResidentOutcome<SymbolInfoAnswer>) -> Option<ide::SymbolInfoCard> {
+        let ResidentOutcome::Ready(answer, _) = served else {
+            panic!("the resident must be ready on this stand");
+        };
+        answer.expect("symbol_info answered")
+    }
+
+    /// The same cycle for `symbol_info`, whose miss is an absent card rather than an
+    /// outcome word, with the same two controls.
+    #[test]
+    fn symbol_info_resolves_a_late_declaration_only_behind_the_forced_retry() {
+        let (_dir, state) = a_resident_behind_the_disk();
+        let session = session_over(&state);
+
+        assert!(
+            symbol_info_card(symbol_info_read(&session, LATE)()).is_none(),
+            "control: a read with no retry behind it must not see the new declaration, or \
+             this stand cannot tell the retry from the stand"
+        );
+
+        assert!(
+            symbol_info_card(session.read_retrying_a_stale_miss(
+                symbol_info_read(&session, LATE),
+                symbol_info_missed(LATE),
+            ))
+            .is_some(),
+            "a declaration that exists on disk came back as a final-looking miss: the \
+             forced re-scan, or the read behind it, did not happen"
+        );
+
+        std::thread::sleep(FORCE_RESCAN_FLOOR + Duration::from_millis(50));
+        let walks = state.scan_count();
+        assert!(
+            symbol_info_card(session.read_retrying_a_stale_miss(
+                symbol_info_read(&session, NEVER_DECLARED),
+                symbol_info_missed(NEVER_DECLARED),
+            ))
+            .is_none(),
+            "control: the retry walks the disk, and the disk does not declare this name"
+        );
+        assert_eq!(
+            state.scan_count(),
+            walks + 1,
+            "control: and it really walked — a miss the storm guard silently declined to \
+             re-scan says nothing about what a walk finds"
+        );
+    }
+
+    /// A force the storm guard DECLINES must not become the answer.
+    ///
+    /// The guard bounds how often the tree is walked, and a force arriving while the last
+    /// scan is younger than [`FORCE_RESCAN_FLOOR`] arms nothing at all. That is right for
+    /// the walk and wrong for the caller: the retry then re-reads the very resident that
+    /// just missed, and the miss it repeats reads as final for a declaration lying on disk.
+    /// Nothing else in the call can contradict it — a healthy hub's event stream never
+    /// re-observes a file the caller just wrote, and the throttled scan keeps serving the
+    /// universe it walked last — so the policy has to wait the floor out and ask again.
+    ///
+    /// The input is the state the sibling gates sleep past on purpose: a scan stamped
+    /// NEWER than the floor. In production it is not exotic — the idle sweeper's
+    /// `reconcile_tick` re-stamps that cache on its own schedule, so any call landing
+    /// within a floor of a tick meets exactly this.
+    ///
+    /// The controls: the hatch is consulted TWICE, so the answer came from a second force
+    /// and not from a first one that quietly worked; and a name nothing declares stays a
+    /// miss through the same wait, so waiting is shown to walk the disk rather than to
+    /// soften a verdict.
+    #[test]
+    fn a_force_the_storm_guard_declines_is_waited_out_and_asked_again() {
+        // Walking references moves the process-global span counter the cancellation
+        // gates measure with; taking their gate keeps this test out of their numbers.
+        let _serialised = WALK_GATE.blocking_lock();
+        let (_dir, state) = a_resident_behind_the_disk();
+        let session = session_over(&state);
+
+        // Stated where it is READ, not before the call. The guard answers on the age of the
+        // scan cache at the instant it is consulted, and between any earlier setup and that
+        // instant stands a full references read over the resident: measured at 1.6 s on a
+        // loaded machine against a 250 ms floor, so a stamp taken earlier is six times
+        // expired by the time it decides anything, and the stand quietly exercises the
+        // branch it was built to avoid. The seam fires immediately before the consultation,
+        // which is the only place the input cannot decay out from under it.
+        {
+            let state = state.clone();
+            session.diag.set_pre_force_probe(move || a_scan_the_storm_guard_still_protects(&state));
+        }
+        let walks = state.scan_count();
+        let forces = state.forced_rescans();
+
+        assert_eq!(
+            references_outcome(
+                session
+                    .read_retrying_a_stale_miss(references_read(&session, LATE), references_missed)
+            ),
+            "resolved",
+            "a declaration that exists on disk came back as a final-looking miss because the \
+             storm guard swallowed the only force the call had"
+        );
+        assert_eq!(
+            state.scan_count(),
+            walks + 1,
+            "the wait has to end in a walk — a policy that merely slept would answer the \
+             same blind resident it started with"
+        );
+        assert_eq!(
+            state.forced_rescans(),
+            forces + 2,
+            "one force the guard declined and one it took: an answer behind a single \
+             consultation did not come from this policy"
+        );
+
+        // The subject's own walk re-stamped the cache, so this control meets the declined
+        // force too — and it must still come back a miss.
+        a_scan_the_storm_guard_still_protects(&state);
+        let walks = state.scan_count();
+        assert_eq!(
+            references_outcome(session.read_retrying_a_stale_miss(
+                references_read(&session, NEVER_DECLARED),
+                references_missed,
+            )),
+            "not_found",
+            "control: waiting the floor out walks the disk, and the disk does not declare \
+             this name"
+        );
+        assert_eq!(
+            state.scan_count(),
+            walks + 1,
+            "control: and it really walked — a miss nothing re-scanned says nothing about \
+             what a walk finds"
+        );
     }
 }

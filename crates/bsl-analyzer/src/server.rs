@@ -214,6 +214,7 @@ fn run_event_loop(state: &mut GlobalState, receiver: &Receiver<Message>) -> Resu
         select! {
             recv(receiver) -> msg => {
                 state.note_loop_activity();
+                refresh_diagnostics_baseline(state);
                 handle_lsp_msg(state, msg?)?;
                 while let Ok(msg) = receiver.try_recv() {
                     handle_lsp_msg(state, msg)?;
@@ -222,11 +223,13 @@ fn run_event_loop(state: &mut GlobalState, receiver: &Receiver<Message>) -> Resu
 
             recv(&state.loader_receiver) -> msg => {
                 state.note_loop_activity();
+                refresh_diagnostics_baseline(state);
                 handle_loader_msg(state, msg?)?;
             }
 
             recv(&state.task_pool.receiver) -> task => {
                 state.note_loop_activity();
+                refresh_diagnostics_baseline(state);
                 handle_task(state, task?)?;
                 while let Ok(task) = state.task_pool.receiver.try_recv() {
                     handle_task(state, task)?;
@@ -341,6 +344,30 @@ fn idle_trim_kind(state: &GlobalState, over_budget: bool) -> Option<IdleTrimKind
         return Some(IdleTrimKind::Shallow);
     }
     None
+}
+
+/// Take the baseline whatever comes next will be answered from, reloading it first when
+/// the ground moved under it.
+///
+/// The watcher is armed asynchronously, after the loader has already announced the load
+/// finished; a baseline write landing before that raises no event, and the snapshot the
+/// initial load produced would otherwise answer for the life of the process. Asking here
+/// puts the LSP server on the resident's discipline: the reading a load produced is
+/// compared with disk before anything is answered from it — and every branch of the loop
+/// answers, the loader's finalize by publishing the documents opened during the load.
+fn refresh_diagnostics_baseline(state: &mut GlobalState) {
+    if !state.refresh_diagnostics_baseline() {
+        return;
+    }
+    state.reset_workspace_batch();
+    state.analysis_host.request_cancellation();
+    let uris = state.opened_document_uris();
+    invalidate_diagnostics(state, &uris);
+    for uri in uris {
+        crate::handlers::notification::schedule_diagnostics(state, &uri);
+    }
+    state.mark_workspace_batch_dirty();
+    state.request_workspace_diagnostic_refresh();
 }
 
 /// Handle one idle tick: advance the idle clock and, when [`idle_trim_kind`] says so,

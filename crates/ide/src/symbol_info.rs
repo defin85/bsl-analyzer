@@ -66,13 +66,13 @@ pub struct SymbolInfoRequest {
     pub position: Option<SymbolPosition>,
     pub locale: Locale,
     pub sections: SymbolInfoSections,
-    /// The root the call graph was built against (the resident's `workspace_root` / the MCP
-    /// server's `source_dir`), used to encode a form event-handler's path-fallback
+    /// The root the call graph was built against, in the spelling the generation serving this
+    /// request walked its files under, used to encode a form event-handler's path-fallback
     /// `method/file/<rel>::<name>` graph id byte-identically to the graph builder. This is NOT the
     /// config root (`db.all_config_paths()` — e.g. `<workspace>/src/cf`): the graph strips the
     /// workspace root, so using the config root would mint a mismatched, non-resolving id and drop
     /// form-handler usages. `None` disables the form-handler `graph_id` (usages) only.
-    pub workspace_root: Option<std::path::PathBuf>,
+    pub workspace_root: Option<crate::graph::StripRoot>,
 }
 
 /// The container a symbol lives in (its owning module or metadata object).
@@ -1340,7 +1340,7 @@ fn resolve_position(
                 db,
                 module.file_id,
                 name.as_str(),
-                req.workspace_root.as_deref(),
+                req.workspace_root.as_ref(),
             );
         }
     }
@@ -1415,7 +1415,7 @@ fn card_from_method_sig(
     let mut card = SymbolInfoCard::empty(symbol.to_string(), kind);
     card.container = container;
     card.signature = Some(signature_string(sig));
-    card.graph_id = method_graph_id(db, sig, req.workspace_root.as_deref());
+    card.graph_id = method_graph_id(db, sig, req.workspace_root.as_ref());
 
     if req.sections.doc {
         card.doc = sig.purpose.clone().or_else(|| sig.description.clone());
@@ -1452,7 +1452,7 @@ fn card_from_method_sig(
 fn method_graph_id(
     db: &RootDatabaseImpl,
     sig: &SymbolSignature,
-    workspace_root: Option<&std::path::Path>,
+    workspace_root: Option<&crate::graph::StripRoot>,
 ) -> Option<String> {
     let method_id = sig.method_id?;
     crate::graph::graph_id_of_method(

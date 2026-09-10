@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub const SHARED_CONFIGURATIONS_ROOT_ENV: &str = "ONEC_CONFIGURATIONS_ROOT";
 
 mod diagnostics_baseline_fs;
-pub use diagnostics_baseline_fs::ManagedBaselineDirectory;
+pub use diagnostics_baseline_fs::{ManagedBaselineDirectory, ManagedEntryReading};
 
 pub mod extension_topology;
 pub mod file_role;
@@ -5545,7 +5545,11 @@ include = ["main", "extension:Sales"]
             .diagnostics_baseline()
             .unwrap()
             .unwrap();
-        assert_eq!(resolved.path, dir.path().join("baseline.json"));
+        // `path` is resolved THROUGH the filesystem, so it is the canonical spelling of
+        // the target; a temporary directory may be reached through a link (`/var` is one
+        // to `/private/var` on macOS), and the declared spelling of the fixture root is
+        // then not the same string.
+        assert_eq!(resolved.path, fs::canonicalize(dir.path()).unwrap().join("baseline.json"));
         assert_eq!(resolved.project_path, "baseline.json");
         assert_eq!(resolved.scope.source_root.as_deref(), Some("src/cf"));
         assert_eq!(resolved.scope.extensions[0].name, "vendor");
@@ -5565,7 +5569,10 @@ include = ["main", "extension:Sales"]
                 .diagnostics_baseline()
                 .unwrap()
                 .unwrap();
-            assert_eq!(resolved.path, root.join("baseline.json"));
+            // The root goes in spelled as the caller wrote it — that is what this test is
+            // about — while `path` comes back canonical, so only the expectation is
+            // resolved through the filesystem.
+            assert_eq!(resolved.path, fs::canonicalize(&root).unwrap().join("baseline.json"));
             assert_eq!(resolved.scope.source_root.as_deref(), Some("src/cf"));
             return;
         }

@@ -492,7 +492,7 @@ fn run_memory_point(
 
     let rss_after_trim = trim_and_settle(env, false, args.trim_settle_ms)?;
     let rss_after_deep_trim = trim_and_settle(env, true, args.trim_settle_ms)?;
-    let vm_hwm = crate::mem_report::proc_kb("VmHWM:").map(|kb| kb * 1024);
+    let vm_hwm = crate::mem_report::process_peak_rss_bytes();
 
     let memory = MemoryReport {
         rss_before_bytes: rss_before,
@@ -514,9 +514,9 @@ fn run_call_hierarchy_index_memory_point(
     target: &Target,
     resolved: &ResolvedTarget,
 ) -> Result<PointReport, RunError> {
-    let boot_rss_bytes = env.boot_rss_bytes.ok_or_else(|| {
-        RunError::Other("cannot read boot VmRSS from /proc (non-Linux?)".to_string())
-    })?;
+    let boot_rss_bytes = env
+        .boot_rss_bytes
+        .ok_or_else(|| RunError::Other("cannot read the boot resident set size".to_string()))?;
     let pre_build_rss_bytes = read_rss_checked()?;
 
     let sampler = RssSampler::start();
@@ -533,7 +533,7 @@ fn run_call_hierarchy_index_memory_point(
 
     let post_trim_rss_bytes = trim_and_settle(env, false, args.trim_settle_ms)?;
     let rss_after_deep_trim_bytes = trim_and_settle(env, true, args.trim_settle_ms)?;
-    let vm_hwm_bytes = crate::mem_report::proc_kb("VmHWM:").map(|kb| kb * 1024);
+    let vm_hwm_bytes = crate::mem_report::process_peak_rss_bytes();
 
     let index = observation.call_hierarchy_index.as_ref().ok_or_else(|| {
         RunError::Other("call hierarchy index benchmark did not return build metrics".to_string())
@@ -571,7 +571,7 @@ fn run_call_hierarchy_index_memory_point(
 
 fn read_rss_checked() -> Result<u64, RunError> {
     crate::smoke::read_rss_bytes()
-        .ok_or_else(|| RunError::Other("cannot read VmRSS from /proc (non-Linux?)".to_string()))
+        .ok_or_else(|| RunError::Other("cannot read the resident set size".to_string()))
 }
 
 /// The normative trim protocol: close overlays, trim salsa (`enforce_lru` or
@@ -595,7 +595,7 @@ fn trim_and_settle(env: &mut BenchEnv, deep: bool, settle_ms: u64) -> Result<u64
     read_rss_checked()
 }
 
-/// In-process VmRSS sampler: a dedicated thread polling `/proc/self/status`
+/// In-process resident-size sampler: a dedicated thread polling the kernel
 /// every 5 ms while the measured phase runs. 1 Hz external sampling misses
 /// short-lived peaks; even 5 ms only bounds them from below, which the report
 /// makes explicit via `sample_count` / `peak_is_lower_bound`.

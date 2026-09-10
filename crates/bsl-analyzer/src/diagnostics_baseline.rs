@@ -179,6 +179,7 @@ mod tests {
             project_path: "baseline.json".to_owned(),
             path: root.join("baseline.json"),
             epoch: "e".to_owned(),
+            ground: Default::default(),
         };
         let active = active_for_file(&snapshot, root, &path, text, vec![beyond]);
         assert!(active.is_empty(), "the desynchronised finding must not reach the converter");
@@ -224,6 +225,7 @@ mod tests {
             project_path: "baseline.json".to_owned(),
             path: root.join("baseline.json"),
             epoch: "e".to_owned(),
+            ground: Default::default(),
         };
         let mut third_line = diagnostic(code);
         third_line.range = TextRange::new(20.into(), 32.into());
@@ -275,6 +277,7 @@ mod tests {
             project_path: "baseline.json".to_owned(),
             path: root.join("baseline.json"),
             epoch: "e".to_owned(),
+            ground: Default::default(),
         };
         let (enabled, _) = fastest(&ready);
 
@@ -315,6 +318,7 @@ mod tests {
             project_path: "baseline.json".to_owned(),
             path: root.join("baseline.json"),
             epoch: "test".to_owned(),
+            ground: Default::default(),
         };
         let active = active_for_file(
             &snapshot,
@@ -431,6 +435,7 @@ directory = "baselines"
                     detail: "broken".to_owned(),
                     epoch: "error".to_owned(),
                 }],
+                ground: Default::default(),
             },
             root,
             &root.join(relative),

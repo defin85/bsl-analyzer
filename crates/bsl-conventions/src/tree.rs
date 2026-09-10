@@ -13,6 +13,7 @@
 //! cost on a large dump, and a listing, taken only when the exact probe misses.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// What a path is, when it is anything.
@@ -47,12 +48,26 @@ pub trait DirTree {
     /// The children of `dir`; empty when `dir` cannot be listed. Order is
     /// unspecified — every caller sorts its own output.
     fn entries(&self, dir: &Path) -> Vec<TreeEntry>;
+
+    /// Immediate child names, without requiring the type of each entry's target.
+    /// Name-only probes must not turn a missing marker into a stat of every sibling.
+    fn child_names(&self, dir: &Path) -> Vec<OsString> {
+        self.entries(dir)
+            .into_iter()
+            .filter_map(|entry| entry.path.file_name().map(OsString::from))
+            .collect()
+    }
 }
 
 /// The real filesystem.
 pub struct RealFs;
 
 impl DirTree for RealFs {
+    fn child_names(&self, dir: &Path) -> Vec<OsString> {
+        let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+        entries.flatten().map(|entry| entry.file_name()).collect()
+    }
+
     fn kind_of(&self, path: &Path) -> Option<EntryKind> {
         let meta = std::fs::metadata(path).ok()?;
         Some(if meta.is_dir() { EntryKind::Dir } else { EntryKind::File })

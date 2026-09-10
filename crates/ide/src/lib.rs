@@ -49,7 +49,7 @@ pub use graph::{
     BatchDbOpener, ChunkRow, Direction, EdgeRef, FusedChunkSink, GraphBuildSummary,
     GraphBuildTicker, GraphContext, GraphDetail, GraphError, GraphIdKind, GraphOverview,
     GraphRowSink, ModuleMethod, NeighborsParams, NeighborsResult, NodeRef, NodeResult,
-    ReprojectedRows, ResolveCandidate, ResolveResult, SourceItem, SourceResult,
+    ReprojectedRows, ResolveCandidate, ResolveResult, SourceItem, SourceResult, StripRoot,
     CALL_SITE_NOT_RECORDED, MAX_DROPPED_SAMPLE, NO_CALL_SITE, NO_SOURCE_LOCATION,
     ROOTS_UNAVAILABLE, SOURCE_DRIFTED,
 };

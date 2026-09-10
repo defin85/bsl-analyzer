@@ -4084,6 +4084,46 @@ fn application_module_path_scan_is_memoized_across_method_bodies() {
 }
 
 #[test]
+fn application_module_path_scan_is_memoized_across_files_of_one_root() {
+    use hir::HirDatabase;
+    use test_fixture::CfeFixtureBuilder;
+
+    let fixture = CfeFixtureBuilder::new("").build();
+    let source = "Процедура Тест() Экспорт\nЗначение = Метаданные;\nКонецПроцедуры\n";
+    let first_path = write_cfe_common_module(fixture.root(), "CallerA", false, source);
+    let second_path = write_cfe_common_module(fixture.root(), "CallerB", false, source);
+    let first = FileId(0);
+    let second = FileId(1);
+    let mut db = RootDatabaseImpl::new_with_salsa_events();
+    let mut file_set = FileSet::new();
+    file_set.insert(first, VfsPath::new(first_path.to_string_lossy().as_ref()));
+    file_set.insert(second, VfsPath::new(second_path.to_string_lossy().as_ref()));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    db.set_file_source_root(first, SourceRootId(0));
+    db.set_file_source_root(second, SourceRootId(0));
+    db.set_file_text(first, source);
+    db.set_file_text(second, source);
+    db.set_all_config_paths(fixture.config_paths());
+
+    let _ = db.infer(first);
+    let _ = db.infer(second);
+    let rows = db.salsa_event_report().expect("event counters enabled");
+    let executes =
+        |name: &str| rows.iter().find(|row| row.name.contains(name)).map_or(0, |row| row.execute);
+    let kinds = hir::ApplicationModuleKind::ALL.len() as u64;
+    assert_eq!(
+        executes("application_module_files_query"),
+        2 * kinds,
+        "the per-file lookup runs once per asking file and kind"
+    );
+    assert_eq!(
+        executes("resolve_vfs_path_ci_scan_query"),
+        kinds,
+        "a missing host path is scanned once per candidate, not once per asking file"
+    );
+}
+
+#[test]
 fn application_export_shadows_same_named_platform_property_for_reads() {
     use hir::HirDatabase;
     use test_fixture::CfeFixtureBuilder;

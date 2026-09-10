@@ -5,6 +5,7 @@
 //! Uses the lightweight `reference` profile so no heavy workspace build is needed,
 //! and points the per-user runtime dir at a tempdir so the socket is isolated.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -237,6 +238,45 @@ async fn backend_idles_out_after_ttl() {
     c.cancel().await.ok();
     let exited = tokio::time::timeout(Duration::from_secs(20), backend).await;
     assert!(exited.is_ok(), "warm backend idled out after its TTL once the last client left");
+    exited.unwrap().expect("backend task joined").expect("backend run ok");
+}
+
+/// The hold that background work takes on a backend has to END with the work, and both
+/// halves of that are load-bearing: a backend reaped mid-index makes the next client pay the
+/// cold rebuild again, while one that never lets go pins a multi-gigabyte resident for the
+/// life of the machine. Neither half is provable from the predicate alone — this drives the
+/// serve loop itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(any(unix, windows))]
+async fn background_work_holds_the_backend_and_then_lets_it_go() {
+    let src = TempDir::new().unwrap();
+    let key = key_for(&src);
+
+    let state = SharedState::shared();
+    state.index_progress().active.store(true, Ordering::SeqCst);
+    let server = McpServer::new(McpProfile::Reference, state.clone());
+
+    // Long orphan grace, so only the idle TTL can explain an exit; the TTL is tiny, so the
+    // wait below spans many of its ticks rather than one lucky one.
+    let grace = Duration::from_secs(30);
+    let idle_ttl = Duration::from_millis(200);
+    let mut backend =
+        tokio::spawn(broker::daemon::run(move || Ok(server), key_for(&src), grace, idle_ttl));
+
+    let s = connect_within(&key, Duration::from_secs(25)).await;
+    let c = ().serve(s).await.expect("client initialized");
+    assert!(c.peer_info().is_some(), "session saw server info");
+    c.cancel().await.ok();
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), &mut backend).await.is_err(),
+        "the backend gave up while its background work was still running"
+    );
+
+    state.index_progress().active.store(false, Ordering::SeqCst);
+
+    let exited = tokio::time::timeout(Duration::from_secs(20), backend).await;
+    assert!(exited.is_ok(), "the backend held on after its background work was done");
     exited.unwrap().expect("backend task joined").expect("backend run ok");
 }
 

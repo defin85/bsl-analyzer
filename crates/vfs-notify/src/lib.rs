@@ -1,6 +1,7 @@
 use std::{
+    cell::RefCell,
     fs,
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, OnceLock,
@@ -11,7 +12,7 @@ use std::{
 use crossbeam_channel::{bounded, select, unbounded, Receiver, Sender, TrySendError};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use paths::{AbsPath, AbsPathBuf, Utf8PathBuf};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use vfs::loader::{self, LoadingProgress};
 use walkdir::WalkDir;
 
@@ -102,13 +103,25 @@ impl loader::Handle for NotifyHandle {
 
 type NotifyEvent = notify::Result<notify::Event>;
 
+/// A live watcher together with the registrations standing on it. One value because
+/// they share a fate: a registration exists only for as long as the watcher holding
+/// it, so a dropped watcher must take every record with it.
+struct WatchState {
+    watcher: RecommendedWatcher,
+    registered: FxHashMap<PathBuf, RecursiveMode>,
+}
+
 struct NotifyActor {
     sender: loader::Sender,
     shutdown: Arc<AtomicBool>,
     watched_file_entries: FxHashSet<AbsPathBuf>,
     watched_only_file_entries: FxHashSet<AbsPathBuf>,
     watched_dir_entries: Vec<loader::Directories>,
-    watcher: Option<(RecommendedWatcher, Receiver<NotifyEvent>)>,
+    /// Behind a `RefCell` because registration happens from inside the scan, where
+    /// the actor is borrowed immutably by the closures reporting progress — and
+    /// registering as the scan reaches each path is the whole point: a path
+    /// registered afterwards is blind to everything written in between.
+    watcher: Option<(RefCell<WatchState>, Receiver<NotifyEvent>)>,
 }
 
 #[derive(Debug)]
@@ -168,8 +181,20 @@ impl NotifyActor {
             match event {
                 Event::Message(msg) => match msg {
                     Message::Config(config) => {
-                        self.watcher = None;
-                        if !config.watch.is_empty() {
+                        // The watcher SURVIVES a reconfiguration. Baseline object names
+                        // carry a content hash, so every baseline write changes the list
+                        // of watched paths and brings another config here; taking the
+                        // watcher down to build a new one leaves the whole tree
+                        // unobserved until the registrations are placed again. On
+                        // FSEvents the cost is not even confined to that gap: `watch`
+                        // does not extend a running stream, it rebuilds one starting
+                        // from "now", so whatever happened during the swap is reported
+                        // to nobody, ever.
+                        if config.watch.is_empty() {
+                            // Nothing is to be observed after this config, so there is
+                            // no coverage to lose by dropping the watcher.
+                            self.watcher = None;
+                        } else if self.watcher.is_none() {
                             let (watcher_sender, watcher_receiver) = unbounded();
                             let watcher = log_notify_error(RecommendedWatcher::new(
                                 move |event| {
@@ -177,14 +202,39 @@ impl NotifyActor {
                                 },
                                 Config::default(),
                             ));
-                            self.watcher = watcher.map(|it| (it, watcher_receiver));
+                            self.watcher = watcher.map(|it| {
+                                let state =
+                                    WatchState { watcher: it, registered: FxHashMap::default() };
+                                (RefCell::new(state), watcher_receiver)
+                            });
                         }
 
                         let config_version = config.version;
 
+                        // Filled BEFORE the load pass instead of from its outcome:
+                        // `watch_target` reads these sets to decide what to register for
+                        // a path, and the pass now registers each path as it reaches it.
                         self.watched_dir_entries.clear();
                         self.watched_file_entries.clear();
                         self.watched_only_file_entries.clear();
+                        for (i, entry) in config.load.iter().enumerate() {
+                            if !config.watch.contains(&i) {
+                                continue;
+                            }
+                            match entry {
+                                loader::Entry::Files(files) => {
+                                    self.watched_file_entries.extend(files.iter().cloned())
+                                }
+                                loader::Entry::WatchOnlyFiles(files) => {
+                                    self.watched_only_file_entries.extend(files.iter().cloned())
+                                }
+                                loader::Entry::Directories(dirs) => {
+                                    self.watched_dir_entries.push(dirs.clone())
+                                }
+                            }
+                        }
+
+                        self.release_watches_no_longer_requested();
 
                         self.send(loader::Message::Progress {
                             n_total: 0,
@@ -220,8 +270,6 @@ impl NotifyActor {
                             dir: None,
                         });
 
-                        let (entry_tx, entry_rx) = unbounded();
-                        let (watch_tx, watch_rx) = unbounded();
                         let processed = AtomicUsize::new(0);
                         let last_reported = AtomicUsize::new(0);
                         const PROGRESS_BATCH_SIZE: usize = 50;
@@ -243,11 +291,8 @@ impl NotifyActor {
                                 break;
                             }
                             let do_watch = config.watch.contains(&i);
-                            if do_watch {
-                                _ = entry_tx.send(entry.clone());
-                            }
                             Self::load_entry(
-                                |f| _ = watch_tx.send(f.to_owned()),
+                                |path| self.watch(path),
                                 entry,
                                 do_watch,
                                 |file| {
@@ -296,37 +341,21 @@ impl NotifyActor {
                         tracing::info!(
                             n_total,
                             elapsed_ms = load_start.elapsed().as_millis() as u64,
+                            watch_targets = self
+                                .watcher
+                                .as_ref()
+                                .map_or(0, |(state, _)| state.borrow().registered.len()),
                             "vfs: parallel read pass complete, sending LoadingProgress::Finished",
                         );
+                        // LAST. The consumer reads this as "the tree is observed from
+                        // here on", and a write landing before the registrations are in
+                        // place produces no event at all — not a late one.
                         self.send(loader::Message::Progress {
                             n_total,
                             n_done: LoadingProgress::Finished,
                             config_version,
                             dir: None,
                         });
-
-                        drop(watch_tx);
-                        drop(entry_tx);
-                        for entry in entry_rx {
-                            match entry {
-                                loader::Entry::Files(files) => {
-                                    self.watched_file_entries.extend(files)
-                                }
-                                loader::Entry::WatchOnlyFiles(files) => {
-                                    self.watched_only_file_entries.extend(files)
-                                }
-                                loader::Entry::Directories(dir) => {
-                                    self.watched_dir_entries.push(dir)
-                                }
-                            }
-                        }
-                        tracing::debug!("Setting up file watchers...");
-                        let watch_count = watch_rx.len();
-                        for path in watch_rx {
-                            self.watch(&path);
-                        }
-                        tracing::debug!("Finished setting up {} file watchers", watch_count);
-                        tracing::debug!("File watching setup complete");
                     }
                     Message::Invalidate(path) => {
                         let contents = read(path.as_path());
@@ -350,6 +379,7 @@ impl NotifyActor {
                                 else {
                                     continue;
                                 };
+                                self.release_watch_if_gone(&path);
                                 match self.classify_event_path(&path) {
                                     EventPathAction::WatchDir => self.watch(path.as_ref()),
                                     EventPathAction::LoadContent => {
@@ -763,11 +793,95 @@ impl NotifyActor {
         (!covered).then(|| (parent.to_path_buf(), RecursiveMode::NonRecursive))
     }
 
-    fn watch(&mut self, path: &Path) {
+    /// Register `path` with the running watcher unless a registration already
+    /// standing covers it.
+    ///
+    /// The skip needs no platform gate, unlike the coverage question the workspace
+    /// change hub answers per backend: what is skipped here is a target THIS actor
+    /// registered and never released, so the registration is in place on every
+    /// backend and re-issuing it can only cost. On FSEvents it costs the tree —
+    /// `watch` rebuilds the single stream and starts it from "now".
+    fn watch(&self, path: &Path) {
         let Some((target, mode)) = self.watch_target(path) else { return };
-        if let Some((watcher, _)) = &mut self.watcher {
-            log_notify_error(watcher.watch(&target, mode));
+        let Some((state, _)) = &self.watcher else { return };
+        let mut state = state.borrow_mut();
+        if registration_stands(&state.registered, &target, mode) {
+            return;
         }
+        if log_notify_error(state.watcher.watch(&target, mode)).is_some() {
+            state.registered.insert(target, mode);
+        }
+    }
+
+    /// Give up the registrations at and beneath `path` once it is actually gone.
+    ///
+    /// The release cannot hang on how the path classifies: a registered target may be a
+    /// directory the watched sets name nowhere — the uncovered parent of an
+    /// exactly-listed file — and such a path classifies as `Ignore` when it disappears,
+    /// so nothing would ever release it and a directory recreated under that name would
+    /// look already watched. The disk is asked only when a record is actually held, and
+    /// only an outright absence counts: a transient stat error must never drop a live
+    /// watch.
+    fn release_watch_if_gone(&self, path: &AbsPath) {
+        let Some((state, _)) = &self.watcher else { return };
+        let target: &Path = path.as_ref();
+        if !state.borrow().registered.contains_key(target) {
+            return;
+        }
+        let gone = fs::symlink_metadata(target)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        if gone {
+            forget_registrations_beneath(&mut state.borrow_mut().registered, target);
+        }
+    }
+
+    /// Give up the registrations this configuration no longer asks for.
+    ///
+    /// A watcher that survives a reconfiguration would otherwise hold every target it
+    /// was ever given: on inotify a descriptor per directory of a tree nobody watches
+    /// any more, and a wake-up for each of its events. The sweep finds nothing while
+    /// the configuration is stable — the case that arrives on every baseline write — so
+    /// the stream rebuild an `unwatch` costs on FSEvents is paid only when the
+    /// requested set genuinely shrank, and paid BEFORE the scan, which then re-reads
+    /// whatever the rebuild dropped.
+    fn release_watches_no_longer_requested(&self) {
+        let Some((state, _)) = &self.watcher else { return };
+        let stale: Vec<PathBuf> = state
+            .borrow()
+            .registered
+            .keys()
+            .filter(|target| !self.registration_is_requested(target))
+            .cloned()
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        let mut state = state.borrow_mut();
+        for target in stale {
+            log_notify_error(state.watcher.unwatch(&target));
+            state.registered.remove(&target);
+        }
+    }
+
+    /// Whether the current configuration still asks for a registration on `target`.
+    ///
+    /// Every watch this actor places has one of two shapes, and the answer enumerates
+    /// both: a directory under a watched root, or the directory holding an
+    /// exactly-listed file.
+    fn registration_is_requested(&self, target: &Path) -> bool {
+        let Some(target) = Utf8PathBuf::from_path_buf(target.to_path_buf())
+            .ok()
+            .and_then(|path| AbsPathBuf::try_from(path).ok())
+        else {
+            return false;
+        };
+        if self.watched_dir_entries.iter().any(|dir| dir.contains_dir(&target)) {
+            return true;
+        }
+        self.watched_file_entries
+            .iter()
+            .chain(&self.watched_only_file_entries)
+            .any(|file| file.parent() == Some(target.as_path()))
     }
 
     #[track_caller]
@@ -780,6 +894,33 @@ impl NotifyActor {
             self.shutdown.store(true, Ordering::Release);
         }
     }
+}
+
+/// Whether the registration already placed on `target` answers for `mode`.
+///
+/// A recursive one answers for both; a non-recursive one only for itself, because
+/// `notify` REPLACES the mode of a path it already watches — so a widening request
+/// has to go through.
+fn registration_stands(
+    registered: &FxHashMap<PathBuf, RecursiveMode>,
+    target: &Path,
+    mode: RecursiveMode,
+) -> bool {
+    match registered.get(target) {
+        Some(RecursiveMode::Recursive) => true,
+        Some(RecursiveMode::NonRecursive) => mode == RecursiveMode::NonRecursive,
+        None => false,
+    }
+}
+
+/// Drop the records for `path` and everything below it.
+///
+/// A registration lives on the directory it was placed on: once that directory is
+/// gone the backend has released it (inotify drops the descriptor), so a surviving
+/// record would make a directory recreated under the same name look already watched
+/// and leave it blind for the life of the process.
+fn forget_registrations_beneath(registered: &mut FxHashMap<PathBuf, RecursiveMode>, path: &Path) {
+    registered.retain(|target, _| !target.starts_with(path));
 }
 
 fn read(path: &AbsPath) -> Option<Vec<u8>> {
@@ -805,6 +946,8 @@ fn symlink_might_be_cyclic(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::time::Duration;
+    use vfs::loader::Handle;
 
     fn fixture(count: usize, bytes_per_file: usize) -> (tempfile::TempDir, loader::Directories) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1366,6 +1509,258 @@ mod tests {
         let shutdown = AtomicBool::new(true);
         let chunks = run_with_shutdown(dirs, 100 * 1024, &shutdown);
         assert!(chunks.is_empty(), "shutdown latch must suppress all sends, got {chunks:#?}");
+    }
+
+    /// A repeat registration is not a harmless no-op on every backend, so the record
+    /// must answer for the target exactly — including the one case where it must NOT
+    /// suppress the call: widening a directory from non-recursive to recursive.
+    #[test]
+    fn a_standing_registration_answers_only_for_what_it_covers() {
+        let mut registered = FxHashMap::default();
+        registered.insert(PathBuf::from("/root"), RecursiveMode::Recursive);
+        registered.insert(PathBuf::from("/root/leaf"), RecursiveMode::NonRecursive);
+
+        assert!(registration_stands(&registered, Path::new("/root"), RecursiveMode::Recursive));
+        assert!(registration_stands(&registered, Path::new("/root"), RecursiveMode::NonRecursive));
+        assert!(registration_stands(
+            &registered,
+            Path::new("/root/leaf"),
+            RecursiveMode::NonRecursive
+        ));
+        assert!(
+            !registration_stands(&registered, Path::new("/root/leaf"), RecursiveMode::Recursive),
+            "a narrower registration must not suppress the widening call",
+        );
+        assert!(
+            !registration_stands(&registered, Path::new("/other"), RecursiveMode::Recursive),
+            "an unknown target has nothing standing on it",
+        );
+    }
+
+    /// Only what the removed directory took with it: a sibling whose name merely shares
+    /// a prefix keeps its registration, and so does everything above.
+    #[test]
+    fn a_removed_subtree_releases_the_records_beneath_it() {
+        let mut registered = FxHashMap::default();
+        for path in ["/root", "/root/gone", "/root/gone/deep", "/root/gone-not"] {
+            registered.insert(PathBuf::from(path), RecursiveMode::Recursive);
+        }
+
+        forget_registrations_beneath(&mut registered, Path::new("/root/gone"));
+
+        let mut left: Vec<_> =
+            registered.keys().map(|p| p.to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, vec!["/root".to_string(), "/root/gone-not".to_string()]);
+    }
+
+    fn give_a_live_watcher(actor: &mut NotifyActor) {
+        let (watcher_sender, watcher_receiver) = unbounded();
+        let watcher = RecommendedWatcher::new(
+            move |event| {
+                _ = watcher_sender.send(event);
+            },
+            Config::default(),
+        )
+        .expect("watcher");
+        let state = WatchState { watcher, registered: FxHashMap::default() };
+        actor.watcher = Some((RefCell::new(state), watcher_receiver));
+    }
+
+    fn registered_of(actor: &NotifyActor) -> FxHashMap<PathBuf, RecursiveMode> {
+        let (state, _) = actor.watcher.as_ref().expect("watcher");
+        let registered = state.borrow().registered.clone();
+        registered
+    }
+
+    /// A registration is released when its directory is gone, and only then. The
+    /// directory at stake is the uncovered parent of an exactly-listed file: no watched
+    /// root names it, so its removal classifies as `Ignore` and a rule keyed on the
+    /// classification would never reach it — leaving a directory recreated under the
+    /// same name looking already watched.
+    #[test]
+    fn a_registration_is_released_once_its_directory_is_gone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        let live = root.join("live");
+        std::fs::create_dir(&live).expect("create dir");
+        let gone = root.join("gone");
+
+        let mut actor = actor_with_watched_dirs(Vec::new());
+        actor.watched_only_file_entries.insert(AbsPathBuf::assert_utf8(gone.join("manifest.json")));
+        give_a_live_watcher(&mut actor);
+        {
+            let (state, _) = actor.watcher.as_ref().expect("watcher");
+            let mut state = state.borrow_mut();
+            state.registered.insert(live.clone(), RecursiveMode::NonRecursive);
+            state.registered.insert(gone.clone(), RecursiveMode::NonRecursive);
+        }
+
+        assert_eq!(
+            actor.classify_event_path(&AbsPathBuf::assert_utf8(gone.clone())),
+            EventPathAction::Ignore,
+            "the case only matters because the classification says nothing about it",
+        );
+
+        actor.release_watch_if_gone(&AbsPathBuf::assert_utf8(gone.clone()));
+        actor.release_watch_if_gone(&AbsPathBuf::assert_utf8(live.clone()));
+
+        let registered = registered_of(&actor);
+        assert!(!registered.contains_key(&gone), "a directory that is gone must release its watch");
+        assert!(registered.contains_key(&live), "a directory that is there must keep its watch");
+    }
+
+    /// Every watch this actor places has one of two shapes, and what the sweep lets go
+    /// is whatever matches neither — a root the new configuration stopped asking for.
+    #[test]
+    fn only_what_the_configuration_still_asks_for_stays_requested() {
+        let (_guard, root) = fixture_mixed(0, 0, 0);
+        let raw: &std::path::Path = root.as_ref();
+        let baseline = raw.join("baseline");
+        let dropped = raw.parent().expect("parent").join("extension");
+
+        let mut actor = actor_with_watched_dirs(vec![dirs_for(&root, &["bsl"], &[])]);
+        actor
+            .watched_only_file_entries
+            .insert(AbsPathBuf::assert_utf8(baseline.join("manifest.json")));
+
+        assert!(actor.registration_is_requested(raw), "a watched root asks for itself");
+        assert!(
+            actor.registration_is_requested(&raw.join("sub")),
+            "a directory under a watched root is covered by it",
+        );
+        assert!(
+            actor.registration_is_requested(&baseline),
+            "the directory holding an exactly-listed file is asked for",
+        );
+        assert!(
+            !actor.registration_is_requested(&dropped),
+            "a root this configuration no longer names is asked for by nothing",
+        );
+    }
+
+    /// A rendezvous loader channel: every message the actor sends waits to be taken
+    /// here. That is what makes the moment of the writes below exact — while this
+    /// side holds off, the actor is parked in a send and cannot have moved on.
+    fn spawn_watching(root: &Path, version: u32) -> (NotifyHandle, Receiver<loader::Message>) {
+        let (tx, rx) = bounded::<loader::Message>(0);
+        let mut handle = NotifyHandle::spawn(tx);
+        handle.set_config(watching_config(root, version));
+        (handle, rx)
+    }
+
+    fn watching_config(root: &Path, version: u32) -> loader::Config {
+        loader::Config {
+            version,
+            load: vec![loader::Entry::Directories(loader::Directories {
+                extensions: vec!["txt".to_string()],
+                include: vec![AbsPathBuf::assert_utf8(root.to_path_buf())],
+                exclude: vec![],
+                rules: Vec::new(),
+            })],
+            watch: vec![0],
+        }
+    }
+
+    fn received(
+        rx: &Receiver<loader::Message>,
+        mut wanted: impl FnMut(&loader::Message) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match rx.recv_timeout(remaining) {
+                Ok(msg) => {
+                    if wanted(&msg) {
+                        return true;
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    fn carries(
+        files: &[(AbsPathBuf, Option<Vec<u8>>)],
+        path: &AbsPathBuf,
+        contents: &[u8],
+    ) -> bool {
+        files.iter().any(|(p, c)| p == path && c.as_deref() == Some(contents))
+    }
+
+    /// A write that lands after its file has been read but before loading is announced
+    /// finished must still reach the consumer. Nothing re-reads the tree afterwards, so
+    /// a change made while no watch stands is not late — it is lost for good.
+    #[test]
+    fn a_write_during_the_scan_is_still_delivered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        let file = root.join("a.txt");
+        std::fs::write(&file, b"before").expect("write fixture");
+        let watched = AbsPathBuf::assert_utf8(file.clone());
+
+        let (_handle, rx) = spawn_watching(&root, 1);
+
+        // Waiting for the file's own contents proves the scan has read it: from here
+        // on only a watch can carry the next version.
+        assert!(
+            received(&rx, |msg| {
+                matches!(msg, loader::Message::Loaded { files } if carries(files, &watched, b"before"))
+            }),
+            "the scan never delivered the fixture",
+        );
+        std::fs::write(&file, b"after").expect("rewrite fixture");
+
+        assert!(
+            received(&rx, |msg| {
+                matches!(msg, loader::Message::Changed { files } if carries(files, &watched, b"after"))
+            }),
+            "a write made before loading was announced finished never arrived",
+        );
+    }
+
+    /// Every baseline write brings another configuration here, because baseline object
+    /// names carry a content hash. The watch placed by the previous one must survive it:
+    /// a write during the rescan reaches the consumer only through a registration that
+    /// was never taken down.
+    #[test]
+    fn a_reconfiguration_does_not_take_the_watch_down() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        let file = root.join("a.txt");
+        std::fs::write(&file, b"before").expect("write fixture");
+        let watched = AbsPathBuf::assert_utf8(file.clone());
+
+        let (mut handle, rx) = spawn_watching(&root, 1);
+        assert!(
+            received(&rx, |msg| {
+                matches!(msg, loader::Message::Progress { n_done: LoadingProgress::Finished, .. })
+            }),
+            "the first configuration never finished loading",
+        );
+
+        handle.set_config(watching_config(&root, 2));
+        assert!(
+            received(&rx, |msg| {
+                matches!(
+                    msg,
+                    loader::Message::Progress {
+                        n_done: LoadingProgress::Scanning,
+                        config_version: 2,
+                        ..
+                    }
+                )
+            }),
+            "the second configuration never started",
+        );
+        std::fs::write(&file, b"after").expect("rewrite fixture");
+
+        assert!(
+            received(&rx, |msg| {
+                matches!(msg, loader::Message::Changed { files } if carries(files, &watched, b"after"))
+            }),
+            "a write during a reconfiguration never arrived",
+        );
     }
 
     #[test]

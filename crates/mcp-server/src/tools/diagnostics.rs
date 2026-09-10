@@ -503,6 +503,12 @@ pub(crate) fn file_findings(
     // Method spans for the graph bridge: each finding inside a method carries the
     // method's durable graph id so the agent can pivot to `graph callers`.
     let methods = method_ranges(&analysis.document_symbols(file_id));
+    // The base comes from THIS resident's own root table, which read the disk once, before the
+    // walk that gave the resident its files. Reading it again here would strip paths belonging
+    // to the resident's generation against whatever the workspace spelling names now — and a
+    // root reached through a link that has since been retargeted names another directory, so
+    // every path-keyed id would silently stop being minted.
+    let graph_root = ide::StripRoot::pinned(resident.workspace_roots().workspace_canonical());
     let file_location = answer_location(
         resident.workspace_roots(),
         root_id,
@@ -538,7 +544,7 @@ pub(crate) fn file_findings(
             count_capped = true;
             continue;
         }
-        let graph_id = graph_id_for(diag.range, &methods, path, resident.workspace_root());
+        let graph_id = graph_id_for(diag.range, &methods, path, &graph_root);
         let place = FindingPlace {
             file: &file_location,
             range: line_index.utf16_line_col_range(&file_text, diag.range),
@@ -1214,7 +1220,7 @@ fn graph_id_for(
     range: TextRange,
     methods: &[(String, TextRange)],
     path: &Path,
-    workspace_root: &Path,
+    workspace_root: &ide::StripRoot,
 ) -> Option<String> {
     let name = methods.iter().find(|(_, r)| r.contains_range(range)).map(|(n, _)| n.as_str())?;
     ide::method_graph_id(&path.to_string_lossy(), name, Some(workspace_root))
@@ -1700,6 +1706,104 @@ mod tests {
                 max_output_tokens: None,
                 detailed: false,
             }
+        }
+
+        /// A form module, whose methods are addressed by the `method/file/<rel>::<name>`
+        /// path-fallback id — the only id form a strip root takes part in.
+        const FORM_MODULE_REL: &str = "CommonForms/Форма/Ext/Form/Module.bsl";
+
+        /// Every finding's graph bridge, in the order the response lists them.
+        fn graph_ids(body: &Value) -> Vec<&str> {
+            body["findings"]
+                .as_array()
+                .expect("a findings array")
+                .iter()
+                .filter_map(|finding| finding["graph_id"].as_str())
+                .collect()
+        }
+
+        /// The card `symbol_info` builds for the method a finding sits in, by the same
+        /// resident. `None` when the request does not resolve or the card carries no id.
+        fn card_graph_id(state: &DiagnosticsState, path: &Path, line: u32) -> Option<String> {
+            match state.read(|resident, _| {
+                crate::tools::symbol_info::resolve_card(
+                    resident,
+                    resident.db(),
+                    None,
+                    None,
+                    path.to_str(),
+                    Some(line),
+                    Some(10),
+                    crate::tools::symbol_info::sections_from(&[]),
+                    ide::Locale::default(),
+                )
+            }) {
+                ResidentOutcome::Ready(card, _) => {
+                    card.expect("the request resolves").and_then(|card| card.graph_id)
+                }
+                _ => panic!("expected Ready outcome"),
+            }
+        }
+
+        /// A finding is bridged against the root ITS resident was built over, not against
+        /// whatever the workspace path names by the time the answer is rendered — and the card
+        /// for the same method is bridged against that same root.
+        ///
+        /// The path half of a `method/file/<rel>::<name>` id comes from one generation's walk,
+        /// so the base it is stripped against belongs to that same generation. A workspace
+        /// reached through a link that is retargeted while the resident still serves would
+        /// otherwise have its old paths stripped against the new tree: no rel is found, and
+        /// every path-keyed id quietly stops being minted — a form handler addressable or not
+        /// depending on when the request happened to arrive.
+        ///
+        /// Both tools are asked because a base each of them read for itself would let them
+        /// answer differently about one method, and two tools disagreeing about a symbol they
+        /// both resolved is worse than neither of them naming it.
+        #[cfg(unix)]
+        #[test]
+        fn a_finding_is_bridged_against_the_root_its_resident_was_built_over() {
+            let dir = tempfile::tempdir().unwrap();
+            let served = dir.path().join("served");
+            let elsewhere = dir.path().join("elsewhere");
+            fs::create_dir_all(&elsewhere).unwrap();
+            write(&served, FORM_MODULE_REL, "Процедура ПриОткрытии()\n\t;\nКонецПроцедуры\n");
+            let workspace = dir.path().join("workspace");
+            std::os::unix::fs::symlink(&served, &workspace).unwrap();
+
+            let state = ready_state(&workspace);
+            // The walk's own spelling of the module — the one the resident holds it under, and
+            // the one a hit or a card hands back.
+            let module = served.canonicalize().unwrap().join(FORM_MODULE_REL);
+            let expected = format!("method/file/{FORM_MODULE_REL}::ПриОткрытии");
+
+            let served_body = run(&state, &module, &default_filters());
+            let before = graph_ids(&served_body);
+            assert!(
+                !before.is_empty() && before.iter().all(|id| *id == expected),
+                "control: this module's findings carry the path-fallback id, got {before:?}",
+            );
+
+            let card_before = card_graph_id(&state, &module, 0);
+            assert_eq!(
+                card_before.as_deref(),
+                Some(expected.as_str()),
+                "control: the card names the method the findings sit in the same way",
+            );
+
+            fs::remove_file(&workspace).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &workspace).unwrap();
+
+            let retargeted_body = run(&state, &module, &default_filters());
+            let after = graph_ids(&retargeted_body);
+            assert_eq!(
+                after, before,
+                "the resident still serves the files it walked, so it still names them the same",
+            );
+            assert_eq!(
+                card_graph_id(&state, &module, 0),
+                card_before,
+                "and the card cannot start naming it otherwise while the finding does not",
+            );
         }
 
         #[test]
@@ -2785,23 +2889,23 @@ mod tests {
             children: Vec::new(),
         };
         let methods = method_ranges(std::slice::from_ref(&method));
-        let root = std::path::Path::new("/ws");
+        let root = ide::StripRoot::pinned(std::path::Path::new("/ws"));
         let module = std::path::Path::new("/ws/CommonModules/Сервер/Ext/Module.bsl");
 
         // A finding inside the method span resolves to the method's durable graph id.
         let inside = TextRange::new(30u32.into(), 35u32.into());
         assert_eq!(
-            graph_id_for(inside, &methods, module, root).as_deref(),
+            graph_id_for(inside, &methods, module, &root).as_deref(),
             Some("method/common/Сервер/Считать")
         );
         // A module-body finding (outside any method) carries no graph id.
         let outside = TextRange::new(0u32.into(), 5u32.into());
-        assert_eq!(graph_id_for(outside, &methods, module, root), None);
+        assert_eq!(graph_id_for(outside, &methods, module, &root), None);
         // A form module: a finding inside a method now falls back to the
         // `method/file/<rel>::<name>` id the graph mints, with the rel stripped to `root`.
         let form = std::path::Path::new("/ws/CommonForms/Форма/Ext/Form/Module.bsl");
         assert_eq!(
-            graph_id_for(inside, &methods, form, root).as_deref(),
+            graph_id_for(inside, &methods, form, &root).as_deref(),
             Some("method/file/CommonForms/Форма/Ext/Form/Module.bsl::Считать")
         );
     }

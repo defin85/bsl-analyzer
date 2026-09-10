@@ -11,3 +11,4 @@ smol_str.workspace = true
 
 [dev-dependencies]
 expect-test.workspace = true
+stdx.workspace = true

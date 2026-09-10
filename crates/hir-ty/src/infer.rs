@@ -170,6 +170,19 @@ pub struct ImplicitLocalAssignment {
     pub ty: TypeId,
 }
 
+/// One definition reaching a use: the statement that made it, and the type
+/// inference recorded for the value it puts in the variable.
+///
+/// `stmt` is `None` for a definition that is not a statement at all — a
+/// parameter, a bare `Перем`, a loop binding. `ty` is `None` when inference
+/// recorded no type for it, which is the ordinary answer for a BSL parameter:
+/// the language declares none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReachingDef {
+    stmt: Option<StmtId>,
+    ty: Option<TypeId>,
+}
+
 impl InferenceResult {
     pub fn type_id_of_expr_in(&self, owner: DefWithBodyId, expr: ExprId) -> Option<TypeId> {
         self.expr_types_by_body.get(&owner)?.get(&expr).copied()
@@ -1555,13 +1568,12 @@ impl<'db> InferenceContext<'db> {
             .any(|assignment| assignment.target.into_raw().into_u32() < use_index)
     }
 
-    /// True when the receiver is a reassigned local variable and a definition
-    /// that actually reaches this use either resolves the method or cannot be
-    /// typed. Sequential inference records the textually-last assignment type,
-    /// so at a use inside a sibling branch the receiver type may be a
-    /// cross-branch artefact; reaching definitions restore the flow facts and
-    /// keep the diagnostic alive when the stale type is the only one that
-    /// reaches (e.g. straight-line reassignment).
+    /// True when the receiver is a reassigned local variable and the definitions
+    /// that actually reach this use leave the miss unprovable. Sequential
+    /// inference records the textually-last assignment type, so at a use inside a
+    /// sibling branch the receiver type may be a cross-branch artefact; reaching
+    /// definitions restore the flow facts and keep the diagnostic alive when the
+    /// stale type is the only one that reaches (e.g. straight-line reassignment).
     fn method_resolves_on_alternate_assignment(
         &self,
         receiver_expr: ExprId,
@@ -1579,11 +1591,9 @@ impl<'db> InferenceContext<'db> {
             return false;
         }
 
-        let vouches = |ty: TypeId| {
-            ty != receiver_ty
-                && (self.is_unknown(ty)
-                    || crate::method_lookup::lookup_method(self.db, ty, method_name).is_some())
-        };
+        let resolves =
+            |ty: TypeId| crate::method_lookup::lookup_method(self.db, ty, method_name).is_some();
+        let is_wildcard = |ty: TypeId| matches!(self.db.lookup_type(ty), TypeKind::Any);
 
         // Without flow facts a non-reaching assignment must not vouch for the
         // call (it would hide a real error after a straight-line
@@ -1591,23 +1601,112 @@ impl<'db> InferenceContext<'db> {
         let Some(reaching) = self.reaching_assignment_types(receiver_expr, &key) else {
             return false;
         };
-        reaching.iter().any(|ty| match ty {
-            Some(ty) => vouches(*ty),
+
+        // One definition that resolves the method, or that inference could not
+        // type at all, is enough: it also puts the types recorded for the other
+        // paths in doubt, so nothing here is provable.
+        let vouches_alone = |ty: TypeId| ty != receiver_ty && (self.is_unknown(ty) || resolves(ty));
+        if reaching.iter().any(|def| match def.ty {
+            Some(ty) => vouches_alone(ty),
             // A reaching definition inference could not type (e.g. a loop
             // back-edge not seen yet) — "method not found" is unprovable.
             None => true,
+        }) {
+            return true;
+        }
+
+        // A declared wildcard — `Произвольный`, or a bare metadata-kind name that
+        // documents a family rather than an object (`lower_bare_name_id` lowers a
+        // documented `СправочникСсылка` with no catalog behind it to exactly this)
+        // — carries no arms, so it cannot witness that a method is absent either.
+        // Unlike `Unknown` it is a type inference did record, and it leaves the
+        // other paths' types standing: where a definition reaching this very use
+        // carries a type of its own that lacks the method, the miss is provable on
+        // that path and stays reported.
+        let mut wildcard_reaches = false;
+        let every_path_unprovable = reaching.iter().all(|def| match def.ty {
+            Some(ty) if is_wildcard(ty) => {
+                wildcard_reaches = true;
+                true
+            }
+            Some(ty) => resolves(ty),
+            None => true,
+        });
+        every_path_unprovable && wildcard_reaches
+    }
+
+    /// True when the `Если` branch holding this call rules out every definition
+    /// that reaches it.
+    ///
+    /// `Если Х = Неопределено … Иначе Х.Метод()` proves `Х` is not `Неопределено`
+    /// in the `Иначе` branch. A value inference could only type through a lossy
+    /// path — a query whose text is glued together at run time, say — comes back
+    /// as a confident `Неопределено` rather than an honest unknown, and that is
+    /// exactly the type the branch rules out. With every reaching definition
+    /// ruled out, no type is established for the receiver here at all, so
+    /// "method not found" is unprovable and reporting it is a false positive.
+    ///
+    /// Deliberately narrower than the guard itself: one surviving definition is
+    /// enough to keep the diagnostic, and a definition made inside the guarded
+    /// `Если` is left alone — the condition tested the value that flowed into the
+    /// statement, not one assigned after it. A definition that establishes no
+    /// type of its own — a BSL parameter, an element of an untyped collection —
+    /// has nothing to survive with, so it does not hold the diagnostic open.
+    fn branch_guard_rules_out_every_reaching_def(&self, receiver_expr: ExprId) -> bool {
+        use crate::narrow::{apply_branch_guard, branch_guards_for_stmt, guard_var, GuardVerdict};
+
+        let Expr::Path(name) = self.body.expr(receiver_expr) else {
+            return false;
+        };
+        let Some(use_stmt) = self.body.enclosing_stmt(receiver_expr) else {
+            return false;
+        };
+        let guards: Vec<_> = branch_guards_for_stmt(&self.body, use_stmt)
+            .into_iter()
+            .filter(|branch| guard_var(&branch.guard).eq_ignore_case(name))
+            .collect();
+        if guards.is_empty() {
+            return false;
+        }
+
+        let key = name.as_str().fold_lower();
+        let Some(reaching) = self.reaching_assignment_types(receiver_expr, &key) else {
+            return false;
+        };
+        if reaching.is_empty() {
+            return false;
+        }
+        reaching.iter().all(|def| {
+            // A definition establishing no type of its own — a BSL parameter, an
+            // element of an untyped collection — cannot keep the miss provable
+            // either. `Unknown` and `Any` carry no arms, so they say as little as
+            // no record at all.
+            let Some(ty) = def.ty else {
+                return true;
+            };
+            if self.is_unknown(ty) || matches!(self.db.lookup_type(ty), TypeKind::Any) {
+                return true;
+            }
+            guards.iter().any(|branch| {
+                // Only a definition made inside the guarded `Если` escapes the
+                // guard; a binding is never inside one.
+                let made_inside_the_guard = def.stmt.is_some_and(|def_stmt| {
+                    crate::narrow::stmt_covers_stmt(&self.body, branch.if_stmt, def_stmt.to_idx())
+                });
+                !made_inside_the_guard
+                    && apply_branch_guard(self.db, &branch.guard, branch.on_true, ty)
+                        == GuardVerdict::Contradicted
+            })
         })
     }
 
-    /// Types of the assignments reaching `use_expr` for variable `var_key`.
-    /// `None` per entry when the defining statement's value has no recorded
-    /// type; `None` overall when reaching definitions are unavailable for the
-    /// owner.
+    /// The definitions of `var_key` reaching `use_expr`. `None` overall when
+    /// reaching definitions are unavailable for the owner.
     fn reaching_assignment_types(
         &self,
         use_expr: ExprId,
         var_key: &str,
-    ) -> Option<Vec<Option<TypeId>>> {
+    ) -> Option<Vec<ReachingDef>> {
         let stmt_id = self.body.enclosing_stmt(use_expr)?;
         let module = hir_def::ModuleId::new(self.context_file_id);
         let body_defs = match self.owner {
@@ -1623,14 +1722,27 @@ impl<'db> InferenceContext<'db> {
             defs.into_iter()
                 .map(|def| match def.def_site {
                     dataflow::reaching_defs::DefSite::Assignment(stmt_raw) => {
-                        match self.body.stmt(StmtId::from_raw(stmt_raw)) {
+                        let stmt = StmtId::from_raw(stmt_raw);
+                        let ty = match self.body.stmt(stmt) {
                             Stmt::Assign { value, .. } => {
                                 self.expr_types.get(&ExprId::from_idx(*value)).copied()
                             }
                             _ => None,
-                        }
+                        };
+                        ReachingDef { stmt: Some(stmt), ty }
                     }
-                    _ => None,
+                    // A binding is not a statement, but inference does record a
+                    // type for it when it could work one out — a `Для` counter
+                    // has one, a BSL parameter usually does not.
+                    dataflow::reaching_defs::DefSite::Parameter(binding)
+                    | dataflow::reaching_defs::DefSite::VarDecl(binding)
+                    | dataflow::reaching_defs::DefSite::ForLoop(binding)
+                    | dataflow::reaching_defs::DefSite::ForEachLoop(binding) => {
+                        ReachingDef { stmt: None, ty: self.binding_types.get(&binding).copied() }
+                    }
+                    dataflow::reaching_defs::DefSite::Unknown => {
+                        ReachingDef { stmt: None, ty: None }
+                    }
                 })
                 .collect(),
         )
@@ -3006,7 +3118,8 @@ impl<'db> InferenceContext<'db> {
                         base_id,
                         receiver_ty,
                         &method_name,
-                    ) {
+                    ) || self.branch_guard_rules_out_every_reaching_def(base_id)
+                    {
                         // Inference is sequential, so at this use the variable
                         // carries the type of its textually-last assignment even
                         // when that assignment lives in a sibling branch that
@@ -3014,6 +3127,11 @@ impl<'db> InferenceContext<'db> {
                         // type resolves the method, the receiver type is a
                         // cross-branch artefact — stay silent instead of
                         // reporting a false unresolved call.
+                        //
+                        // The branch guard covers the other half: the definitions
+                        // that do reach this use may all be ruled out by the
+                        // condition the branch settled, and then nothing about the
+                        // receiver is established here either.
                     } else if let Some(receiver_name) = receiver_display_name(self.db, receiver_ty)
                     {
                         self.push_inference_diagnostic(InferenceDiagnostic::UnresolvedMethodCall {

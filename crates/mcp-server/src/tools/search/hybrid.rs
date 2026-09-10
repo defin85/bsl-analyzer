@@ -9,7 +9,6 @@ use bsl_search::{fuse_smart, FusedHit, IndexProgress, SearchEngine};
 use rmcp::model::CallToolResult;
 use rmcp::ErrorData as McpError;
 use std::fmt::Write;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -43,7 +42,6 @@ pub fn hybrid_code(
     workspace_search_mode: WorkspaceSearchMode,
     configured_baseline: Option<&ConfiguredBaselineStatus>,
     external_baseline: Option<Arc<ExternalBaselineService>>,
-    graph_root: Option<&Path>,
     index_progress: &IndexProgress,
     query: &str,
     limit: usize,
@@ -57,7 +55,6 @@ pub fn hybrid_code(
         workspace_search_mode,
         configured_baseline,
         external_baseline,
-        graph_root,
         index_progress,
         query,
         limit,
@@ -78,7 +75,6 @@ pub fn hybrid_code_fenced(
     workspace_search_mode: WorkspaceSearchMode,
     configured_baseline: Option<&ConfiguredBaselineStatus>,
     external_baseline: Option<Arc<ExternalBaselineService>>,
-    graph_root: Option<&Path>,
     index_progress: &IndexProgress,
     query: &str,
     limit: usize,
@@ -156,13 +152,7 @@ pub fn hybrid_code_fenced(
         return Ok(no_hits_response(note.as_deref(), Envelope::Yes, "search_code"));
     }
 
-    Ok(assemble_code_response(
-        &hits,
-        roots.as_ref(),
-        graph_root,
-        note.as_deref(),
-        max_output_tokens,
-    ))
+    Ok(assemble_code_response(&hits, roots.as_ref(), note.as_deref(), max_output_tokens))
 }
 
 /// The served response: the legend, the hits sized against what the wrapping will spend, the
@@ -176,14 +166,13 @@ pub fn hybrid_code_fenced(
 fn assemble_code_response(
     hits: &[FusedHit],
     roots: Option<&bsl_search::WorkspaceRoots>,
-    graph_root: Option<&Path>,
     note: Option<&str>,
     max_output_tokens: usize,
 ) -> CallToolResult {
     // Explain the per-hit modality tag once, up front — a leading line does not shift the
     // per-hit `graph_id:` parsing (which is relative to each `#N` line).
     let mut out = String::from(MODALITY_LEGEND);
-    let rendered = format_code_hits(hits, roots, graph_root, hits_budget(max_output_tokens, note));
+    let rendered = format_code_hits(hits, roots, hits_budget(max_output_tokens, note));
     out.push_str(&rendered.text);
     if let Some(note) = note {
         // Append AFTER the hit lines — never before — so a client parsing `graph_id:` lines
@@ -314,7 +303,6 @@ mod tests {
             WorkspaceSearchMode::SqliteLocal,
             None,
             None,
-            None,
             &IndexProgress::new(),
             "Предыдущая",
             10,
@@ -358,7 +346,6 @@ mod tests {
             WorkspaceSearchMode::SqliteLocal,
             None,
             None,
-            None,
             &IndexProgress::new(),
             "ПроверитьИНН",
             10,
@@ -386,7 +373,6 @@ mod tests {
             &Arc::new(Mutex::new(Some(engine))),
             &Arc::new(Mutex::new(SemanticRuntimeStatus::Failed("overlay sync failed".to_owned()))),
             WorkspaceSearchMode::SqliteLocal,
-            None,
             None,
             None,
             &IndexProgress::new(),
@@ -420,7 +406,6 @@ mod tests {
             WorkspaceSearchMode::SqliteLocal,
             None,
             None,
-            None,
             &IndexProgress::new(),
             "ПроверитьИНН",
             10,
@@ -436,7 +421,6 @@ mod tests {
             &engine,
             &failed,
             WorkspaceSearchMode::SqliteLocal,
-            None,
             None,
             None,
             &IndexProgress::new(),
@@ -479,7 +463,7 @@ mod tests {
         for note_length in [44usize, 230, 800] {
             let note = "с".repeat(note_length);
             for budget in (50usize..=2000).step_by(25) {
-                let result = assemble_code_response(&hits, None, None, Some(&note), budget);
+                let result = assemble_code_response(&hits, None, Some(&note), budget);
                 let text = result.content[0].as_text().expect("text").text.as_str();
                 let body = result.structured_content.as_ref().expect("structured");
                 let size = text.len() + serde_json::to_string(body).unwrap().len();
@@ -518,14 +502,16 @@ mod tests {
         let engine = Arc::new(Mutex::new(Some(engine)));
 
         // A sweep across the boundary where the hits alone fit but the assembled response does
-        // not — the case that overshoots when only the hit blocks are sized.
+        // not — the case that overshoots when only the hit blocks are sized. It has to reach
+        // past a whole answer as well, or the ceiling is never observed being met: these hits
+        // are workspace-root modules, so each carries a path-keyed `graph_id` off the engine's
+        // own root table, and a complete listing of six runs to some 1_300 tokens.
         let mut saw_complete_answer = false;
-        for budget in [200usize, 400, 700, 875, 1000, 1200] {
+        for budget in [200usize, 400, 700, 875, 1000, 1200, 1400, 1800] {
             let result = hybrid_code(
                 &engine,
                 &Arc::new(Mutex::new(SemanticRuntimeStatus::Failed("boom".to_owned()))),
                 WorkspaceSearchMode::SqliteLocal,
-                None,
                 None,
                 None,
                 &IndexProgress::new(),
@@ -576,7 +562,6 @@ mod tests {
             WorkspaceSearchMode::SqliteLocal,
             None,
             None,
-            None,
             &IndexProgress::new(),
             "ПроверитьИНН",
             10,
@@ -623,7 +608,6 @@ mod tests {
             WorkspaceSearchMode::SqliteLocal,
             None,
             None,
-            None,
             &progress,
             "ПроверитьИНН",
             10,
@@ -657,7 +641,6 @@ mod tests {
             &engine,
             &runtime,
             WorkspaceSearchMode::SqliteLocal,
-            None,
             None,
             None,
             &progress,
@@ -700,7 +683,6 @@ mod tests {
             WorkspaceSearchMode::PostgresRemoteOverlay,
             Some(&configured),
             None,
-            None,
             &IndexProgress::new(),
             "Процедура",
             10,
@@ -734,7 +716,6 @@ mod tests {
                 issue: Some("failed to resolve PostgreSQL reader credentials".to_owned()),
                 support: None,
             }),
-            None,
             None,
             &IndexProgress::new(),
             "ТестоваПроцедура",
@@ -778,7 +759,6 @@ mod tests {
                 support: None,
             }),
             Some(retryable_postgres_source()),
-            None,
             &IndexProgress::new(),
             "ТестоваПроцедура",
             10,
@@ -815,7 +795,6 @@ mod tests {
                 support: None,
             }),
             Some(retryable_postgres_source()),
-            None,
             &IndexProgress::new(),
             "НесуществующееСлово",
             10,

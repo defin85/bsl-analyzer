@@ -1,9 +1,8 @@
 use crate::define_metadata;
 use crate::metadata::*;
-use crate::utils::preprocessor_symbols;
 use crate::{BodyContext, Diagnostic, DiagnosticCode};
 use hir::LocalRange;
-use syntax::{SyntaxKind, SyntaxNode};
+use syntax::{preproc_symbols, SyntaxKind, SyntaxNode};
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::Error,
@@ -33,7 +32,7 @@ pub fn check_node(node: &SyntaxNode, acc: &mut Vec<Diagnostic<LocalRange>>, ctx:
     }
 
     let text = node.text().to_string();
-    if !preprocessor_symbols::is_known_symbol(&text) {
+    if !preproc_symbols::is_known(&text) {
         acc.push(Diagnostic {
             code,
             message: format!("Неизвестный символ препроцессора '{}'", text),
@@ -78,6 +77,62 @@ mod tests {
                   message: Неизвестный символ препроцессора 'Морок'
                   severity: Critical"#]],
         );
+    }
+
+    /// Ни одно написание реестра не диагностируется, и оба написания
+    /// каждого символа проверены — русское и английское.
+    ///
+    /// Обход реестра, а не выборка руками: символ, добавленный завтра,
+    /// попадёт под проверку сам. Рядом стоит написание вне реестра, иначе
+    /// проверка зелена и у реализации, признающей известным вообще всё.
+    #[test]
+    fn no_registry_spelling_is_reported() {
+        use syntax::preproc_symbols::PreprocSymbolId;
+
+        for &id in PreprocSymbolId::ALL {
+            for spelling in id.spellings() {
+                for written in [spelling.to_string(), spelling.to_uppercase()] {
+                    let code = format!("#Если {written} Тогда\n#КонецЕсли\n");
+                    let found = crate::test_utils::check_diagnostics_for(
+                        &code,
+                        DiagnosticCode::UnknownPreprocessorSymbol,
+                    );
+                    assert!(
+                        found.is_empty(),
+                        "{written:?}: написание реестра признано неизвестным"
+                    );
+                }
+            }
+        }
+
+        let code = "#Если Мираж Тогда\n#КонецЕсли\n";
+        assert_eq!(
+            crate::test_utils::check_diagnostics_for(
+                code,
+                DiagnosticCode::UnknownPreprocessorSymbol
+            )
+            .len(),
+            1,
+            "написание вне реестра обязано диагностироваться"
+        );
+    }
+
+    /// ОС-символы источника не имеют и остаются неизвестными — тот же ответ,
+    /// что даёт реестр остальным потребителям.
+    #[test]
+    fn os_symbols_are_reported() {
+        for os in ["Linux", "Windows", "MacOS"] {
+            let code = format!("#Если {os} Тогда\n#КонецЕсли\n");
+            assert_eq!(
+                crate::test_utils::check_diagnostics_for(
+                    &code,
+                    DiagnosticCode::UnknownPreprocessorSymbol
+                )
+                .len(),
+                1,
+                "{os:?}: ОС-символ обязан остаться неизвестным"
+            );
+        }
     }
 
     /// Написание, которого раздел 4.8.1.2 не определяет, диагностируется.

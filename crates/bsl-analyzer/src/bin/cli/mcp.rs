@@ -1468,7 +1468,7 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        daemon_command, resolve_onec_password, resolve_serve_mode_with_override,
+        daemon_command, decode_password, resolve_onec_password, resolve_serve_mode_with_override,
         resolve_workspace_cache, validate_backend_pid, validate_onec_settings, validate_serve_args,
         warn_on_wildcard_allowlist, HttpServeOptions, McpCommand, McpProfileCli, McpServeArgs,
         McpServeMode, ServeModeContext,
@@ -1909,11 +1909,24 @@ mod tests {
         );
 
         // An encoding of no password is no password: the gate refuses a credential that would be
-        // dropped, and there is nothing here to drop.
-        let mut args = serve_args(McpServeMode::BrokerRequired, None);
-        args.backend_pid = Some(42);
-        args.onec_password = "base64:".to_owned();
-        validate_serve_args(&args).expect("an encoded empty password is still no password");
+        // dropped, and there is nothing here to drop. Read through the whole argument path, which
+        // a platform whose peer credentials carry no PID refuses before the password is resolved.
+        if mcp_server::broker::peer_pid_available() {
+            let mut args = serve_args(McpServeMode::BrokerRequired, None);
+            args.backend_pid = Some(42);
+            args.onec_password = "base64:".to_owned();
+            validate_serve_args(&args).expect("an encoded empty password is still no password");
+        }
+        assert!(
+            validate_onec_settings(
+                McpServeMode::BrokerRequired,
+                None,
+                "",
+                &decode_password("base64:")
+            )
+            .is_ok(),
+            "an encoded empty password reaches the gate as no password"
+        );
         for mode in [McpServeMode::Stdio, McpServeMode::Broker, McpServeMode::Daemon] {
             validate_onec_settings(mode, Some("http://base-a"), "user", "secret")
                 .unwrap_or_else(|e| panic!("{mode:?} applies 1C settings itself: {e}"));

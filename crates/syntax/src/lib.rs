@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod ast_utils;
 mod comment_run;
+pub mod preproc_symbols;
 pub mod sdbl_query;
 mod syntax_kind;
 mod syntax_node;

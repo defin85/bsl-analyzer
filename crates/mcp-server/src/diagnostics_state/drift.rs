@@ -54,10 +54,20 @@ impl DiagnosticsState {
         self.scan_count.load(Ordering::SeqCst)
     }
 
+    #[cfg(test)]
+    pub(super) fn forced_rescans(&self) -> usize {
+        self.forced_rescans.load(Ordering::SeqCst)
+    }
+
     /// `pub(crate)`, unlike its neighbours: the handler-level gates live in `lib.rs`.
     #[cfg(test)]
-    pub(crate) fn forced_rescans(&self) -> usize {
-        self.forced_rescans.load(Ordering::SeqCst)
+    pub(crate) fn stale_miss_consultations(&self) -> usize {
+        self.stale_miss_consultations.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(super) fn note_stale_miss_consultation(&self) {
+        self.stale_miss_consultations.fetch_add(1, Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -87,6 +97,11 @@ impl DiagnosticsState {
     #[cfg(test)]
     pub(super) fn set_pre_drain_probe(&self, f: impl FnOnce() + Send + 'static) {
         *lock_recover(&self.pre_drain_probe) = Some(Box::new(f));
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_pre_force_probe(&self, f: impl FnOnce() + Send + 'static) {
+        *lock_recover(&self.pre_force_probe) = Some(Box::new(f));
     }
 
     pub(super) fn poll_drift(&self) {
@@ -730,17 +745,30 @@ impl DiagnosticsState {
         }
     }
 
-    pub(crate) fn force_rescan(&self) {
+    /// Reports what the storm guard owes: `None` when the force armed, `Some(remaining)`
+    /// when the floor declined it and by how much it is still short.
+    ///
+    /// The number is the whole difference between "the scan was asked for" and "the scan
+    /// happened". A caller that only wants the next poll routed through the disk may drop
+    /// it; a caller whose ANSWER depends on the walk cannot, because a declined force
+    /// leaves the read exactly as blind as it was — see
+    /// [`ResidentSession::read_retrying_a_stale_miss`](super::session::ResidentSession::read_retrying_a_stale_miss).
+    pub(crate) fn force_rescan(&self) -> Option<Duration> {
         #[cfg(test)]
         self.forced_rescans.fetch_add(1, Ordering::SeqCst);
         let mut cache = lock_recover(&self.scan);
-        let stale = cache.as_ref().is_none_or(|c| c.at.elapsed() >= FORCE_RESCAN_FLOOR);
-        if stale {
-            *cache = None;
-            // Route the next poll through the scan even when the hub is healthy: the
-            // event path would not re-observe an object the caller thinks it just added.
-            self.force_scan.store(true, Ordering::SeqCst);
+        let owed = cache
+            .as_ref()
+            .and_then(|c| FORCE_RESCAN_FLOOR.checked_sub(c.at.elapsed()))
+            .filter(|remaining| !remaining.is_zero());
+        if owed.is_some() {
+            return owed;
         }
+        *cache = None;
+        // Route the next poll through the scan even when the hub is healthy: the
+        // event path would not re-observe an object the caller thinks it just added.
+        self.force_scan.store(true, Ordering::SeqCst);
+        None
     }
 
     pub(super) fn resubscribe_cursor(&self) {
@@ -897,6 +925,14 @@ impl DiagnosticsState {
     #[cfg(test)]
     fn fire_post_scan_probe(&self) {
         let probe = lock_recover(&self.post_scan_probe).take();
+        if let Some(probe) = probe {
+            probe();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn fire_pre_force_probe(&self) {
+        let probe = lock_recover(&self.pre_force_probe).take();
         if let Some(probe) = probe {
             probe();
         }
@@ -2255,7 +2291,11 @@ mod tests {
     #[test]
     fn non_enrolled_xml_edit_bumps_channel2_without_full_rebuild() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
+        // Config roots are registered under their resolved spelling, and the revision is
+        // asked for by the root a path falls under: through a symlinked component the
+        // question would land on no root at all and be answered by the global fallback,
+        // which this edit has no reason to move.
+        let root = &dir.path().canonicalize().unwrap();
         sample_workspace(root);
         write(root, "Configuration.xml", "<Configuration><Name>Конфа</Name></Configuration>");
 
@@ -2450,6 +2490,11 @@ mod tests {
     /// genuinely-absent lookups cannot stat-walk the workspace faster than that floor
     /// (the retired MetadataCache's storm guard). Exercised with a synthetic past
     /// `Instant`, so it is deterministic and needs no real sleep.
+    ///
+    /// A decline is also REPORTED, and reported as the time still owed to the floor: a
+    /// caller whose answer depends on the walk waits exactly that long instead of taking
+    /// the swallowed force for a verdict. A guard that declined silently would be
+    /// indistinguishable from one that armed.
     #[test]
     fn force_rescan_is_storm_guarded_by_the_floor() {
         let state = DiagnosticsState::for_workspace(std::env::temp_dir());
@@ -2462,10 +2507,16 @@ mod tests {
             baseline_epoch: 0,
             verdict: ScanVerdict::for_test(0, 0),
         });
-        state.force_rescan();
+        let owed = state.force_rescan();
         assert!(
             lock_recover(&state.scan).is_some(),
             "a scan within the floor is kept, so repeated misses cannot hammer the FS",
+        );
+        let owed = owed.expect("a declined force says so");
+        assert!(
+            owed <= FORCE_RESCAN_FLOOR && !owed.is_zero(),
+            "the decline is reported as the time the floor still owes, and a scan taken \
+             just now owes nearly the whole floor: {owed:?}",
         );
 
         // A scan older than the floor IS cleared, so the next read re-scans and can pick up
@@ -2480,7 +2531,11 @@ mod tests {
             baseline_epoch: 0,
             verdict: ScanVerdict::for_test(0, 0),
         });
-        state.force_rescan();
+        assert_eq!(
+            state.force_rescan(),
+            None,
+            "a force that armed owes nothing, or a caller would wait for a walk it got",
+        );
         assert!(
             lock_recover(&state.scan).is_none(),
             "a scan older than the floor is force-cleared so the retry re-scans",
@@ -2726,7 +2781,10 @@ mod tests {
         use ide::DiagnosticCode;
 
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
+        // Resolved, because the wait below asks the drift baseline about this file and the
+        // baseline is keyed the way the scan spells its paths — resolved. An unresolved
+        // link component in a temporary directory would make the question address nothing.
+        let root = &dir.path().canonicalize().unwrap();
         sample_workspace(root);
         write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = false\n");
 
@@ -2750,16 +2808,27 @@ mod tests {
         assert!(reloaded, "the config rebuild completed");
 
         // A body edit AFTER the rebuild must reach the freshly-built resident via drain.
-        let gen0 = raw_generation(&state);
+        let module = module_path(root, "Сервер");
         std::thread::sleep(Duration::from_millis(10));
-        fs::write(
-            module_path(root, "Сервер"),
-            "&НаСервере\nФункция Считать() Экспорт Возврат 42; КонецФункции\n",
-        )
-        .unwrap();
-        wait_for_apply(&state, gen0, "post-rebuild edits apply to the new resident");
+        fs::write(&module, "&НаСервере\nФункция Считать() Экспорт Возврат 42; КонецФункции\n")
+            .unwrap();
+        // Waited for by THIS file's own baseline row, not by a generation move: the config
+        // edit is seen twice — by the scan and, later, by the hub — and the second sighting
+        // moves the generation on its own. Reading the text on that move asks the resident
+        // for a file whose recorded revision disk has since left behind, which it refuses
+        // outright, so the proxy fails the test for something that is not its subject.
+        let on_disk =
+            crate::graph::scan::file_fingerprint(&module).expect("the edited body is on disk");
+        let key = module.to_string_lossy().into_owned();
+        wait_until("post-rebuild edits apply to the new resident", || {
+            let _ = state.read(|_, _| ());
+            match lock_recover(&state.inner).stats.get(&key).copied() {
+                Some(fp) if fp == on_disk => Ok(()),
+                other => Err(format!("baseline holds {other:?}, waiting for {on_disk}")),
+            }
+        });
         let text = state.read(|r, _| {
-            let fid = r.file_id_for(&module_path(root, "Сервер")).unwrap();
+            let fid = r.file_id_for(&module).unwrap();
             r.analysis().file_text(fid)
         });
         match text {
@@ -3145,7 +3214,11 @@ mod tests {
     #[test]
     fn a_scan_taken_before_the_baseline_moved_is_not_applied() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
+        // Resolved once, because the entry below stands for one the hub would deliver and
+        // the hub spells its canonical key canonically. A temporary directory can be
+        // reached through a symlinked component, and an entry keyed by the unresolved
+        // spelling addresses a file the resident has never heard of.
+        let root = &dir.path().canonicalize().unwrap();
         sample_workspace(root);
 
         let (state, _hub) = state_with_hub(root);
@@ -3547,7 +3620,10 @@ mod tests {
     #[test]
     fn the_descendants_of_a_delivered_vanished_directory_are_not_missed() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
+        // Resolved, because the drain entry this stand looks for carries the resolved
+        // spelling — that is the key the hub guarantees against the scan universe — and a
+        // temporary directory can be reached through a link component.
+        let root = &dir.path().canonicalize().unwrap();
         write_common_module(root, "Первый", true, "&НаСервере\nФункция А() Экспорт КонецФункции");
         write_common_module(root, "Второй", true, "&НаСервере\nФункция Б() Экспорт КонецФункции");
 
@@ -3560,17 +3636,25 @@ mod tests {
         let after_probe = Arc::new(Mutex::new(0u64));
         let probe_seen = Arc::clone(&after_probe);
         state.set_reconcile_probe(move || {
-            fs::remove_dir_all(probe_root.join("CommonModules")).unwrap();
-            let mut obs = probe_hub.subscribe();
-            for _ in 0..300 {
-                let batch = probe_hub.drain(obs);
-                obs = batch.cursor;
-                if batch.entries.iter().any(|e| e.kind == ChangeKind::SubtreeRemoved) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            probe_hub.unsubscribe(obs);
+            let vanished = probe_root.join("CommonModules");
+            let obs = probe_hub.subscribe();
+            fs::remove_dir_all(&vanished).unwrap();
+            // The input this stand is about, stated rather than waited for: the drain names
+            // the vanished DIRECTORY and nothing else. Waiting for the backend to name it
+            // is what makes the stand measure the platform — under load FSEvents has been
+            // measured naming `Первый`, `Первый/Ext` and their bodies while never naming
+            // `CommonModules` above them, and never naming `Первый.xml` either. The
+            // reconciler is then right to charge a miss (that `.xml` removal really was not
+            // delivered), so the stand fails over an input it never meant to have. Whether
+            // the backend reports a vanished directory at all is `change_hub`'s own subject.
+            probe_hub.deliver_vanished_for_test(&vanished);
+            let batch = probe_hub.drain(obs);
+            let named = batch
+                .entries
+                .iter()
+                .any(|e| e.kind == ChangeKind::SubtreeRemoved && e.canonical == vanished);
+            probe_hub.unsubscribe(batch.cursor);
+            assert!(named, "the drain names the vanished directory: {:?}", batch.entries);
             probe_hub.degrade_external();
             *lock_recover(&probe_seen) = probe_hub.rescan_request_count();
         });

@@ -316,7 +316,7 @@ fn by_name(db: &RootDatabaseImpl, symbol: &str) -> Option<ide::SymbolInfoCard> {
             sections: SymbolInfoSections::all(),
             // Form-handler `graph_id` is encoded relative to this root; the fixtures live under
             // the designer root, so a handler path strips to `Documents/…/Module.bsl`.
-            workspace_root: Some(designer_fixture_path()),
+            workspace_root: Some(ide::StripRoot::resolve(&designer_fixture_path())),
         },
     )
 }
@@ -881,7 +881,7 @@ fn form_handler_graph_id_is_relative_to_workspace_root_not_config() {
             position: None,
             locale: ide::Locale::default(),
             sections: SymbolInfoSections::all(),
-            workspace_root: designer.parent().map(|p| p.to_path_buf()),
+            workspace_root: designer.parent().map(ide::StripRoot::resolve),
         },
     )
     .expect("handler resolves");

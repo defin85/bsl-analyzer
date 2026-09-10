@@ -1023,7 +1023,7 @@ fn is_root_descriptor(roots: Option<&bsl_search::WorkspaceRoots>, xml: &Path) ->
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{
-        write_common_module, write_common_module_tree, EnvVarGuard, ENV_LOCK,
+        env_lock, write_common_module, write_common_module_tree, EnvVarGuard,
     };
     use super::{
         SearchDriftPlan, SharedState, FORCE_REWALK_WALK_ERROR,
@@ -1239,7 +1239,7 @@ mod tests {
         ));
 
         let retry_lease = crate::workspace_lease::WorkspaceLease::claim(dir.path());
-        let _force_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _force_lock = env_lock();
         super::FORCE_DRIFT_APPLY_ERROR_ENGINE
             .store(Arc::as_ptr(&shared) as usize, std::sync::atomic::Ordering::SeqCst);
         let mut failing_plan = SearchDriftPlan {
@@ -1328,7 +1328,7 @@ mod tests {
             }
         }
 
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let _reset = ResetForcedError;
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
@@ -1354,14 +1354,52 @@ mod tests {
             lease.clone(),
         ));
 
-        let write_and_wait = |path: &std::path::Path, text: &str| {
-            let before = hub.events_seen();
-            fs::write(path, text).unwrap();
-            assert!(eventually(Duration::from_secs(5), || hub.events_seen() > before));
+        // An independent cursor, read by nobody else, so the wait below can tell "the hub
+        // delivered THIS path" from "some event went past". `events_seen` cannot: it counts
+        // every raw event, including the ones the scope filter drops (the search db writes
+        // into this very tree), and it is bumped before the path is recorded — so it rises
+        // for changes that are not the one just written and are not drainable yet.
+        let probe = hub.subscribe();
+        // One change on disk, waited out end to end: the hub records it, then the sink is done
+        // with it. The change is passed in rather than assumed to be a write, because a removal
+        // has to be waited out for the same reason — see the floor below.
+        let settle = |path: &std::path::Path, change: &dyn Fn()| {
+            // The accumulator keeps ONE record per canonical path and stamps a fresh `seq` on
+            // every event folded into it, so "an entry for this path" is not "this change was
+            // delivered": a removal and the re-write that follows collapse into one record
+            // under one path. Everything the hub already holds is therefore drained first and
+            // its highest `seq` kept as the floor — only a record above it can be this
+            // change's. The floor is only exact because every change gets its own `settle`: an
+            // unwaited one would still be in flight here and land above the floor it should
+            // have set.
+            let floor = hub.drain(probe).entries.iter().map(|entry| entry.seq).max().unwrap_or(0);
+            change();
+            // Canonicalised through the PARENT: a removal leaves no file to resolve, and both
+            // kinds of change must be matched against the spelling the watcher reports.
+            let target = path
+                .parent()
+                .expect("a file in a directory")
+                .canonicalize()
+                .expect("the directory the change happened in")
+                .join(path.file_name().expect("a file name"));
+            let mut delivered = false;
+            let mut seen: Vec<(std::path::PathBuf, u64)> = Vec::new();
+            let arrived = eventually(Duration::from_secs(15), || {
+                let batch = hub.drain(probe);
+                seen.extend(batch.entries.iter().map(|entry| (entry.canonical.clone(), entry.seq)));
+                delivered =
+                    delivered || seen.iter().any(|(path, seq)| *path == target && *seq > floor);
+                delivered
+            });
+            assert!(arrived, "the hub delivered {target:?} above seq {floor}; it saw {seen:?}");
+            // Only now does an empty sink view mean the sink is DONE with that delivery:
+            // it acknowledges after nudging, so the entry stands in its batch until then.
             assert!(eventually(Duration::from_secs(15), || {
                 hub.materialize(cursor).entries.is_empty()
             }));
         };
+        let write_and_wait =
+            |path: &std::path::Path, text: &str| settle(path, &|| fs::write(path, text).unwrap());
 
         super::FORCE_DRIFT_APPLY_ERROR_ENGINE
             .store(Arc::as_ptr(&shared) as usize, std::sync::atomic::Ordering::SeqCst);
@@ -1372,7 +1410,9 @@ mod tests {
             "the graph nudge survives a search OperationError"
         );
         write_and_wait(&workspace.join("B.bsl"), "Procedure B()\nEndProcedure");
-        fs::remove_file(&a).unwrap();
+        // Waited out like any other change: leaving it in flight would put its record above
+        // the floor the next call takes, and that call would read it as its own delivery.
+        settle(&a, &|| fs::remove_file(&a).unwrap());
         write_and_wait(&a, "Procedure New()\nEndProcedure");
         assert!(
             shared
@@ -3070,7 +3110,14 @@ mod tests {
         /// is the deliberate answer: the alternative is a key guessed from a rendering that
         /// several different roots fit, and the seam that key would travel is the one
         /// removals resolve through.
-        #[cfg(unix)]
+        ///
+        /// Only a filesystem that accepts a name outside UTF-8 can stage the root this is
+        /// about, and APFS refuses to create one at all (`EILSEQ`), so macOS is out: the
+        /// stand is a real workspace under a real directory, and there is no half of it
+        /// that survives without that directory. The mark's positive side —
+        /// [`a_referencing_module_of_an_extension_is_marked_under_its_own_root`] — runs
+        /// everywhere.
+        #[cfg(all(unix, not(target_os = "macos")))]
         #[test]
         fn a_referencing_module_under_an_unrepresentable_root_is_left_to_a_wider_mark() {
             use std::os::unix::ffi::OsStringExt;
@@ -3230,7 +3277,7 @@ mod tests {
 
         // Toggles the process-global `FORCE_REWALK_WALK_ERROR` seam; serialize against the
         // other tests that read it.
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         let db_path = dir.path().join("search.db");
@@ -3323,7 +3370,7 @@ mod tests {
         use crate::change_hub::{ChangeEntry, ChangeKind};
         use bsl_search::{Chunk, ChunkKind, Store};
 
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         let db_path = dir.path().join("search.db");
@@ -3396,7 +3443,7 @@ mod tests {
         use crate::change_hub::{ChangeEntry, ChangeKind};
         use bsl_search::{Chunk, ChunkKind, Store};
 
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         let db_path = dir.path().join("search.db");
@@ -3476,7 +3523,7 @@ mod tests {
         use crate::change_hub::{ChangeEntry, ChangeKind};
         use bsl_search::{Chunk, ChunkKind, Store};
 
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         let db_path = dir.path().join("search.db");
@@ -3545,7 +3592,7 @@ mod tests {
         use crate::change_hub::{ChangeEntry, ChangeKind};
         use bsl_search::{Chunk, ChunkKind, Store};
 
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         let db_path = dir.path().join("search.db");
@@ -3612,7 +3659,7 @@ mod tests {
         use crate::change_hub::{ChangeEntry, ChangeKind};
         use bsl_search::{Chunk, ChunkKind, Store};
 
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         let db_path = dir.path().join("search.db");
@@ -3688,7 +3735,7 @@ mod tests {
         use crate::change_hub::{ChangeEntry, ChangeKind};
         use bsl_search::{Chunk, ChunkKind, Store};
 
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         let db_path = dir.path().join("search.db");
@@ -3758,7 +3805,7 @@ mod tests {
         use crate::change_hub::{ChangeEntry, ChangeKind};
         use bsl_search::{Chunk, ChunkKind, Store};
 
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         let outside = tempdir().unwrap();
@@ -3836,7 +3883,7 @@ mod tests {
         use bsl_search::{Chunk, ChunkKind, Store};
         use std::os::unix::fs::PermissionsExt;
 
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         let db_path = dir.path().join("search.db");
@@ -3914,7 +3961,7 @@ mod tests {
 
         // This test toggles the process-global `FORCE_REWALK_WALK_ERROR` seam; serialize against the
         // boot-reconcile tests (which read it) so its forced error can't leak into their walk.
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         let db_path = dir.path().join("search.db");
@@ -4214,7 +4261,7 @@ mod tests {
     fn boot_reconcile_removes_deleted_file_keeps_present() {
         // The boot reconcile reads the process-global `FORCE_REWALK_WALK_ERROR` seam; serialize
         // against the walk-error tests that toggle it so a concurrent set can't force a false error.
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
         write_common_module_tree(
@@ -4267,7 +4314,7 @@ mod tests {
     /// Reverting the downgrade (staying Clean on a failed walk) fails this.
     #[test]
     fn boot_walk_error_downgrades_clean_to_prime() {
-        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_lock = env_lock();
         let _embedding_url = EnvVarGuard::unset("EMBEDDING_URL");
         let _embedding_model = EnvVarGuard::unset("EMBEDDING_MODEL");
 

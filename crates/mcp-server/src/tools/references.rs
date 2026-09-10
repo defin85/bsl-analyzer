@@ -162,7 +162,6 @@ pub(crate) fn answer(
     let result = ide::find_references_by_name(db, &request, external);
     Ok(render(
         db,
-        resident.workspace_root(),
         resident.workspace_roots(),
         &result,
         params,
@@ -391,10 +390,10 @@ fn outcome_str(outcome: &ReferencesOutcome) -> &'static str {
 )]
 fn render(
     db: &ide::RootDatabaseImpl,
-    // The root the graph was built against, so a form handler's path-fallback id is encoded
-    // byte-identically to the way the graph builder encoded it — and identically to the way
-    // `symbol_info` encodes it for the same method.
-    workspace_root: &std::path::Path,
+    // The root table of the resident that answered. Its workspace is the base a form handler's
+    // path-fallback id is stripped against, so the id comes out byte-identical to the graph
+    // builder's — and to the one `symbol_info` and `diagnostics` mint for the same method,
+    // because all three take it from the generation rather than from the disk.
     roots: &WorkspaceRoots,
     result: &ReferencesResult,
     params: &Params<'_>,
@@ -423,8 +422,8 @@ fn render(
     // the anchor settled on a single declaration the graph's grammar can address; a name that
     // stayed ambiguous has no one node to name, and a variable is not a node at all.
     if let [declaration] = result.declarations.as_slice() {
-        if let Some(graph_id) = ide::graph_id_of_declaration(db, declaration, Some(workspace_root))
-        {
+        let graph_root = ide::StripRoot::pinned(roots.workspace_canonical());
+        if let Some(graph_id) = ide::graph_id_of_declaration(db, declaration, Some(&graph_root)) {
             if let Some(block) = anchor_block.as_object_mut() {
                 block.insert("graph_id".into(), json!(graph_id));
             }
@@ -1465,18 +1464,7 @@ mod tests {
 
         salsa::Database::cancellation_token(&db).cancel();
         let caught = salsa::Cancelled::catch(AssertUnwindSafe(|| {
-            render(
-                &db,
-                std::path::Path::new("/ws"),
-                &roots,
-                &result,
-                &params,
-                &anchor,
-                None,
-                0,
-                DEFAULT_BUDGET,
-                0,
-            )
+            render(&db, &roots, &result, &params, &anchor, None, 0, DEFAULT_BUDGET, 0)
         }));
         assert!(
             matches!(caught, Err(salsa::Cancelled::Local)),
@@ -1862,36 +1850,16 @@ mod tests {
         };
 
         let anchor = ide::ReferenceAnchor::Name("Продажи.Расчёт".to_owned());
-        let read_whole = render(
-            &db,
-            std::path::Path::new("/ws"),
-            &roots,
-            &result,
-            &params,
-            &anchor,
-            None,
-            DEFAULT_LIMIT,
-            DEFAULT_BUDGET,
-            0,
-        );
+        let read_whole =
+            render(&db, &roots, &result, &params, &anchor, None, DEFAULT_LIMIT, DEFAULT_BUDGET, 0);
         assert!(
             read_whole.completeness.is_complete(),
             "control: nothing was held out of service: {:?}",
             read_whole.completeness.to_value(),
         );
 
-        let with_a_hole = render(
-            &db,
-            std::path::Path::new("/ws"),
-            &roots,
-            &result,
-            &params,
-            &anchor,
-            None,
-            DEFAULT_LIMIT,
-            DEFAULT_BUDGET,
-            1,
-        );
+        let with_a_hole =
+            render(&db, &roots, &result, &params, &anchor, None, DEFAULT_LIMIT, DEFAULT_BUDGET, 1);
         let reasons = with_a_hole.completeness.to_value();
         assert!(
             reasons["reasons"]

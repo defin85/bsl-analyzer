@@ -243,9 +243,10 @@ pub fn token_kind_to_syntax(kind: TokenKind) -> syntax::SyntaxKind {
 }
 
 #[cfg(test)]
-mod trivia_agreement_tests {
+mod kind_agreement_tests {
     use super::token_kind_to_syntax;
     use lexer::TokenKind;
+    use syntax::SyntaxKind;
 
     /// Два канонических предиката тривии согласны на КАЖДОМ виде.
     ///
@@ -264,6 +265,46 @@ mod trivia_agreement_tests {
                 kind.is_trivia(),
                 token_kind_to_syntax(*kind).is_trivia(),
                 "{kind:?}: лексер и дерево разошлись в том, тривия ли это"
+            );
+        }
+    }
+
+    /// Виды дерева, которые лексер выдаёт за инструкции препроцессора.
+    ///
+    /// Разряд задан именованием, а не вторым списком: `TokenKind` содержит
+    /// только виды лексем, поэтому префикс `Pre` в нём означает ровно
+    /// инструкцию препроцессора — в отличие от `SyntaxKind`, где `PRE_*`
+    /// носят ещё и узлы (`PRE_IF_DIR`, `PRE_EXPR`). Полноту перебора по
+    /// стороне лексера держит `TokenKind::ALL` со своим тестом.
+    fn preprocessor_kinds_of_the_tree() -> Vec<SyntaxKind> {
+        TokenKind::ALL
+            .iter()
+            .filter(|kind| format!("{kind:?}").starts_with("Pre"))
+            .map(|kind| token_kind_to_syntax(*kind))
+            .collect()
+    }
+
+    /// `SyntaxKind::is_preprocessor` истинен ровно на разряде инструкций.
+    ///
+    /// Перебор с обеих сторон: разряд собирается по полному списку видов
+    /// лексера, а сверяется на КАЖДОМ виде дерева. Выборка из четырёх
+    /// представителей зелена и у предиката, отставшего на пятом, — а
+    /// отстать он может молча: единственный потребитель предиката,
+    /// подсветка, на неучтённом виде просто ничего не возвращает.
+    #[test]
+    fn the_preprocessor_predicate_covers_every_instruction_kind() {
+        let instructions = preprocessor_kinds_of_the_tree();
+        assert!(
+            !instructions.is_empty(),
+            "разряд инструкций пуст: сверять нечего, проверка прошла бы вхолостую"
+        );
+
+        for raw in 0..SyntaxKind::__LAST as u16 {
+            let kind = SyntaxKind::from(raw);
+            assert_eq!(
+                kind.is_preprocessor(),
+                instructions.contains(&kind),
+                "{kind:?}: предикат дерева разошёлся с разрядом инструкций препроцессора"
             );
         }
     }

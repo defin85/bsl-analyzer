@@ -92,7 +92,6 @@ fn actions() -> Vec<(&'static str, SearchCall)> {
                     WorkspaceSearchMode::SqliteLocal,
                     None,
                     None,
-                    None,
                     &IndexProgress::new(),
                     "Процедура",
                     10,

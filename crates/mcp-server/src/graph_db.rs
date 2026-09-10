@@ -67,7 +67,13 @@ use crate::graph::input::{build_source_root, db_for_files};
 // file, or the code saying why there is none. A version-18 artefact has neither, and its
 // edges are otherwise indistinguishable from this binary's, so serving call sites from it
 // would answer "no place" for every edge that has one.
-pub(crate) const SCHEMA_VERSION: u32 = 19;
+// 20: the row encoder now strips its rel against the RESOLVED workspace root, so a workspace
+// declared through a link mints `method/file/<rel>::<name>` where a version-19 build minted
+// `method/file/<basename>::<name>` and called it unaddressable. Same tree, same bytes: no
+// fingerprint moves and no patch would ever rewrite a module nobody edited, so a reused
+// artefact would answer `not_found` for the ids this binary now hands out — and an
+// incremental patch would leave one database holding both spellings for nodes of one kind.
+pub(crate) const SCHEMA_VERSION: u32 = 20;
 
 /// One file's persisted identity in the `files` table: its stat-only fingerprint
 /// and (for `.bsl`) its resolution-signature hash. Persisting these per path lets a

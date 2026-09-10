@@ -270,7 +270,6 @@ pub(crate) struct DiagnosticsResident {
     /// Independently reloadable diagnostics-baseline snapshot. It is not a Salsa input.
     pub(super) diagnostics_baseline:
         ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot,
-    pub(super) diagnostics_baseline_observation: String,
     pub(super) project: project_model::Project,
 }
 
@@ -1121,11 +1120,18 @@ impl Clone for SweepWorker {
     }
 }
 
-/// Canonicalise a path to the same key the loader indexed by (`enumerate_bsl_files`
-/// canonicalises, falling back to the raw path). Lets a request path in any form
-/// resolve to the resident FileId.
+/// Resolve a path to the same key the loader indexed by (`enumerate_bsl_files`
+/// canonicalises). Lets a request path in any form resolve to the resident FileId.
+///
+/// Resolved as far as the file system allows rather than all-or-nothing: a directory
+/// above the file turning unreadable refuses the traversal `canonicalize` needs while
+/// every link above that door still resolves. Keying the file by its raw spelling there
+/// names it by the way it is written rather than the way it lies, and through a
+/// symlinked ancestor those are two different keys — so a live, indexed file would read
+/// as unknown, answered as "not a workspace file" rather than as one that cannot be
+/// read right now, for as long as the door stays shut.
 pub(super) fn canonical_key(path: &Path) -> String {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf()).to_string_lossy().into_owned()
+    crate::change_hub::resolve_as_far_as_it_goes(path).to_string_lossy().into_owned()
 }
 
 /// Apply drifted XML metadata + modified BSL bodies to the resident under an
@@ -1334,6 +1340,48 @@ mod tests {
     use super::*;
     use crate::tools::file_request::RootedPathError;
     use ide::DiagnosticsConfig;
+
+    /// A file's key is a statement about where it lies, so nothing that merely blocks
+    /// the way to it may change the key. Closing a directory above the file refuses the
+    /// traversal `canonicalize` needs while leaving every link above the door resolvable
+    /// — and through a symlinked ancestor the raw spelling is a DIFFERENT key, so the
+    /// table would stop recognising a file it holds.
+    ///
+    /// Both halves of the shape are load-bearing: the link is what makes the two
+    /// spellings differ at all, and the closed directory is what refuses the full
+    /// resolution. Either one alone leaves the key trivially unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_survives_a_door_closed_above_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let closed = real.join("closed");
+        std::fs::create_dir_all(&closed).unwrap();
+        std::fs::write(closed.join("Module.bsl"), "x").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let through_the_link = link.join("closed").join("Module.bsl");
+        let open_key = canonical_key(&through_the_link);
+        assert_ne!(
+            open_key,
+            through_the_link.to_string_lossy(),
+            "the link has to make the two spellings differ, or the case under test is absent",
+        );
+
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Permissions do not bind UID 0, and then the input this test needs cannot exist.
+        let bound = std::fs::read_dir(&closed).is_err();
+        let closed_key = canonical_key(&through_the_link);
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !bound {
+            return;
+        }
+
+        assert_eq!(closed_key, open_key, "a closed door above the file moved its key");
+    }
 
     /// Every fan-out job of the sweep must land on THIS resident's own pool and must be
     /// barred from opening nested parallel work.

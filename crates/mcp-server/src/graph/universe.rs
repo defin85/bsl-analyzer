@@ -349,9 +349,60 @@ mod tests {
         assert_eq!(bsl_files_from(&fresh).len(), 1, "a fresh scan does see the deletion");
     }
 
+    /// Two walked files whose canonical paths differ in bytes but share one lossy
+    /// spelling: the enumeration keeps both, the stats collapse to the first.
+    ///
+    /// Assembled rather than walked, because the only filesystems that hold such a pair
+    /// are the ones that accept a name outside UTF-8 — APFS refuses one outright
+    /// (`EILSEQ`), so on macOS no tree can stand for this. What the projections key by
+    /// is theirs alone, and it is decided from the walked set, so a set stated outright
+    /// exercises it wherever the tests run. `metadata` is the one part no test can
+    /// fabricate, so it is borrowed from real files of the two lengths the assertion
+    /// tells apart. The end-to-end pairing — that a real walk yields such a set at all,
+    /// name-sorted — is [`a_lossy_collision_survives_a_real_walk`].
     #[cfg(unix)]
     #[test]
     fn a_lossy_collision_keeps_the_projections_on_their_own_keys() {
+        use project_model::WalkedFile;
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let short = dir.path().join("short.bsl");
+        let long = dir.path().join("long.bsl");
+        fs::write(&short, "x").unwrap();
+        fs::write(&long, "xx").unwrap();
+
+        // Distinct byte names, one lossy spelling, in the byte order a walk sorts them.
+        let walked = |name: &[u8], on_disk: &Path| WalkedFile {
+            root: dir.path().to_path_buf(),
+            role: FileRole::Source,
+            walked: dir.path().join(OsStr::from_bytes(name)),
+            canonical: dir.path().join(OsStr::from_bytes(name)),
+            metadata: fs::metadata(on_disk).unwrap(),
+        };
+        let set = SourceSet {
+            files: vec![walked(b"\x80.bsl", &short), walked(b"\x81.bsl", &long)],
+            ..SourceSet::default()
+        };
+
+        let bsl = bsl_files_from(&set);
+        assert_eq!(bsl.len(), 2, "enumeration keys by PathBuf: both files stay");
+        assert_ne!(bsl[0].1, bsl[1].1, "and on their own keys, not one key twice");
+        let stats = file_stats_from(&set);
+        assert_eq!(stats.len(), 1, "stats key by the lossy string: the rows collapse");
+        // First occurrence wins, and the walk hands them over name-sorted, so the
+        // survivor is the byte-wise first name — the deterministic winner that
+        // replaced the readdir lottery.
+        assert_eq!(stats[0].len, 1, "the surviving row must be the first-listed file's");
+    }
+
+    /// The pairing for the stand above: a real walk does hand such a pair to the
+    /// projections, sorted by name. Only a filesystem that accepts a name outside UTF-8
+    /// can hold one — APFS answers `EILSEQ` — so this half is where such names exist.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_lossy_collision_survives_a_real_walk() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir().unwrap();

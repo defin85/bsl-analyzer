@@ -16,14 +16,75 @@ pub fn salsa_memory_rows(db: &ide::RootDatabaseImpl) -> Vec<SalsaMemoryRow> {
     rows
 }
 
-/// Read one `/proc/self/status` field in kilobytes (e.g. `"VmRSS:"`); `None` off Linux.
-pub(crate) fn proc_kb(key: &str) -> Option<u64> {
+/// Resident set size of this process in bytes, read from the kernel rather than
+/// from the allocator; `None` on a platform with no reader here.
+pub(crate) fn process_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        proc_status_kb("VmRSS:").map(|kb| kb * 1024)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        task_basic_info().map(|info| info.resident_size)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Peak resident set size of this process in bytes. The kernel keeps this
+/// high-water mark itself, so it catches spikes shorter than any sampling
+/// interval; `None` on a platform with no reader here.
+pub(crate) fn process_peak_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        proc_status_kb("VmHWM:").map(|kb| kb * 1024)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        task_basic_info().map(|info| info.resident_size_max)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Read one `/proc/self/status` field in kilobytes (e.g. `"VmRSS:"`).
+#[cfg(target_os = "linux")]
+fn proc_status_kb(key: &str) -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     status
         .lines()
         .find(|l| l.starts_with(key))
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|v| v.parse::<u64>().ok())
+}
+
+/// macOS has no `/proc`; the same residency numbers come from the mach kernel's
+/// task info for the current task.
+#[cfg(target_os = "macos")]
+fn task_basic_info() -> Option<libc::mach_task_basic_info> {
+    let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info>::uninit();
+    let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+    // libc hands its mach bindings over to the `mach2` crate, but only the task
+    // port accessor carries the deprecation — `task_info` and the flavour
+    // constants below are current, so one allow beats a crate for one symbol.
+    #[allow(deprecated)]
+    // SAFETY: reading the port of the task we are already running in.
+    let task = unsafe { libc::mach_task_self() };
+    // SAFETY: `task_info` writes at most `count` words of the requested flavour,
+    // and `MACH_TASK_BASIC_INFO_COUNT` is exactly the size of the buffer being
+    // passed; the contents are read only after the call reports KERN_SUCCESS.
+    let status = unsafe {
+        libc::task_info(task, libc::MACH_TASK_BASIC_INFO, info.as_mut_ptr().cast(), &mut count)
+    };
+    if status != libc::KERN_SUCCESS {
+        return None;
+    }
+    // SAFETY: KERN_SUCCESS means the kernel filled the whole structure.
+    Some(unsafe { info.assume_init() })
 }
 
 /// Print the salsa memory map (top 40 ingredients by live entry count) under a
@@ -74,14 +135,13 @@ pub fn print_salsa_memory_report(db: &ide::RootDatabaseImpl, label: &str) {
         "--- intern pool (non-salsa): norms={} raw_cached={} heap~={pool_mb:.1}MB ---",
         pool.norm_count, pool.raw_count
     );
-    if let (Some(hwm), Some(rss)) = (proc_kb("VmHWM:"), proc_kb("VmRSS:")) {
+    if let (Some(hwm), Some(rss)) = (process_peak_rss_bytes(), process_rss_bytes()) {
         let salsa_mb = (tm + tf + th) as f64 / 1048576.0;
+        let rss_mb = rss as f64 / 1048576.0;
         eprintln!(
-            "--- process: VmHWM(peak)={:.1}MB VmRSS(now)={:.1}MB | salsa-tracked={:.1}MB | intern-pool~={pool_mb:.1}MB | untracked(node-cache+text+alloc)~={:.1}MB ---",
-            hwm as f64 / 1024.0,
-            rss as f64 / 1024.0,
-            salsa_mb,
-            rss as f64 / 1024.0 - salsa_mb - pool_mb
+            "--- process: rss-peak={:.1}MB rss-now={rss_mb:.1}MB | salsa-tracked={salsa_mb:.1}MB | intern-pool~={pool_mb:.1}MB | untracked(node-cache+text+alloc)~={:.1}MB ---",
+            hwm as f64 / 1048576.0,
+            rss_mb - salsa_mb - pool_mb
         );
     }
 }

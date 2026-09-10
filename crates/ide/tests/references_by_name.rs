@@ -1302,7 +1302,7 @@ fn a_form_module_method_is_a_working_anchor() {
             position: None,
             locale: ide::Locale::default(),
             sections: SymbolInfoSections::all(),
-            workspace_root: Some(designer),
+            workspace_root: Some(ide::StripRoot::resolve(&designer)),
         },
     );
     assert!(card.is_some(), "control: the same string resolves as a card");
@@ -1435,7 +1435,7 @@ fn a_form_attribute_outranks_a_form_module_method_of_the_same_name() {
             position: None,
             locale: ide::Locale::default(),
             sections: SymbolInfoSections::all(),
-            workspace_root: Some(designer),
+            workspace_root: Some(ide::StripRoot::resolve(&designer)),
         },
     );
     assert_eq!(

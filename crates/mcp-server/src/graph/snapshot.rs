@@ -1332,6 +1332,11 @@ mod tests {
         // moment after the generation became visible.
         let cursor = hub.subscribe();
         let file = ext.join("Новый.bsl");
+        // The watcher reports the spelling the platform hands it, which need not be the
+        // one written through (macOS resolves the temp dir's link before delivering). The
+        // delivery is therefore recognised by `canonical`, the key the hub guarantees
+        // against the scan universe.
+        let delivered = ext.canonicalize().expect("the extension root exists").join("Новый.bsl");
         // Waits on the hub's delivery queue, not on graph state: a graph-state summary
         // would say nothing about whether inotify delivered.
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1342,7 +1347,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             let batch = hub.drain(cursor);
             cursor = batch.cursor;
-            if batch.entries.iter().any(|e| e.raw == file) {
+            if batch.entries.iter().any(|e| e.canonical == delivered) {
                 seen = true;
                 break;
             }

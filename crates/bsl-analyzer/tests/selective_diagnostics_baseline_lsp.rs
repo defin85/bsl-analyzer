@@ -94,7 +94,10 @@ fn selective_lsp_publishes_new_unsuppressed_and_protected() {
 #[test]
 fn selective_lsp_enabled_error_is_fail_visible_and_recovers() {
     let dir = selective_project();
-    let root = dir.path();
+    // The server republishes under the path it resolved through the filesystem, so a root
+    // reached by a symlink — every temporary directory on macOS — has to be named the same way
+    // here, or the awaited notification never matches.
+    let root = &dir.path().canonicalize().unwrap();
     let mut lsp = Lsp::start(root);
     assert!(lsp.open(&root.join("src/cf/Main.bsl"), BROKEN)["params"]["diagnostics"]
         .as_array()
@@ -119,12 +122,19 @@ fn selective_lsp_enabled_error_is_fail_visible_and_recovers() {
         .to_owned();
     let object = root.join("baselines").join(&relative);
     let valid = std::fs::read(&object).unwrap();
+    // Broken ONCE: the write may land before the watcher is armed and raise no event, and
+    // the server has to notice it anyway, the next time the client asks it for anything.
     std::fs::write(&object, b"{broken").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let main_uri = lsp_types::Url::from_file_path(root.join("src/cf/Main.bsl")).unwrap();
     let ext_uri = lsp_types::Url::from_file_path(root.join("src/cfe/Ext/Ext.bsl")).unwrap();
     let (mut notified, mut main_seen, mut ext_seen) = (false, false, false);
     while !notified || !main_seen || !ext_seen {
-        let message = lsp.wait_for(|_| true);
+        let Some(message) = lsp.wait_for_within(Duration::from_secs(1), |_| true) else {
+            assert!(std::time::Instant::now() < deadline, "the server never saw the broken object",);
+            lsp.poke();
+            continue;
+        };
         if message["method"] == "window/showMessage"
             && message["params"]["message"]
                 .as_str()
@@ -162,9 +172,18 @@ fn selective_lsp_enabled_error_is_fail_visible_and_recovers() {
     directory.replace_file("replacement.tmp", &relative).unwrap();
     let mut main_seen = false;
     let mut ext_seen = false;
+    let repaired = std::time::Instant::now() + Duration::from_secs(60);
     while !main_seen || !ext_seen {
-        let message =
-            lsp.wait_for(|message| message["method"] == "textDocument/publishDiagnostics");
+        // Poked for the reason the first provocation is: the repair may have landed
+        // before the watcher was re-armed and raised no event, and the server notices
+        // that only when the client asks it for something.
+        let Some(message) = lsp.wait_for_within(Duration::from_secs(1), |message| {
+            message["method"] == "textDocument/publishDiagnostics"
+        }) else {
+            assert!(std::time::Instant::now() < repaired, "the server never republished");
+            lsp.poke();
+            continue;
+        };
         let uri = message["params"]["uri"].as_str().unwrap();
         if uri == main_uri.as_str() {
             assert!(message["params"]["diagnostics"].as_array().unwrap().is_empty());
@@ -176,25 +195,22 @@ fn selective_lsp_enabled_error_is_fail_visible_and_recovers() {
     }
 
     std::fs::write(&object, b"{broken-again").unwrap();
-    let notified = lsp.wait_for(|message| message["method"] == "window/showMessage");
+    let again = std::time::Instant::now() + Duration::from_secs(60);
+    let notified = loop {
+        if let Some(message) = lsp.wait_for_within(Duration::from_secs(1), |message| {
+            message["method"] == "window/showMessage"
+        }) {
+            break message;
+        }
+        assert!(std::time::Instant::now() < again, "the server never saw the second break");
+        lsp.poke();
+    };
     assert!(notified["params"]["message"]
         .as_str()
         .is_some_and(|message| message.contains("diagnostics baseline")));
 }
 
-#[test]
-fn selective_lsp_config_reload_applies_selection_and_republishes() {
-    let dir = full_manifest_selective_project();
-    let root = dir.path();
-    let mut lsp = Lsp::start(root);
-    assert!(lsp.open(&root.join("src/cf/Main.bsl"), BROKEN)["params"]["diagnostics"]
-        .as_array()
-        .unwrap()
-        .is_empty());
-    assert!(!lsp.open(&root.join("src/cfe/Ext/Ext.bsl"), UNSUPPRESSED)["params"]["diagnostics"]
-        .as_array()
-        .unwrap()
-        .is_empty());
+fn select_both(root: &std::path::Path) {
     std::fs::write(
         root.join("bsl-analyzer.toml"),
         r#"[source]
@@ -206,15 +222,37 @@ include = ["main", "extension:Ext"]
 "#,
     )
     .unwrap();
+}
+
+#[test]
+fn selective_lsp_config_reload_applies_selection_and_republishes() {
+    let dir = full_manifest_selective_project();
+    // The server republishes under the path it resolved through the filesystem, so a root
+    // reached by a symlink — every temporary directory on macOS — has to be named the same way
+    // here, or the awaited notification never matches.
+    let root = &dir.path().canonicalize().unwrap();
+    let mut lsp = Lsp::start(root);
+    assert!(lsp.open(&root.join("src/cf/Main.bsl"), BROKEN)["params"]["diagnostics"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(!lsp.open(&root.join("src/cfe/Ext/Ext.bsl"), UNSUPPRESSED)["params"]["diagnostics"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let selected = Provocation::start(|| select_both(root));
     let mut remaining = std::collections::BTreeSet::from([
         lsp_types::Url::from_file_path(root.join("src/cf/Main.bsl")).unwrap().to_string(),
         lsp_types::Url::from_file_path(root.join("src/cfe/Ext/Ext.bsl")).unwrap().to_string(),
     ]);
     while !remaining.is_empty() {
-        let message = lsp.wait_for(|message| {
+        let Some(message) = lsp.wait_for_within(Duration::from_secs(2), |message| {
             message["method"] == "textDocument/publishDiagnostics"
                 && message["params"]["uri"].as_str().is_some_and(|uri| remaining.contains(uri))
-        });
+        }) else {
+            selected.again();
+            continue;
+        };
         let uri = message["params"]["uri"].as_str().unwrap();
         let diagnostics = message["params"]["diagnostics"].as_array().unwrap();
         let final_state = if uri.ends_with("Main.bsl") {

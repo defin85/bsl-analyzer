@@ -13,6 +13,8 @@
 //! [`EnvFlags`]: crate::execution_env::EnvFlags
 
 use crate::execution_env::EnvFlags;
+use stdx::case::{eq_case_folded, fold_case};
+use syntax::preproc_symbols::{self, PreprocSymbolId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreprocCondition {
@@ -46,34 +48,26 @@ pub enum PreprocSymbol {
 }
 
 impl PreprocSymbol {
+    /// Семантический класс написания. Написания и их тождество приходят из
+    /// реестра `syntax::preproc_symbols`; здесь остаётся только то, что
+    /// реестру не принадлежит, — во что символ схлопывается для модели сред.
     fn from_ident(ident: &str) -> PreprocSymbol {
         use PreprocSymbol::*;
-        if eq(ident, "Клиент", "Client") || eq(ident, "НаКлиенте", "AtClient") {
-            Client
-        } else if eq(ident, "Сервер", "Server") || eq(ident, "НаСервере", "AtServer")
-        {
-            Server
-        } else if eq(ident, "ТонкийКлиент", "ThinClient") {
-            ThinClient
-        } else if eq(ident, "ВебКлиент", "WebClient") {
-            WebClient
-        } else if eq(ident, "МобильныйКлиент", "MobileClient") {
-            MobileClient
-        } else if eq(ident, "ТолстыйКлиентОбычноеПриложение", "ThickClientOrdinaryApplication")
-        {
-            ThickClientOrdinaryApplication
-        } else if eq(ident, "ТолстыйКлиентУправляемоеПриложение", "ThickClientManagedApplication")
-        {
-            ThickClientManagedApplication
-        } else if eq(ident, "ВнешнееСоединение", "ExternalConnection") {
-            ExternalConnection
-        } else if eq(ident, "МобильноеПриложениеКлиент", "MobileAppClient")
-            || eq(ident, "МобильноеПриложениеСервер", "MobileAppServer")
-            || eq(ident, "МобильныйАвтономныйСервер", "MobileStandaloneServer")
-        {
-            MobileAppRuntime
-        } else {
-            Unrecognized
+        let Some(id) = preproc_symbols::lookup(ident) else {
+            return Unrecognized;
+        };
+        match id {
+            PreprocSymbolId::Client | PreprocSymbolId::AtClient => Client,
+            PreprocSymbolId::Server | PreprocSymbolId::AtServer => Server,
+            PreprocSymbolId::ThinClient => ThinClient,
+            PreprocSymbolId::WebClient => WebClient,
+            PreprocSymbolId::MobileClient => MobileClient,
+            PreprocSymbolId::ThickClientOrdinaryApplication => ThickClientOrdinaryApplication,
+            PreprocSymbolId::ThickClientManagedApplication => ThickClientManagedApplication,
+            PreprocSymbolId::ExternalConnection => ExternalConnection,
+            PreprocSymbolId::MobileAppClient
+            | PreprocSymbolId::MobileAppServer
+            | PreprocSymbolId::MobileStandaloneServer => MobileAppRuntime,
         }
     }
 
@@ -108,8 +102,10 @@ impl PreprocSymbol {
     }
 }
 
+/// Двуязычное ключевое слово инструкции. Регистр складывается по правилу
+/// лексера: он уже принял этот текст по `(?i)`, и разбор обязан согласиться.
 fn eq(ident: &str, ru: &str, en: &str) -> bool {
-    stdx::case::eq_ignore_case(ident, ru) || stdx::case::eq_ignore_case(ident, en)
+    eq_case_folded(ident, ru) || eq_case_folded(ident, en)
 }
 
 impl PreprocCondition {
@@ -225,24 +221,42 @@ pub(crate) fn extract_condition_text(header: &str) -> Option<&str> {
     };
     let rest = header.trim_start();
     let rest = rest.strip_prefix('#')?.trim_start();
-    let keyword_len = ["ИначеЕсли", "ElsIf", "Если", "If"]
-        .iter()
-        .find(|kw| starts_with_ignore_case(rest, kw))?
-        .len();
+    let keyword_len =
+        ["ИначеЕсли", "ElsIf", "Если", "If"].iter().find_map(|kw| folded_prefix_len(rest, kw))?;
     let rest = rest[keyword_len..].trim();
-    let then_at = ["Тогда", "Then"].iter().find_map(|kw| {
-        rest.len()
-            .checked_sub(kw.len())
-            // `checked_sub` yields a byte offset; a non-boundary index (a
-            // trailing multibyte char that is shorter than the keyword)
-            // would panic the slice, so reject it before comparing.
-            .filter(|&at| rest.is_char_boundary(at) && stdx::case::eq_ignore_case(&rest[at..], kw))
-    })?;
+    let then_at = ["Тогда", "Then"].iter().find_map(|kw| folded_suffix_start(rest, kw))?;
     Some(rest[..then_at].trim_end())
 }
 
-fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
-    text.get(..prefix.len()).is_some_and(|head| stdx::case::eq_ignore_case(head, prefix))
+/// Длина в байтах начала `text`, складывающегося в `keyword`.
+///
+/// Считается по символам, а не по `keyword.len()`: под правилом лексера в
+/// написание попадают буквы иной длины в UTF-8 (`ſ` вместо `s`, `ᲃ` вместо
+/// `с`), и длина канонического слова к ним не применима.
+fn folded_prefix_len(text: &str, keyword: &str) -> Option<usize> {
+    let mut chars = text.char_indices();
+    for expected in keyword.chars() {
+        let (_, c) = chars.next()?;
+        if fold_case(c) != fold_case(expected) {
+            return None;
+        }
+    }
+    Some(chars.next().map_or(text.len(), |(at, _)| at))
+}
+
+/// Смещение, с которого `text` заканчивается словом, складывающимся в
+/// `keyword`. Считается по символам по той же причине, что и префикс.
+fn folded_suffix_start(text: &str, keyword: &str) -> Option<usize> {
+    let mut chars = text.char_indices().rev();
+    let mut start = text.len();
+    for expected in keyword.chars().rev() {
+        let (at, c) = chars.next()?;
+        if fold_case(c) != fold_case(expected) {
+            return None;
+        }
+        start = at;
+    }
+    Some(start)
 }
 
 #[derive(Debug, PartialEq)]
@@ -439,6 +453,55 @@ mod tests {
         assert_eq!(t("Сервер", EnvFlags::THICK_CLIENT_ORDINARY), None);
         assert_eq!(t("Сервер", EnvFlags::EXTERNAL_CONNECTION), None);
         assert_eq!(t("НЕ Сервер", EnvFlags::THICK_CLIENT_MANAGED), None);
+    }
+
+    /// Каждый символ реестра получает семантический класс, и ни одно
+    /// написание источника не уходит в `Unrecognized`.
+    ///
+    /// Обход реестра, а не список руками: символ, добавленный завтра,
+    /// обязан провалить эту проверку, если класс ему не назначен.
+    #[test]
+    fn every_registry_symbol_has_a_semantic_class() {
+        for &id in PreprocSymbolId::ALL {
+            for spelling in id.spellings() {
+                let sym = PreprocSymbol::from_ident(spelling);
+                assert_ne!(
+                    sym,
+                    PreprocSymbol::Unrecognized,
+                    "{spelling:?}: написание реестра осталось нераспознанным"
+                );
+                assert_eq!(
+                    PreprocSymbol::from_ident(&spelling.to_uppercase()),
+                    sym,
+                    "{spelling:?}: регистр изменил класс"
+                );
+            }
+        }
+        // ОС-символы источника не имеют и остаются нераспознанными — тот же
+        // ответ, что у остальных потребителей реестра.
+        for os in ["Linux", "Windows", "MacOS"] {
+            assert_eq!(PreprocSymbol::from_ident(os), PreprocSymbol::Unrecognized);
+        }
+    }
+
+    /// Заголовок инструкции разбирается по тому же правилу регистра, по
+    /// которому лексер его принял.
+    ///
+    /// `ſ` длиннее `s` в UTF-8, а `ᲃ` длиннее `с`: разбор, режущий заголовок
+    /// по длине канонического слова, здесь обязан провалиться. Рядом стоят
+    /// обычные написания — без них проверка зелена и у разбора, который не
+    /// понимает вообще ничего.
+    #[test]
+    fn the_header_folds_case_the_way_the_lexer_does() {
+        let h = PreprocCondition::parse_directive_header;
+        assert_eq!(h("#El\u{17F}if Server Then"), PreprocCondition::Symbol(PreprocSymbol::Server));
+        assert_eq!(h("#Е\u{1C83}ли Сервер Тогда"), PreprocCondition::Symbol(PreprocSymbol::Server));
+        assert_eq!(h("#ElsIf Server Then"), PreprocCondition::Symbol(PreprocSymbol::Server));
+        assert_eq!(h("#Если Сервер Тогда"), PreprocCondition::Symbol(PreprocSymbol::Server));
+        // Символ условия — по тому же правилу.
+        assert_eq!(h("#If \u{17F}erver Then"), PreprocCondition::Symbol(PreprocSymbol::Server));
+        // Турецкая точечная `ı` ключевым словом не становится, как и у лексера.
+        assert_eq!(h("#\u{131}f Server Then"), PreprocCondition::Unknown);
     }
 
     #[test]

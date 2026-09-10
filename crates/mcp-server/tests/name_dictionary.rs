@@ -135,27 +135,43 @@ fn categories(body: &Value) -> Vec<String> {
     candidates(body).iter().filter_map(|c| c["category"].as_str().map(str::to_owned)).collect()
 }
 
-/// И2. The platform and the configuration's own tables answer by name with no
-/// graph at all.
+/// Which source built the row for the first candidate of `category`.
 ///
-/// The graph state matters: with a BUILT graph a metadata object is found by its
-/// `mdo/…` node, so the same assertion would pass on an implementation that only
-/// relabelled a graph hit. Asked before the build, only a dictionary can answer.
+/// One entity arrives as one row carrying every address any provider knew for it, and the
+/// row keeps the name of the source that built it: providers run in a fixed order with the
+/// graph LAST, so a row a dictionary source produced still says so however far the graph's
+/// own background build has got.
+fn provider_of(body: &Value, category: &str) -> Option<String> {
+    candidates(body)
+        .iter()
+        .find(|c| c["category"] == category)
+        .and_then(|c| c["provider"].as_str().map(str::to_owned))
+}
+
+/// И2. The platform and the configuration's own tables answer by name — not the graph.
+///
+/// Which source answered IS the claim: with a built graph a metadata object is also found by
+/// its `mdo/…` node, so asserting merely that a candidate came back would pass on an
+/// implementation that only relabelled a graph hit. This used to be gated by asking before
+/// the graph had published, which is no precondition at all but a bet on which of two
+/// background builds finishes first — won on a loaded machine and lost on an idle one. The
+/// row names its own source, so the claim can be asserted outright and holds whatever the
+/// graph is doing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn names_resolve_before_the_graph_exists() {
+async fn the_configuration_and_the_platform_answer_by_name() {
     let ws = stage_workspace();
     let client = workspace_client(ws.path(), true).await;
     wait_until_resident_is_ready(&client).await;
 
     let platform = resolve(&client, "СтрНайти").await;
-    assert_eq!(
-        provider_state(&platform, "graph"),
-        "not_ready",
-        "the stand is meant to have no graph yet: {platform}",
-    );
     assert!(
         categories(&platform).iter().any(|c| c == "platform_member"),
         "a platform member is missing: {platform}",
+    );
+    assert_eq!(
+        provider_of(&platform, "platform_member").as_deref(),
+        Some("platform"),
+        "a platform member must come from the platform, which needs no index: {platform}",
     );
 
     let object = resolve(&client, "Справочник1").await;
@@ -163,27 +179,39 @@ async fn names_resolve_before_the_graph_exists() {
         categories(&object).iter().any(|c| c == "metadata_object"),
         "a metadata object is missing: {object}",
     );
+    assert_eq!(
+        provider_of(&object, "metadata_object").as_deref(),
+        Some("metadata_listing"),
+        "a metadata object must come from the configuration's own tables: {object}",
+    );
 }
 
-/// И3. A source that could not be consulted is named, and the answer says it is
-/// partial. The control is the same query once the graph is built.
+/// И3 end to end: every source is NAMED whatever it is doing, and once the graph is built
+/// it answers and nothing is building any more.
+///
+/// What this stand does NOT pin is the graph being unconsulted when the first question is
+/// asked. The graph is a second background build racing this one: waiting for the resident
+/// and asserting the graph has not published yet is not a precondition, it is a bet on which
+/// build finishes first. The half that needs the graph held unconsulted is
+/// `tools::graph::tests::an_unconsulted_source_is_named_not_merely_missing`, where that
+/// verdict is stated to the dictionary exactly as the handler states it. What is left here
+/// is the half only a live server can show.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unconsulted_source_is_named_not_merely_missing() {
+async fn every_source_is_named_before_and_after_the_graph_is_built() {
     let ws = stage_workspace();
     let client = workspace_client(ws.path(), true).await;
     wait_until_resident_is_ready(&client).await;
 
     let building = resolve(&client, "СтрНайти").await;
     assert!(!candidates(&building).is_empty(), "{building}");
-    assert_eq!(provider_state(&building, "graph"), "not_ready", "{building}");
     assert_eq!(provider_state(&building, "platform"), "answered", "{building}");
-    assert!(
-        reason_codes(&building).iter().any(|c| c == "index_building"),
-        "the answer does not admit it is partial: {building}",
-    );
+    // Read out, never asserted: an unnamed source is one a consumer cannot decide to wait
+    // for, and `provider_state` fails if the graph is missing from the list at all.
+    let _ = provider_state(&building, "graph");
 
-    // The positive control. Without it the assertions above pass on an
-    // implementation that reports `not_ready` unconditionally.
+    // Deterministic by construction: the wait makes the graph's verdict an input rather
+    // than something to hope for. Without it an implementation that reported `not_ready`
+    // for ever would go unnoticed, since nothing above asserts the graph's state.
     wait_until_graph_is_ready(&client).await;
     let built = resolve(&client, "СтрНайти").await;
     assert_eq!(provider_state(&built, "graph"), "answered", "{built}");
@@ -193,8 +221,18 @@ async fn an_unconsulted_source_is_named_not_merely_missing() {
     );
 }
 
-/// И4. An empty list is not by itself a proven zero — it means one thing while an
-/// index is building and another when every source answered.
+/// И4 end to end: once every source has answered, an empty list IS the answer.
+///
+/// What this stand does NOT pin is the other half — the same emptiness while a source is
+/// still unconsulted, which must NOT read as complete. Asking for it before the graph
+/// publishes is no precondition: it is a bet on which of two background builds finishes
+/// first, won on a loaded machine and lost on an idle one. That half is stated where the
+/// graph's verdict is an input rather than a hope: over the dictionary's own answer in
+/// `tools::graph::tests::an_empty_list_while_a_source_is_unconsulted_is_not_a_proven_zero`,
+/// and over the envelope this action assembles for itself in
+/// `resolve_envelope::an_unconsulted_source_makes_the_resolve_envelope_partial`. What is left
+/// here is the half only a live server can show: every source really did answer, and the
+/// envelope stops hedging.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_empty_list_says_whether_it_is_a_proven_zero() {
     let ws = stage_workspace();
@@ -203,30 +241,34 @@ async fn an_empty_list_says_whether_it_is_a_proven_zero() {
 
     const ABSENT: &str = "ЗаведомоНесуществующееИмяСимвола";
 
-    let building = resolve(&client, ABSENT).await;
-    assert!(candidates(&building).is_empty(), "{building}");
-    assert!(
-        reason_codes(&building).iter().any(|c| c == "index_building"),
-        "an empty list while the graph builds must not read as complete: {building}",
-    );
-
     wait_until_graph_is_ready(&client).await;
     let settled = resolve(&client, ABSENT).await;
     assert!(candidates(&settled).is_empty(), "{settled}");
+    assert_eq!(provider_state(&settled, "graph"), "answered", "{settled}");
     assert!(
         !reason_codes(&settled).iter().any(|c| c == "index_building"),
         "with every source answered the same emptiness IS the answer: {settled}",
     );
 }
 
-/// И16. The other entry is fixed too.
+/// И16 end to end: a resident miss carries the platform's answer.
 ///
-/// `symbol_info` used to answer a resident miss from the graph alone, so with no
-/// graph it returned an empty list — even for a platform member, which the graph
-/// never held in the first place. The name asked here is one the PLATFORM
-/// answers by prefix — `СтрНайт` resolves to nothing and is one letter short of
-/// `СтрНайти`. A name nothing could hold would leave the list empty under either
-/// implementation, which is why the test that asked for one proved nothing.
+/// `symbol_info` used to answer a resident miss from the graph alone, so with no graph it
+/// returned an empty list — even for a platform member, which the graph never held in the
+/// first place. The name asked here is one the PLATFORM answers by prefix: `СтрНайт`
+/// resolves to nothing and is one letter short of `СтрНайти`. A name nothing could hold
+/// would leave the list empty under either implementation, which is why the test that asked
+/// for one proved nothing.
+///
+/// What this stand does NOT pin is the graph's own state, and that is deliberate. The graph
+/// is a second background build racing this one: waiting for the resident and asserting the
+/// graph has not published yet is not a precondition, it is a bet on which build finishes
+/// first — won on a loaded machine and lost on an idle one. The half that needs the graph
+/// held not-ready is
+/// [`crate::tools::symbol_info::tests::a_resident_miss_is_answered_by_the_platform_while_the_graph_is_not_ready`],
+/// where that verdict is stated to the dictionary exactly as the handler states it. What is
+/// left here is the half only a live server can show: the whole path answers a miss with the
+/// platform's candidate, whatever the graph happens to be doing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resident_miss_is_answered_without_the_graph() {
     let ws = stage_workspace();
@@ -247,20 +289,16 @@ async fn a_resident_miss_is_answered_without_the_graph() {
         "the platform answered nothing on a miss: {miss}",
     );
 
-    let graph_state = miss["providers"]
+    // The graph is NAMED whatever it is doing — an unnamed source is one a consumer cannot
+    // decide to wait for. Its state is read out only to say what it was, never asserted.
+    let graph = miss["providers"]
         .as_array()
         .unwrap_or_else(|| panic!("the miss names its providers: {miss}"))
         .iter()
         .find(|p| p["provider"] == "graph")
-        .unwrap_or_else(|| panic!("`graph` is named: {miss}"))["state"]
+        .unwrap_or_else(|| panic!("`graph` is named among the sources: {miss}"))
         .clone();
-    assert_eq!(graph_state, "not_ready", "{miss}");
-
-    let reasons: Vec<&str> = miss["freshness"]["completeness"]["reasons"]
-        .as_array()
-        .map(|r| r.iter().filter_map(|r| r["code"].as_str()).collect())
-        .unwrap_or_default();
-    assert!(reasons.contains(&"index_building"), "{miss}");
+    assert!(graph["state"].is_string(), "the graph's state is published whatever it is: {miss}",);
 }
 
 /// И1. Every address published is accepted back by the tool it names, and the

@@ -15,6 +15,8 @@ use rmcp::{RoleClient, ServiceExt};
 use serde_json::{json, Map, Value};
 use tempfile::TempDir;
 
+mod common;
+
 type Client = RunningService<RoleClient, ()>;
 
 const TOOL: &str = "references";
@@ -523,18 +525,40 @@ async fn narrowing_survives_a_root_declared_through_a_symlink() {
     direct.cancel().await.ok();
 }
 
+/// Does this volume keep two names that differ only in case apart?
+///
+/// Asked of the volume the stand actually sits on, because that is the fact the stand needs:
+/// a case-sensitive APFS volume answers yes on macOS, and a folding volume answers no
+/// wherever it is mounted.
+#[cfg(unix)]
+fn fs_keeps_case_distinct(dir: &Path) -> bool {
+    let probe = dir.join("bsl_case_distinction_probe");
+    if std::fs::write(&probe, "").is_err() {
+        return false;
+    }
+    let distinct = std::fs::metadata(dir.join("BSL_CASE_DISTINCTION_PROBE")).is_err();
+    let _ = std::fs::remove_file(&probe);
+    distinct
+}
+
 /// Two declarations in ONE root cannot be told apart by a root filter, and the answer must
 /// not send an agent down that road. The control is the two-root case, where the root
 /// filter is exactly the right advice.
 ///
 /// Staging it needs a case-sensitive filesystem: the two spellings are the same directory on
-/// APFS or NTFS, and the stand would quietly become a single module answering `resolved` —
-/// a gate that cannot fail. Declared with `cfg(unix)` rather than left to degrade, and the
-/// stand asserts its own precondition before it asserts anything about the hint.
+/// a folding volume, and the stand would quietly become a single module answering
+/// `resolved` — a gate that cannot fail. The VOLUME is asked rather than the target OS: a
+/// case-sensitive APFS volume is a configuration chosen at format time, and there this stand
+/// is staged exactly as it is on Linux, so gating by `target_os` would drop the coverage on
+/// a machine that can carry it. Left declared rather than degraded, and the stand still
+/// asserts its own precondition before it asserts anything about the hint.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_resolution_hint_names_an_axis_that_can_separate_these_declarations() {
     let ws = stage_workspace();
+    if !fs_keeps_case_distinct(ws.path()) {
+        return;
+    }
     // One root, two directories whose names differ only in case: a module path is folded to
     // its key, so both files answer to `Стенд.ОбщийМетод`, and no root filter stands between
     // them. This is the spelling divergence a case-sensitive filesystem makes real, not an
@@ -966,8 +990,16 @@ async fn an_area_root_selects_one_root_and_excludes_the_other() {
 /// A name declared after the resident was built must not come back `not_found`: a caller
 /// reads that outcome as final. Two mechanisms can keep the promise — the change hub, and
 /// the forced re-scan this tool does on a miss the way `symbol_info` does — and this gate
-/// holds whichever of them ran; it does not single out the second. The control is a name
-/// nothing ever declared, which stays `not_found` however many re-scans it takes.
+/// holds whichever of them ran; it does not single out the second. It does not have to:
+/// the re-scan and the read behind it are coloured on their own by
+/// `references_resolves_a_late_declaration_only_behind_the_forced_retry`, on a stand with
+/// no hub to deliver anything, and the floor the re-scan waits out by
+/// `a_force_the_storm_guard_declines_is_waited_out_and_asked_again` beside it. What is
+/// measured HERE is the promise, not the mechanism — asked until it is kept, because both
+/// mechanisms run on clocks this test does not hold.
+/// The control is a name nothing ever declared, which stays `not_found` however many
+/// re-scans it takes — and it is asked ONCE, because there is nothing for a second ask to
+/// wait for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_name_declared_after_the_last_scan_is_found_on_a_forced_retry() {
     let ws = stage_workspace();
@@ -985,11 +1017,13 @@ async fn a_name_declared_after_the_last_scan_is_found_on_a_forced_retry() {
     )
     .expect("declare a method after the resident was built");
 
-    let fresh = references(&client, &[("symbol", Value::from("Первый.ДобавленнаяПозже"))]).await;
-    assert_eq!(
-        fresh["outcome"], "resolved",
-        "a method that exists on disk must not be reported missing: {fresh}",
-    );
+    let declared = [("symbol", Value::from("Первый.ДобавленнаяПозже"))];
+    common::settled(
+        "a method that exists on disk must not be reported missing",
+        |answer| answer["outcome"] == "resolved",
+        || references(&client, &declared),
+    )
+    .await;
 
     let never = references(&client, &[("symbol", Value::from("Первый.НикогдаНеБыло"))]).await;
     assert_eq!(
@@ -1677,15 +1711,12 @@ async fn a_preview_quotes_the_revision_the_answer_is_signed_with() {
     // preview — so the stand does deliver edits, and the assertion above is about which
     // text was read and not about a write that never landed.
     std::fs::write(&module, DRAFT_MODULE.replace("// мет", "// метка")).expect("visible rewrite");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let after = ask(&client).await;
-        if draft_snippet(&after).ends_with("// метка") {
-            break;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "the visible edit never arrived: {after}");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    common::settled(
+        "the visible edit reaches the preview",
+        |answer| draft_snippet(answer).ends_with("// метка"),
+        || ask(&client),
+    )
+    .await;
 
     client.cancel().await.ok();
 }
@@ -1718,30 +1749,16 @@ async fn a_line_written_after_the_last_scan_is_found_on_a_forced_retry() {
     )
     .expect("write a line after the resident was built");
 
-    // Polled, not asked once. Two mechanisms can deliver the edit — the hub's drain and the
-    // forced rescan — and BOTH can be late: the drain runs on a watcher thread the scheduler
-    // may starve, and a forced rescan is suppressed while another scan is younger than the
-    // storm floor. A single call would be a race, and a race in a smoke test is a test that
-    // fails for reasons it does not measure.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let fresh = loop {
-        let answer = references(
-            &client,
-            &anchor_args(&[(
-                "line_content",
-                Value::from("НеУстаревшаяФункция(); // добавлено позже"),
-            )]),
-        )
-        .await;
-        if answer["outcome"] == "resolved" {
-            break answer;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "a line that exists on disk must not be called stale: {answer}",
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
+    // Asked until answered, not asked once: both mechanisms that could deliver the line run
+    // on clocks this test does not hold — see `common::settled`.
+    let quoted =
+        anchor_args(&[("line_content", Value::from("НеУстаревшаяФункция(); // добавлено позже"))]);
+    let fresh = common::settled(
+        "a line that exists on disk must not be called stale",
+        |answer| answer["outcome"] == "resolved",
+        || references(&client, &quoted),
+    )
+    .await;
     assert_eq!(fresh["anchor"]["mode"], "line_content", "{fresh}");
 
     let never =

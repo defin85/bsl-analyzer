@@ -134,11 +134,13 @@ impl GlobalState {
         config_files.sort();
         config_files.dedup();
         // NOTE: object names are content-addressed, so this list changes with every
-        // baseline write and re-registering it reconfigures the loader — a full
-        // workspace rescan. Narrowing the watch to stable paths was tried and reverted:
-        // watching the manifest alone hides a corrupted enabled object, and watching the
-        // object directories makes edits to dormant partitions visible to the editor.
-        // Both properties are asserted by tests, so the fix needs a different mechanism.
+        // baseline write and each one reconfigures the loader — a full workspace rescan.
+        // Narrowing the watch to stable paths was tried and reverted: watching the
+        // manifest alone hides a corrupted enabled object, and watching the object
+        // directories makes edits to dormant partitions visible to the editor. Both
+        // properties are asserted by tests, so the rescan is what a reconfiguration
+        // still costs — the watch itself survives it, `vfs-notify` keeping its watcher
+        // and adding only targets it has not already registered.
         let mut baseline_files: Vec<_> = self
             .diagnostics_baseline
             .observation_paths()
@@ -441,6 +443,40 @@ impl GlobalState {
             }
         }
         self.diagnostics_baseline = std::sync::Arc::new(snapshot);
+    }
+
+    /// Reload the baseline when the ground moved under the snapshot in hand.
+    ///
+    /// The same question the resident asks before it answers, asked here for the same
+    /// reason and over the same value: the watcher is armed asynchronously, after the
+    /// loader has already announced the load finished, so a change landing before that
+    /// raises no event at all. Without asking, the snapshot the initial load produced
+    /// would answer for the life of the process — silently suppressing diagnostics
+    /// against a baseline that is no longer on disk.
+    pub(crate) fn refresh_diagnostics_baseline(&mut self) -> bool {
+        /// How long an answer stands for.
+        ///
+        /// The question costs a stat per watched name and sits on the loop's hottest
+        /// path, where one keystroke is one message, so it is not asked twice inside this
+        /// window. What that buys is bounded and worth naming: a message arriving inside
+        /// the window is answered from the previous answer, so a baseline that moved in
+        /// it can be answered against once — and if no message ever follows, never
+        /// noticed at all. Nothing is answered in that case either. The floor trades the
+        /// last fraction of a second against a stat on every keystroke; the window it
+        /// exists to cover, between the load and the watcher's arming, is orders of
+        /// magnitude longer.
+        const FLOOR: std::time::Duration = std::time::Duration::from_millis(250);
+
+        let now = std::time::Instant::now();
+        if self.diagnostics_baseline_checked_at.is_some_and(|last| now - last < FLOOR) {
+            return false;
+        }
+        self.diagnostics_baseline_checked_at = Some(now);
+        let Some(project) = self.project.as_ref() else { return false };
+        if !self.diagnostics_baseline.moved_since_load(project) {
+            return false;
+        }
+        self.reload_diagnostics_baseline()
     }
 
     pub(crate) fn reload_diagnostics_baseline(&mut self) -> bool {
@@ -994,7 +1030,7 @@ mod diagnostics_baseline_tests {
         };
 
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
+        let root = &dir.path().canonicalize().unwrap();
         for source in ["src/cf", "src/cfe/Ext", "src/cfe/Dormant"] {
             std::fs::create_dir_all(root.join(source)).unwrap();
             std::fs::write(root.join(source).join("Configuration.xml"), "<Configuration/>")
@@ -1126,7 +1162,7 @@ directory = "baselines"
     #[test]
     fn lsp_diagnostics_baseline_reload_handles_write_replace_and_delete_without_replacing_salsa() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
+        let root = &dir.path().canonicalize().unwrap();
         let baseline_path = root.join("baseline.json");
         std::fs::write(
             root.join("bsl-analyzer.toml"),

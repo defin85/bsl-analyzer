@@ -116,12 +116,23 @@ pub(crate) struct DiagnosticsState {
     /// tell "asked for and thrown away" from "never asked for".
     #[cfg(test)]
     pub(super) rebuilds_started: Arc<AtomicUsize>,
-    /// Consultations of the stale-miss rescan hatch — the ASK, not its effect. Counting
-    /// the arms instead would make "did this tool consult the hatch" depend on the age of
-    /// the scan cache, because the storm guard declines to arm within its floor: the same
-    /// call would be counted or not according to time.
+    /// Forces asked of the storm guard — the ASK, not its effect. Counting the arms instead
+    /// would make the count depend on the age of the scan cache, because the guard declines
+    /// to arm within its floor: the same call would be counted or not according to time.
+    ///
+    /// One consultation of the stale-miss hatch spends one force or two, so this cannot
+    /// answer HOW MANY TIMES a caller consulted; [`Self::stale_miss_consultations`] is that
+    /// number.
     #[cfg(test)]
     pub(super) forced_rescans: Arc<AtomicUsize>,
+    /// Consultations of the stale-miss rescan hatch: one per read that met a stale miss and
+    /// decided to ask, whatever the storm guard then made of the ask.
+    ///
+    /// This is the number a handler-level gate states — "this tool asks on its own miss and
+    /// on nothing else" is a claim about consultations, and a second consultation is exactly
+    /// what a count of forces cannot tell from one consultation the guard declined once.
+    #[cfg(test)]
+    pub(super) stale_miss_consultations: Arc<AtomicUsize>,
     /// One-shot test seam fired between the reconciler's first drain and its scan.
     #[cfg(test)]
     pub(super) reconcile_probe: ReconcileProbe,
@@ -134,6 +145,13 @@ pub(crate) struct DiagnosticsState {
     /// a debt visible earlier sends the read down the scan path instead.
     #[cfg(test)]
     pub(super) pre_drain_probe: ReconcileProbe,
+    /// One-shot test seam fired immediately before the stale-miss retry consults the storm
+    /// guard. The guard's answer depends on the AGE of the scan cache at that instant, and
+    /// the read standing between a stand's setup and this point is unbounded on a loaded
+    /// machine — so a stand that wants a particular answer has to state the age here, where
+    /// it is read, rather than earlier and hope it survives.
+    #[cfg(test)]
+    pub(super) pre_force_probe: ReconcileProbe,
 }
 
 /// A one-shot callback the reconciler fires between its first drain and its scan.
@@ -218,11 +236,15 @@ impl DiagnosticsState {
             #[cfg(test)]
             forced_rescans: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
+            stale_miss_consultations: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
             reconcile_probe: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             post_scan_probe: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             pre_drain_probe: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            pre_force_probe: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -400,24 +422,14 @@ impl DiagnosticsState {
     fn refresh_diagnostics_baseline(&self) {
         let mut inner = lock_recover(&self.inner);
         let Some(resident) = inner.resident.as_mut() else { return };
-        let observation = resident.diagnostics_baseline.observation();
-        if observation == resident.diagnostics_baseline_observation {
+        if !resident.diagnostics_baseline.moved_since_load(&resident.project) {
             return;
         }
-        let snapshot =
+        resident.diagnostics_baseline =
             ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::load_reusing(
                 &resident.project,
                 &resident.diagnostics_baseline,
             );
-        // A write landing WHILE the set is read would otherwise be lost forever: the
-        // bytes are the old ones, but the observation taken afterwards is the new file's,
-        // so no later read ever sees a difference. Re-observing the previous paths says
-        // whether the ground moved during the read; if it did, an empty mark forces the
-        // next read to load again instead of trusting this snapshot.
-        let moved_during_read = observation != resident.diagnostics_baseline.observation();
-        resident.diagnostics_baseline_observation =
-            if moved_during_read { String::new() } else { snapshot.observation() };
-        resident.diagnostics_baseline = snapshot;
     }
 
     /// The resident's current generation, bumped on every build / reload / incremental
@@ -751,7 +763,6 @@ impl DiagnosticsState {
         let topology = crate::graph::scan::topology_u64(&snapshot.configs);
         let diagnostics_baseline =
             ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::load(&project);
-        let diagnostics_baseline_observation = diagnostics_baseline.observation();
         Ok(ResidentBuild {
             resident: DiagnosticsResident {
                 db,
@@ -767,7 +778,6 @@ impl DiagnosticsState {
                 ignored_authors,
                 author_filter,
                 diagnostics_baseline,
-                diagnostics_baseline_observation,
                 project,
             },
             stats,
@@ -940,6 +950,61 @@ mod tests {
         assert!(
             built.stats.keys().any(|k| k.ends_with("Module.bsl")),
             "the baseline describes the scanned universe"
+        );
+    }
+
+    /// A rebuild walks the tree the workspace path names NOW, not the one it named earlier.
+    ///
+    /// The root is kept as the project DECLARED it and read again on every build — this entry
+    /// point is the only one a rebuild has — so a workspace reached through a link follows that
+    /// link wherever it currently points. Resolving the root once, when the daemon takes it in,
+    /// would freeze which physical tree is served: every later rebuild would enumerate the
+    /// directory the link named at startup and answer about a workspace that has since moved.
+    #[cfg(unix)]
+    #[test]
+    fn a_rebuild_walks_the_tree_the_workspace_points_at_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let served = dir.path().join("served");
+        let moved_to = dir.path().join("moved-to");
+        for (tree, module) in [(&served, "Альфа"), (&moved_to, "Бета")] {
+            let ext = tree.join(format!("CommonModules/{module}/Ext"));
+            std::fs::create_dir_all(&ext).unwrap();
+            std::fs::write(ext.join("Module.bsl"), "Процедура П() Экспорт КонецПроцедуры\n")
+                .unwrap();
+        }
+        let workspace = dir.path().join("workspace");
+        std::os::unix::fs::symlink(&served, &workspace).unwrap();
+
+        // Which tree was walked, read off the module directory each scanned body sits in — the
+        // absolute spellings differ per run, the owning module name does not.
+        let modules = |stats: &HashMap<String, u64>| -> Vec<String> {
+            let mut names: Vec<String> = stats
+                .keys()
+                .filter(|key| key.ends_with("Module.bsl"))
+                .filter_map(|key| {
+                    let ext = Path::new(key).parent()?;
+                    ext.parent()?.file_name()?.to_str().map(str::to_owned)
+                })
+                .collect();
+            names.sort();
+            names
+        };
+
+        let served_build = DiagnosticsState::build_resident(&workspace, &[]).expect("builds");
+        assert_eq!(
+            modules(&served_build.stats),
+            ["Альфа"],
+            "control: the workspace names the tree it was pointed at",
+        );
+
+        std::fs::remove_file(&workspace).unwrap();
+        std::os::unix::fs::symlink(&moved_to, &workspace).unwrap();
+
+        let moved_build = DiagnosticsState::build_resident(&workspace, &[]).expect("builds");
+        assert_eq!(
+            modules(&moved_build.stats),
+            ["Бета"],
+            "and a rebuild goes where it points now, rather than where it pointed before",
         );
     }
 }

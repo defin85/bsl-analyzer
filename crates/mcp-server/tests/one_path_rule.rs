@@ -30,10 +30,25 @@ const WATCHED: &[(&str, usize, &str)] = &[
     ("src/state/bootstrap.rs", 0, "the boot refusal asks PathScope::hole_covering_a_root"),
     (
         "src/change_hub.rs",
-        4,
-        "one relative-path computation for a directory listing, and three that compute \
-         which watch targets COVER which — an operation about the target set, not about \
-         holes, and one PathScope deliberately does not offer",
+        7,
+        "three that compute which watch targets COVER which — an operation about the \
+         target set, not about holes, and one PathScope deliberately does not offer. The \
+         third of them, `an_armed_recursive_watch_reaches`, asks whether the watcher is \
+         ALREADY holding a path, which the blind set and the re-watch both need and must \
+         not answer differently. It cannot be PathScope: the root's side is the resolution \
+         captured at watch time, and re-deriving it would claim coverage a retargeted \
+         symlink has lost. The fourth, `an_arm_already_recorded_covers`, is not about \
+         coverage at all: it asks whether one REGISTRATION lies inside another, which is \
+         what decides whether un-watching the one takes the other with it, and it compares \
+         the spellings the backend was given rather than where they lead. The subtree walk \
+         computes no relative path any more — it keys each file by its own resolved \
+         directory, the rule the workspace walk uses. The fifth, `restore_watches_beneath`, \
+         asks which registrations an unwatch took with it, and the sixth asks the same of \
+         one record before deciding whether a failed re-arm leaves it naming anything — \
+         both about the spellings the backend was given and about nothing else. The \
+         seventh sits beside the fourth: a record may be left out only for a path that lies \
+         inside another registration BOTH ways — under its spelling, so the unwatch takes \
+         it, and inside the tree it reaches, so the arm that follows puts it back",
     ),
 ];
 

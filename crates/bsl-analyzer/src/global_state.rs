@@ -245,6 +245,13 @@ pub struct GlobalState {
     pub loader: Box<dyn loader::Handle>,
     pub vfs_progress_config_version: u32,
     pub vfs_done: bool,
+    /// When the baseline's ground was last compared with disk.
+    ///
+    /// The comparison is a handful of stats, and it stands on the loop's hottest path —
+    /// one keystroke is one message. A floor keeps it off every message without weakening
+    /// what it buys: a baseline that moved is noticed within the floor, which is orders
+    /// of magnitude sooner than the watcher's own arming window it exists to cover.
+    pub(crate) diagnostics_baseline_checked_at: Option<std::time::Instant>,
     pub task_pool: task_pool::Handle<Task>,
     /// Non-Salsa lifecycle for compact call-hierarchy reverse indexes. Snapshots
     /// clone this handle for readers; orchestration remains on GlobalState.
@@ -448,6 +455,7 @@ impl GlobalState {
             loader_receiver,
             vfs_progress_config_version: 0,
             vfs_done: false,
+            diagnostics_baseline_checked_at: None,
             task_pool: task_pool::TaskPool::new_with_handle(),
             call_hierarchy_index: DeferredCallHierarchyIndexState::default(),
             call_hierarchy_index_rebuilds: FxHashSet::default(),

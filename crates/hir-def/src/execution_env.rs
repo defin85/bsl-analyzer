@@ -23,6 +23,7 @@
 use crate::item_tree::{Annotation, AnnotationKind};
 use crate::ModuleMetadata;
 use bsl_metadata::ModuleType;
+use syntax::preproc_symbols::PreprocSymbolId;
 
 /// Bit set of 1C:Enterprise execution environments.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -158,29 +159,41 @@ impl EnvFlags {
 
     /// Parse an environment name from configuration, spelled like the
     /// preprocessor symbols developers already know (`ВебКлиент` /
-    /// `WebClient`), case-insensitively. `None` — unrecognized.
+    /// `WebClient`), case-insensitively. `None` — the spelling names no
+    /// modelled environment.
+    ///
+    /// Spellings and their identity come from the preprocessor symbol
+    /// registry; the mapping onto environments stays here, and it is its own
+    /// table rather than one shared with `preproc_condition`: there the
+    /// question is whether a symbol holds in an environment, here it is which
+    /// environments a configuration name selects.
     pub fn from_config_name(name: &str) -> Option<EnvFlags> {
-        let eq = |ru: &str, en: &str| {
-            stdx::case::eq_ignore_case(name, ru) || stdx::case::eq_ignore_case(name, en)
-        };
-        if eq("ТонкийКлиент", "ThinClient") {
-            Some(Self::THIN_CLIENT)
-        } else if eq("ВебКлиент", "WebClient") {
-            Some(Self::WEB_CLIENT)
-        } else if eq("ТолстыйКлиентУправляемоеПриложение", "ThickClientManagedApplication")
-        {
-            Some(Self::THICK_CLIENT_MANAGED)
-        } else if eq("ТолстыйКлиентОбычноеПриложение", "ThickClientOrdinaryApplication")
-        {
-            Some(Self::THICK_CLIENT_ORDINARY)
-        } else if eq("Сервер", "Server") {
-            Some(Self::SERVER)
-        } else if eq("МобильныйКлиент", "MobileClient") {
-            Some(Self::MOBILE_CLIENT)
-        } else if eq("ВнешнееСоединение", "ExternalConnection") {
-            Some(Self::EXTERNAL_CONNECTION)
-        } else {
-            None
+        let mask = Self::checked_envs_of(syntax::preproc_symbols::lookup(name)?);
+        (!mask.is_empty()).then_some(mask)
+    }
+
+    /// Environments a preprocessor symbol names. An empty mask means the
+    /// symbol names no modelled environment — the mobile application
+    /// runtimes and the standalone mobile server are genuinely different
+    /// runtimes, and `checked_environments` cannot select them.
+    ///
+    /// `Клиент` / `НаКлиенте` yield the managed clients, not every client:
+    /// the legacy thick client (ordinary application) enters the model only
+    /// through its own name, which is the contract
+    /// [`EnvOptions::ordinary_app_support`] states.
+    fn checked_envs_of(id: PreprocSymbolId) -> EnvFlags {
+        match id {
+            PreprocSymbolId::Server | PreprocSymbolId::AtServer => Self::SERVER,
+            PreprocSymbolId::Client | PreprocSymbolId::AtClient => Self::MANAGED_CLIENTS,
+            PreprocSymbolId::ThinClient => Self::THIN_CLIENT,
+            PreprocSymbolId::WebClient => Self::WEB_CLIENT,
+            PreprocSymbolId::MobileClient => Self::MOBILE_CLIENT,
+            PreprocSymbolId::ThickClientManagedApplication => Self::THICK_CLIENT_MANAGED,
+            PreprocSymbolId::ThickClientOrdinaryApplication => Self::THICK_CLIENT_ORDINARY,
+            PreprocSymbolId::ExternalConnection => Self::EXTERNAL_CONNECTION,
+            PreprocSymbolId::MobileAppClient
+            | PreprocSymbolId::MobileAppServer
+            | PreprocSymbolId::MobileStandaloneServer => Self::EMPTY,
         }
     }
 }
@@ -887,6 +900,76 @@ mod tests {
             Some(EnvFlags::THICK_CLIENT_MANAGED)
         );
         assert_eq!(EnvFlags::from_config_name("Линукс"), None);
+    }
+
+    /// Ответ на каждое написание реестра разобран поимённо, в обе стороны:
+    /// и что принимается, и что нет.
+    ///
+    /// Таблица здесь, а не в реестре: реестр знает написания, а какие среды
+    /// они выбирают — решение этого слоя, и его надо предъявить целиком.
+    #[test]
+    fn every_registry_spelling_has_a_decided_config_answer() {
+        use syntax::preproc_symbols::PreprocSymbolId as Id;
+
+        let expected = |id: Id| match id {
+            Id::Server | Id::AtServer => Some(EnvFlags::SERVER),
+            Id::Client | Id::AtClient => Some(EnvFlags::MANAGED_CLIENTS),
+            Id::ThinClient => Some(EnvFlags::THIN_CLIENT),
+            Id::WebClient => Some(EnvFlags::WEB_CLIENT),
+            Id::MobileClient => Some(EnvFlags::MOBILE_CLIENT),
+            Id::ThickClientManagedApplication => Some(EnvFlags::THICK_CLIENT_MANAGED),
+            Id::ThickClientOrdinaryApplication => Some(EnvFlags::THICK_CLIENT_ORDINARY),
+            Id::ExternalConnection => Some(EnvFlags::EXTERNAL_CONNECTION),
+            // Отдельные среды исполнения, моделью не покрытые.
+            Id::MobileAppClient | Id::MobileAppServer | Id::MobileStandaloneServer => None,
+        };
+
+        for &id in Id::ALL {
+            for spelling in id.spellings() {
+                assert_eq!(
+                    EnvFlags::from_config_name(spelling),
+                    expected(id),
+                    "{spelling:?}: ответ конфигурации не тот"
+                );
+                assert_eq!(
+                    EnvFlags::from_config_name(&spelling.to_uppercase()),
+                    expected(id),
+                    "{spelling:?}: регистр изменил ответ"
+                );
+            }
+        }
+    }
+
+    /// `Клиент` не включает устаревший толстый клиент обычного приложения:
+    /// тот входит в модель только собственным именем.
+    #[test]
+    fn client_names_the_managed_clients_only() {
+        let clients = EnvFlags::from_config_name("Клиент").expect("Клиент — имя сред");
+        assert_eq!(clients, EnvFlags::MANAGED_CLIENTS);
+        assert!(!clients.contains(EnvFlags::THICK_CLIENT_ORDINARY));
+        assert_eq!(EnvFlags::from_config_name("НаКлиенте"), Some(EnvFlags::MANAGED_CLIENTS));
+        assert_eq!(EnvFlags::from_config_name("НаСервере"), Some(EnvFlags::SERVER));
+        assert_eq!(
+            EnvFlags::from_config_name("ТолстыйКлиентОбычноеПриложение"),
+            Some(EnvFlags::THICK_CLIENT_ORDINARY)
+        );
+    }
+
+    /// ОС-символы источника не имеют, и конфигурация их не принимает — тот
+    /// же ответ, что у остальных потребителей реестра.
+    #[test]
+    fn os_symbols_are_not_configuration_environments() {
+        for os in ["Linux", "Windows", "MacOS", "linux"] {
+            assert_eq!(EnvFlags::from_config_name(os), None, "{os:?} принят как среда");
+        }
+    }
+
+    /// Написание сравнивается по правилу лексера: `ſ` за `s` проходит.
+    #[test]
+    fn config_names_fold_case_the_way_the_lexer_does() {
+        assert_eq!(EnvFlags::from_config_name("\u{17F}erver"), Some(EnvFlags::SERVER));
+        assert_eq!(EnvFlags::from_config_name("\u{1C83}ервер"), Some(EnvFlags::SERVER));
+        assert_eq!(EnvFlags::from_config_name("Thi\u{131}Client"), None);
     }
 
     #[test]

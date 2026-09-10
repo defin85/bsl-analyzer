@@ -50,6 +50,65 @@ pub fn eq_ignore_case(a: &str, b: &str) -> bool {
     }
 }
 
+/// Simple Unicode case folding — the equivalence the lexer's `(?i)` patterns
+/// use.
+///
+/// This is a different relation from [`eq_ignore_case`], which folds through
+/// `to_lowercase`: `ſ` (U+017F) and `K` (U+212A) lowercase to themselves yet
+/// belong to the fold classes of `s` and `k`, and the historic Cyrillic
+/// letters U+1C80–U+1C86 belong to the classes of `в`, `д`, `о`, `с`, `т`
+/// and `ъ`. Text the lexer has already accepted must be compared with this
+/// relation, or the analysis and the tokenizer disagree about what the same
+/// word is. `eq_ignore_case` stays the identifier comparison: it is the hot
+/// path, and its `to_lowercase` semantics are what persisted keys were built
+/// from.
+#[inline]
+pub fn fold_case(c: char) -> char {
+    match c {
+        'A'..='Z' => (c as u8 | 0x20) as char,
+        c if c.is_ascii() => c,
+        'А'..='Я' => char::from_u32(c as u32 + 0x20).unwrap_or(c),
+        'Ё' => 'ё',
+        'а'..='я' | 'ё' => c,
+        // The Turkic dotless i is a fold class of its own — `(?i)i` does not
+        // match it — although it uppercases to `I`.
+        'ı' => c,
+        _ => fold_case_slow(c),
+    }
+}
+
+/// The fold representative outside the fast alphabet: uppercase, then
+/// lowercase. `ſ` reaches `s` only this way. A mapping that expands to
+/// several chars has no simple fold, and the char stands alone (`ß`, `İ`).
+#[cold]
+fn fold_case_slow(c: char) -> char {
+    let mut upper = c.to_uppercase();
+    let upper = match (upper.next(), upper.next()) {
+        (Some(single), None) => single,
+        _ => c,
+    };
+    let mut lower = upper.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(single), None) => single,
+        _ => upper,
+    }
+}
+
+/// Case-insensitive comparison under [`fold_case`]: allocation-free, exiting
+/// on the first mismatch. Simple folding is one char to one char, so the two
+/// walks never desynchronise.
+pub fn eq_case_folded(a: &str, b: &str) -> bool {
+    let mut a = a.chars();
+    let mut b = b.chars();
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if fold_case(x) == fold_case(y) => {}
+            _ => return false,
+        }
+    }
+}
+
 /// Drop-in replacement for `str::to_lowercase`.
 ///
 /// Output is byte-identical to `str::to_lowercase` for every input: strings
@@ -237,6 +296,55 @@ mod tests {
         assert!(eq_ignore_case("", ""));
         assert!(!eq_ignore_case("", "a"));
         assert!(!eq_ignore_case("а", ""));
+    }
+
+    #[test]
+    fn fold_case_puts_the_lexers_extra_letters_in_the_right_class() {
+        // Пары, которые лексер принимает по `(?i)`, а `eq_ignore_case`
+        // отвергает: ради них эта связь и заведена. Без них проверка зелена
+        // и у реализации, которая ничего, кроме `to_lowercase`, не делает.
+        for (a, b) in [
+            ("\u{17F}erver", "Server"),
+            ("El\u{17F}if", "ElsIf"),
+            ("\u{1C83}ервер", "Сервер"),
+            ("\u{1C80}еб", "Веб"),
+        ] {
+            assert!(eq_case_folded(a, b), "{a:?} и {b:?} обязаны сложиться в один класс");
+            assert!(
+                !eq_ignore_case(a, b),
+                "{a:?} и {b:?}: проверка зелена и без сложения регистра"
+            );
+        }
+        // Знак Кельвина `to_lowercase` покрывает сам, поэтому здесь он
+        // проверяет только то, что новая связь его не потеряла.
+        assert!(eq_case_folded("brea\u{212A}", "Break"));
+    }
+
+    #[test]
+    fn fold_case_keeps_apart_what_the_lexer_keeps_apart() {
+        // The Turkic pair and `ß` have no simple fold onto ASCII; the lexer
+        // rejects them, and so must this.
+        assert!(!eq_case_folded("\u{131}f", "If"));
+        assert!(!eq_case_folded("\u{130}f", "If"));
+        assert!(!eq_case_folded("ß", "ss"));
+        assert!(!eq_case_folded("Сервер", "Сервера"));
+        assert!(!eq_case_folded("Ёлка", "Елка"));
+    }
+
+    #[test]
+    fn fold_case_agrees_with_eq_ignore_case_on_the_bsl_alphabet() {
+        // The registry alphabet must not shift under the new relation: for
+        // ASCII and the Russian block the two comparisons are the same one.
+        for (a, b) in [
+            ("Сервер", "СЕРВЕР"),
+            ("ВебКлиент", "вебклиент"),
+            ("MobileStandaloneServer", "MOBILESTANDALONESERVER"),
+            ("ThinClient", "thinclient"),
+            ("Сервер", "Server"),
+            ("", ""),
+        ] {
+            assert_eq!(eq_case_folded(a, b), eq_ignore_case(a, b), "разошлись на {a:?}/{b:?}");
+        }
     }
 
     #[test]

@@ -1,7 +1,19 @@
 use std::env;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
-pub(crate) static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Take the process-wide serialization lock used by tests that toggle a global — an
+/// environment variable, a forced-failure seam.
+///
+/// The lock guards nothing but the right to run alone: there is no state under it for a
+/// panic to leave half-written, so the poison flag carries no information. Honouring it
+/// would only make ONE failing test re-report itself as a failure in every test that later
+/// takes the lock, burying the one panic that actually happened under a pile of
+/// `PoisonError`s naming innocent tests.
+pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
+    ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 pub(crate) struct EnvVarGuard {
     key: &'static str,

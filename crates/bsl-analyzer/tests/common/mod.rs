@@ -34,6 +34,32 @@ pub fn project() -> tempfile::TempDir {
     dir
 }
 
+/// An action repeated until the server reacts to it.
+///
+/// The server's file watcher is armed asynchronously and nothing announces when; a change
+/// written before that raises no event at all, so a single act and a long wait would wait
+/// out a notification that is never coming. Bounded, so a server that reacts to nothing
+/// fails the test with a message rather than spinning.
+pub struct Provocation<F> {
+    act: F,
+    deadline: std::time::Instant,
+}
+
+impl<F: Fn()> Provocation<F> {
+    pub fn start(act: F) -> Self {
+        act();
+        Self { act, deadline: std::time::Instant::now() + Duration::from_secs(60) }
+    }
+
+    pub fn again(&self) {
+        assert!(
+            std::time::Instant::now() < self.deadline,
+            "the server never reacted to the provocation",
+        );
+        (self.act)();
+    }
+}
+
 pub struct Lsp {
     pub child: Child,
     pub stdin: ChildStdin,
@@ -98,13 +124,60 @@ impl Lsp {
         self.stdin.flush().unwrap();
     }
 
+    /// Wait for a message, allowing the server sixty seconds to produce EACH one.
+    ///
+    /// Per message, not per wait: a server that is working says so — progress, logs —
+    /// and a stand behind a cold build on a loaded machine can spend longer than a
+    /// minute reaching what it is waiting for without ever having gone quiet.
     pub fn wait_for(&self, predicate: impl Fn(&Value) -> bool) -> Value {
         loop {
-            let message = self.messages.recv_timeout(Duration::from_secs(60)).unwrap();
+            let message = self
+                .wait_for_within(Duration::from_secs(60), |_| true)
+                .expect("the server answered nothing for a minute");
             if predicate(&message) {
                 return message;
             }
         }
+    }
+
+    /// Wait for a message, reporting silence instead of failing the test.
+    ///
+    /// For a wait whose subject arrives only once the server's file watcher is live:
+    /// the watcher is armed asynchronously, after the loader has already announced the
+    /// load finished, and nothing tells a client when. A change written into that window
+    /// raises no event at all, so a caller that provokes one has to be able to provoke it
+    /// again rather than wait out a notification that will never come.
+    ///
+    /// `None` means silence and nothing else. A server that has exited is not silence —
+    /// it is the answer — so it fails here rather than leaving the caller to provoke a
+    /// process that is gone, as fast as the loop can go round.
+    pub fn wait_for_within(
+        &self,
+        timeout: Duration,
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Option<Value> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+            match self.messages.recv_timeout(remaining) {
+                Ok(message) if predicate(&message) => return Some(message),
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => return None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("the server exited instead of answering")
+                }
+            }
+        }
+    }
+
+    /// A notification the server has no work for, sent only to reach its main loop.
+    ///
+    /// What an editor produces constantly and what a stand needs when its subject is
+    /// something the server must notice on its own rather than be told about.
+    pub fn poke(&mut self) {
+        self.send(json!({
+            "jsonrpc": "2.0", "method": "$/setTrace", "params": {"value": "off"}
+        }));
     }
 
     pub fn open(&mut self, path: &Path, text: &str) -> Value {

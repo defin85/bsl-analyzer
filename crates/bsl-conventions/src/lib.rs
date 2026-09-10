@@ -230,7 +230,7 @@ mod tests {
 /// How one path component of a CONSTRUCTED candidate matches a real component.
 /// The caller decides per position — deriving the mode from the spelling would
 /// swallow an object legally named `Ext`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SegmentMatch {
     /// An object/form/command NAME: its case is significant.
     Exact,

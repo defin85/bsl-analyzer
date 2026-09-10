@@ -89,18 +89,32 @@ pub(crate) enum DegradeReason {
     /// separate reason from [`DegradeReason::Overflow`], and why it is carried by the one
     /// cursor rather than by the shared reconcile window.
     CursorLagged,
-    /// The watched root set was re-pointed (an extension topology reload). State a
-    /// consumer derived under the old set predates the new roots' coverage, so
-    /// each must rescan once before trusting the stream again.
+    /// The watch was re-pointed: a new declared root set (an extension topology reload),
+    /// or a stream restarted to reach a subtree an event revealed. Either way state a
+    /// consumer derived beforehand predates the new coverage — and on a backend that
+    /// rebuilds its stream from "now", the swap itself dropped whatever happened during
+    /// it — so each must rescan once before trusting the stream again.
     Rearmed,
 }
 
 /// Run on the hub thread immediately before the watch is armed. `None` in production.
 type BeforeArm = Arc<dyn Fn() + Send + Sync>;
 
-/// Consulted before every watch: paths it answers `true` for refuse to arm. `None` in
-/// production, where only the backend refuses.
-type WatchRefusal = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+/// The seams a test puts between the hub and its backend. `None` in production, where only
+/// the backend decides and nothing needs the record.
+///
+/// Both ends of a watch in one object, because a test that sees only the arms cannot tell a
+/// registration that was dropped from one that was never placed — and `notify` reports
+/// neither.
+struct WatchSeams {
+    /// Consulted before every arm: a path it answers `true` for refuses to arm.
+    refuses: Box<dyn Fn(&Path) -> bool + Send + Sync>,
+    /// Told about every unwatch, and never consulted — a refusal makes a watch fail, and
+    /// there is no such thing as a registration that refuses to go.
+    disarmed: Box<dyn Fn(&Path) + Send + Sync>,
+}
+
+type WatchRefusal = Arc<WatchSeams>;
 
 /// Holds a hub's thread short of arming until released.
 #[cfg(test)]
@@ -141,22 +155,34 @@ impl HubHold {
 /// each: [`Self::arm`].
 struct Watch {
     backend: RecommendedWatcher,
-    refuses: Option<WatchRefusal>,
+    seams: Option<WatchRefusal>,
 }
 
 impl Watch {
     fn arm(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
-        if self.refuses.as_ref().is_some_and(|refuses| refuses(path)) {
+        if self.seams.as_ref().is_some_and(|seams| (seams.refuses)(path)) {
             return Err(notify::Error::generic("the watch of this path is refused"));
         }
         self.backend.watch(path, mode)
     }
 
-    /// Drop a registration. Not gated: a refusal makes a watch fail, and un-watching what
-    /// was never armed is the backend's own no-op to report.
+    /// Drop a registration. Announced to the seam but never gated by it: a refusal makes a
+    /// watch fail, and un-watching what was never armed is the backend's own no-op to
+    /// report.
     fn disarm(&mut self, path: &Path) -> notify::Result<()> {
+        if let Some(seams) = self.seams.as_ref() {
+            (seams.disarmed)(path);
+        }
         self.backend.unwatch(path)
     }
+}
+
+/// One end of a watch the hub asked for.
+#[cfg(all(test, unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatchCallKind {
+    Arm,
+    Disarm,
 }
 
 /// The paths a test has declared unwatchable, and the switch that clears them.
@@ -169,19 +195,34 @@ impl Watch {
 #[derive(Default)]
 pub(crate) struct RefusedWatches {
     paths: Mutex<Vec<PathBuf>>,
+    /// Everything the hub told the watcher to do, in order — both ends of every watch.
+    /// This is the only handle a test has on that, since `notify` reports no such thing,
+    /// and the ORDER is part of it: a re-arm that unwatches after it has re-armed what it
+    /// keeps strips on inotify exactly what it had just restored.
+    asked: Mutex<Vec<(WatchCallKind, PathBuf)>>,
 }
 
 #[cfg(all(test, unix))]
 impl RefusedWatches {
     /// Declared before the hub starts, for a root that must never arm in the first place.
     pub(crate) fn refusing(paths: Vec<PathBuf>) -> Arc<Self> {
-        Arc::new(Self { paths: Mutex::new(paths.iter().map(|p| Self::key(p)).collect()) })
+        Arc::new(Self {
+            paths: Mutex::new(paths.iter().map(|p| Self::key(p)).collect()),
+            asked: Mutex::default(),
+        })
     }
 
     pub(crate) fn none() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
+    /// Refusing a path AFTER the hub is running is only observable where something arms a
+    /// path it is already holding, and on FSEvents nothing does — the defensive pass is
+    /// not run there (see [`a_kept_target_must_be_re_armed`]), and every test that flips a
+    /// refusal mid-flight is gated off that platform for the same reason. The seam itself
+    /// stays whole on every platform: half a seam is how a test ends up green over the
+    /// behaviour it meant to pin.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn refuse(&self, path: &Path) {
         let key = Self::key(path);
         let mut paths = self.paths.lock().unwrap_or_else(PoisonError::into_inner);
@@ -195,9 +236,39 @@ impl RefusedWatches {
         self.paths.lock().unwrap_or_else(PoisonError::into_inner).retain(|p| *p != key);
     }
 
-    fn refuses(&self, path: &Path) -> bool {
+    /// Record one end of a watch, and give back the key it was recorded under.
+    fn note(&self, kind: WatchCallKind, path: &Path) -> PathBuf {
         let key = Self::key(path);
-        self.paths.lock().unwrap_or_else(PoisonError::into_inner).contains(&key)
+        self.asked.lock().unwrap_or_else(PoisonError::into_inner).push((kind, key.clone()));
+        key
+    }
+
+    /// How many times the hub has asked to arm `path` since the last [`Self::forget_asks`].
+    ///
+    /// Two kinds of stand ask it. On FSEvents an arm COSTS something — it rebuilds the
+    /// whole stream — so the count itself is the measurement, and those stands are gated to
+    /// that platform. Everywhere else it is a barrier: "has the hub asked yet" is the only
+    /// signal a test has that an event has been carried all the way to the watcher.
+    pub(crate) fn arms_of(&self, path: &Path) -> usize {
+        let key = Self::key(path);
+        self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(kind, p)| *kind == WatchCallKind::Arm && *p == key)
+            .count()
+    }
+
+    /// Draw a line under everything asked so far, so a stand can measure one step.
+    pub(crate) fn forget_asks(&self) {
+        self.asked.lock().unwrap_or_else(PoisonError::into_inner).clear();
+    }
+
+    /// Everything the watcher was told, in the order it was told. Unlike the counters this
+    /// is asked on every platform: the ordering it exposes is the one an inotify unwatch
+    /// makes load-bearing.
+    pub(crate) fn calls(&self) -> Vec<(WatchCallKind, PathBuf)> {
+        self.asked.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     /// Canonical where the path can be resolved, raw where it cannot — a refused root may
@@ -210,8 +281,17 @@ impl RefusedWatches {
     /// The form the hub thread consults. Holds a clone, so a test can flip a refusal after
     /// the hub is running and the next arming pass sees it.
     fn as_refusal(self: &Arc<Self>) -> WatchRefusal {
-        let refusals = Arc::clone(self);
-        Arc::new(move |path: &Path| refusals.refuses(path))
+        let refuses = Arc::clone(self);
+        let disarmed = Arc::clone(self);
+        Arc::new(WatchSeams {
+            refuses: Box::new(move |path: &Path| {
+                let key = refuses.note(WatchCallKind::Arm, path);
+                refuses.paths.lock().unwrap_or_else(PoisonError::into_inner).contains(&key)
+            }),
+            disarmed: Box::new(move |path: &Path| {
+                disarmed.note(WatchCallKind::Disarm, path);
+            }),
+        })
     }
 }
 
@@ -436,7 +516,17 @@ impl Accumulator {
         // not a loss of the stream: nothing was dropped before this cursor existed that
         // anyone else still holds, so charging it a full reconcile would be charging it
         // for somebody else's silence.
-        let pending = force.or_else(|| self.degrade_reason.clone());
+        //
+        // And only while somebody is still INSIDE it. A window raised over an empty cursor
+        // set belongs to nobody: there was no consumer to lose anything, and nobody who
+        // could acknowledge it away, so handing it to whoever arrives next would charge a
+        // full reconcile for a window that ended before they existed. The reason itself
+        // stands — `health` reports the hub's condition to a status caller whether or not
+        // anyone is there to be owed.
+        let owed = self.cursors.values().any(|cursor| {
+            matches!(&cursor.pending, Some(reason) if *reason != DegradeReason::CursorLagged)
+        });
+        let pending = force.or_else(|| owed.then(|| self.degrade_reason.clone()).flatten());
         self.cursors.insert(id, CursorState { pos: self.max_seq(), pending });
         id
     }
@@ -504,22 +594,66 @@ impl Accumulator {
         }
     }
 
-    /// Enter a reconcile window: optionally clear the (now-untrusted) entries, flag
-    /// every live cursor to reconcile once, and record the reason. Idempotent while
-    /// a window is already open — repeated overflow events neither re-log nor
-    /// re-wake sinks, so a storm does not thrash.
+    /// Enter a reconcile only if somebody is there to owe it to, deciding and acting under
+    /// ONE hold of this lock. Says whether the window was opened.
+    ///
+    /// The two cannot be separate: the last cursor unsubscribing between them closes every
+    /// window that existed and then a debt is written over an empty set — one nobody can
+    /// acknowledge, which leaves the hub calling itself degraded and hands the next
+    /// subscriber a reconcile for a window it was never inside.
+    /// Hand ONE cursor a reconcile, without opening a shared window.
+    ///
+    /// For the cursor that arrived while blindness was being published: the two states live
+    /// under two locks, in that order to keep either path from holding one while asking for
+    /// the other, so a subscription can land in the gap between them. Nothing is owed to
+    /// anybody else — the window, if there is one, has already flagged whoever was there.
+    fn force_rescan(&mut self, id: u64, reason: DegradeReason) {
+        if let Some(cursor) = self.cursors.get_mut(&id) {
+            if cursor.pending.is_none() {
+                cursor.pending = Some(reason);
+                self.generation += 1;
+            }
+        }
+    }
+
+    fn enter_rescan_for_listeners(&mut self, reason: DegradeReason) -> bool {
+        if self.cursors.is_empty() {
+            // Nothing is opened and nothing is ERASED. That nobody is here to be owed a new
+            // window says nothing about a reason recorded earlier, which `health` still
+            // reports to a status caller; what closes such a reason is the obstacle ending,
+            // and that is answered where the obstacle is read.
+            return false;
+        }
+        self.enter_rescan(false, reason);
+        true
+    }
+
+    /// Enter a reconcile window: optionally clear the (now-untrusted) entries, flag every
+    /// live cursor to reconcile once, and record the reason.
+    ///
+    /// Idempotent in what it SAYS, not in what it owes: a repeated report of an open window
+    /// re-logs nothing, so a storm does not fill the log — but every raise is a distinct
+    /// loss, moves the generation, and cannot be acknowledged away by a batch taken before
+    /// it.
     fn enter_rescan(&mut self, clear_entries: bool, reason: DegradeReason) {
         self.rescans_requested += 1;
         let newly = self.degrade_reason.is_none();
         if clear_entries {
             self.entries.clear();
         }
-        let mut changed = newly;
         for cursor in self.cursors.values_mut() {
             // Overwritten, unlike a lag debt: this is the newest thing that went wrong,
             // and it is what a consumer asking why it must reconcile should be told.
-            changed |= cursor.pending.replace(reason.clone()).is_none();
+            cursor.pending.replace(reason.clone());
         }
+        // Moved for every raise while anyone is listening, not only for the first. Two
+        // windows in a row carry the same reason and would otherwise be one: a batch taken
+        // against the first would still look current, so acknowledging it would clear a
+        // debt the consumer's scan ended before — and a sink already waiting on the
+        // generation would sleep out its whole timeout over a loss just handed to it.
+        // Idempotence stays where it belongs, in the LOGGING below: a storm re-reports
+        // nothing.
+        let changed = newly || !self.cursors.is_empty();
         self.degrade_reason = Some(reason.clone());
         if changed {
             self.generation += 1;
@@ -865,12 +999,20 @@ struct HubInner {
 }
 
 impl HubInner {
-    /// Publish the armed targets' `(canonical-at-arm, recursive)` pairs for cheap
+    /// Publish the armed targets' `(resolved-at-arm, recursive)` pairs for cheap
     /// comparisons by [`WorkspaceChangeHub::ensure_roots`]. Targets whose
     /// `watch()` failed are not included, so a retry re-arms them.
-    fn publish_watched_roots(&self, armed: &[(WatchTarget, PathBuf)]) {
-        let pairs: Vec<(PathBuf, bool)> =
-            armed.iter().map(|(t, canonical)| (canonical.clone(), t.recursive)).collect();
+    ///
+    /// DECLARED targets only. `ensure_roots` compares this list against the set it is
+    /// about to declare, and a watch the declaration does not name — a door an event
+    /// revealed — would read as a permanent difference: a re-arm, and the rescan it costs
+    /// every consumer, on every call for as long as the door stands.
+    fn publish_watched_roots(&self, armed: &[ArmedTarget]) {
+        let pairs: Vec<(PathBuf, bool)> = armed
+            .iter()
+            .filter(|entry| entry.is_declared())
+            .map(|entry| (entry.resolved().to_path_buf(), entry.target().recursive))
+            .collect();
         *self.watched_roots.lock().unwrap_or_else(PoisonError::into_inner) = pairs;
     }
 
@@ -1058,6 +1200,31 @@ impl HubInner {
         self.notify();
     }
 
+    /// The watch was extended over a directory an event revealed, and the backend charged
+    /// the stream that was already running for it: everything that happened anywhere in the
+    /// watched tree between that stream's stop and the new one's start was dropped and will
+    /// never be delivered.
+    ///
+    /// A successful arm, and still a loss — which is why no other reporter here covers it.
+    /// The blind set answers the OPPOSITE case, a target that failed to arm, and it reports
+    /// only the transition into blindness; a re-arm pays its own debt at the end of
+    /// `apply_rearm`; and the arm itself, being a success, tells nobody anything.
+    /// Owed to whoever was listening ACROSS the window: a cursor taken afterwards begins
+    /// where the window ended, and a hub nobody has subscribed to has lost nothing for
+    /// anyone. Asked and answered under one hold of the accumulator, so the last cursor
+    /// cannot leave between the question and the debt.
+    fn note_arming_window(&self, dir: &Path) {
+        if !self.lock_acc().enter_rescan_for_listeners(DegradeReason::Rearmed) {
+            return;
+        }
+        tracing::debug!(
+            ?dir,
+            "change hub restarted the watch stream to reach a new subtree; \
+             consumers reconcile the window that cost"
+        );
+        self.notify();
+    }
+
     /// A target that could not be placed leaves a subtree unwatched under a path
     /// nobody downstream can even name, unlike a root that merely failed to arm —
     /// there the path is known and a later re-arm retries it.
@@ -1093,24 +1260,6 @@ impl HubInner {
     }
 }
 
-/// The canonical key for a path known to be *missing* (a removal): its own
-/// `canonicalize` fails, so canonicalize the parent (usually still present) and
-/// re-join the file name. This lets a create (keyed by the file's own
-/// canonicalization) and its later remove coalesce onto the same key even under a
-/// symlinked root. Falls back to the raw path when the parent is unavailable.
-fn canonical_for_missing(path: &Path) -> PathBuf {
-    // Edge case: if the parent was ALSO removed in the same burst its canonicalize
-    // fails too, so we fall back to the raw path and a create/remove pair may land
-    // on different keys. That is not a leak — the stray entry is released by cursor
-    // reclamation once every cursor advances past it.
-    match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) => {
-            parent.canonicalize().map(|p| p.join(name)).unwrap_or_else(|_| path.to_path_buf())
-        }
-        _ => path.to_path_buf(),
-    }
-}
-
 // Thread-local on purpose: tests run in parallel and a process-global counter
 // would let one case observe another's walks.
 #[cfg(test)]
@@ -1118,22 +1267,49 @@ thread_local! {
     static SUBTREE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Walk a freshly-created directory and record every file already inside it,
-/// canonicalizing the directory once and joining each file's relative path rather
-/// than canonicalizing per file.
+/// Walk a freshly-created directory and record every file already inside it, resolving
+/// once per containing directory rather than once per file.
+///
+/// The key is the CONTAINING directory resolved, plus the file's own name — and a file
+/// that is ITSELF a link is resolved in full, because only then does its directory's
+/// prefix stop being the whole answer. That is `project_model::workspace_walk`'s rule, and
+/// it has to be the same one: the scan keys its universe that way, and a key the scan
+/// never produces reads to a consumer as drift the hub failed to deliver. Resolving only
+/// the walked ROOT and joining the tail is not the same rule — a linked SUBdirectory
+/// inside it leaves the tail unresolved — which is exactly the shape a door has.
+///
+/// The cache is keyed by the WALKED directory, not the resolved one, for the same reason
+/// it is there: two links to one tree are two ways to reach the same files, and each file
+/// keeps the spelling the walk actually used to get to it.
 fn collect_subtree(dir: &Path, records: &mut Vec<(PathBuf, PathBuf, ChangeKind)>) {
     #[cfg(test)]
     SUBTREE_WALKS.with(|walks| walks.set(walks.get() + 1));
-    let base_canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let mut resolved_dirs: HashMap<PathBuf, PathBuf> = HashMap::new();
     for entry in WalkDir::new(dir).follow_links(true) {
         let Ok(entry) = entry else { continue };
         if !entry.file_type().is_file() {
             continue;
         }
         let file = entry.path();
-        let canonical = match file.strip_prefix(dir) {
-            Ok(rel) => base_canonical.join(rel),
-            Err(_) => file.canonicalize().unwrap_or_else(|_| file.to_path_buf()),
+        let canonical = if entry.path_is_symlink() {
+            let resolved = resolve_as_far_as_it_goes(file);
+            // The role has to hold for BOTH spellings — the second half of the walk's rule,
+            // and inseparable from the first. A link named `Alias.txt` onto a `Target.bsl`
+            // resolves to a key the walk of the TARGET's root does list, but this walk was
+            // never entitled to reach it, and handing it over would register a file from
+            // outside the workspace as drift inside it.
+            if project_model::file_role(&resolved) != project_model::file_role(file) {
+                continue;
+            }
+            resolved
+        } else {
+            match (file.parent(), file.file_name()) {
+                (Some(parent), Some(name)) => resolved_dirs
+                    .entry(parent.to_path_buf())
+                    .or_insert_with(|| resolve_as_far_as_it_goes(parent))
+                    .join(name),
+                _ => resolve_as_far_as_it_goes(file),
+            }
         };
         records.push((canonical, file.to_path_buf(), ChangeKind::MaybeChanged));
     }
@@ -1147,14 +1323,30 @@ fn classify_path(path: &Path) -> Option<(PathBuf, ChangeKind)> {
     match std::fs::metadata(path) {
         Ok(meta) if meta.is_dir() => None,
         Ok(meta) if meta.is_file() => {
-            let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            Some((canonical, ChangeKind::MaybeChanged))
+            let resolved = resolve_as_far_as_it_goes(path);
+            // The role has to hold for BOTH spellings, exactly as the walk requires and as
+            // the subtree walk here already does. A link named `Alias.txt` onto a
+            // `Target.bsl` resolves to a key the scan of the TARGET's root does list, but
+            // no walk of THIS root ever produces it — so handing it over would report a
+            // file from outside the workspace as drift inside it, and the point stream and
+            // the walk would describe two different file universes.
+            if project_model::file_role(&resolved) != project_model::file_role(path) {
+                return None;
+            }
+            Some((resolved, ChangeKind::MaybeChanged))
         }
         Ok(_) => None,
         // Only an actual absence is a removal. Any other stat error (permissions,
         // interruption, a momentary race) must not tombstone a live file.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let canonical = canonical_for_missing(path);
+            // A path that is gone cannot canonicalize, so it is keyed by the same rule
+            // every other placement here uses: the longest ancestor that still resolves,
+            // plus the rest as spelled. This is what lets a create — keyed by the file's
+            // own resolution — coalesce with its later removal under a symlinked root, and
+            // it keeps answering when the PARENT went in the same burst, where a rule that
+            // resolved only the parent would fall back to the raw spelling and leave the
+            // hub naming a removal in a language the scan does not read.
+            let canonical = resolve_as_far_as_it_goes(path);
             // A project input is known to be a file whatever its name looks like:
             // `.env` carries no extension, and the extension-less heuristic below
             // would read its removal as a vanished directory and force a full
@@ -1585,7 +1777,17 @@ impl WorkspaceChangeHub {
         // Read before taking the accumulator, so no path holds one of the two locks
         // while asking for the other.
         let blind = self.inner.is_partially_blind().then_some(DegradeReason::RewatchFailed);
-        SinkCursor { id: self.inner.lock_acc().subscribe(blind) }
+        let id = self.inner.lock_acc().subscribe(blind.clone());
+        // And read AGAIN, because those two lines are not one moment. A blind set published
+        // between them belongs to a hub thread that flagged every cursor it could see — and
+        // this one was not there yet — so without the second read a consumer walks away
+        // clean over a declared root nothing is watching. Published before the flag, so the
+        // orders that matter are covered both ways: either the flag found this cursor, or
+        // this finds the publication.
+        if blind.is_none() && self.inner.is_partially_blind() {
+            self.inner.lock_acc().force_rescan(id, DegradeReason::RewatchFailed);
+        }
+        SinkCursor { id }
     }
 
     /// Replace one consumer's cursor, carrying whatever it still owes onto the new one.
@@ -1602,7 +1804,14 @@ impl WorkspaceChangeHub {
         let mut acc = self.inner.lock_acc();
         let carried = acc.pending_of(cursor.id);
         acc.unsubscribe(cursor.id);
-        SinkCursor { id: acc.subscribe(carried.or(blind)) }
+        let id = acc.subscribe(carried.or(blind.clone()));
+        drop(acc);
+        // The same second read as in [`Self::subscribe`], for the same gap between the two
+        // locks.
+        if blind.is_none() && self.inner.is_partially_blind() {
+            self.inner.lock_acc().force_rescan(id, DegradeReason::RewatchFailed);
+        }
+        SinkCursor { id }
     }
 
     /// Drop a cursor and reclaim any entries it was the last to hold back. For a consumer
@@ -1767,6 +1976,24 @@ impl WorkspaceChangeHub {
         let _rewatch = self.inner.ingest_event(res);
     }
 
+    /// Report `path` as gone, exactly as the backend would, and classify it the way a real
+    /// event is classified — the kind is re-derived from the disk, not asserted here.
+    ///
+    /// For a stand that needs ONE named path in the drain and is not itself about whether
+    /// the platform reports it. A real removal is reported at the platform's discretion:
+    /// under load FSEvents has been measured naming a directory's descendants while never
+    /// naming the directory above them, so a stand that removes a tree and waits for the
+    /// entry it wants ends up measuring which events the day's scheduling produced. What
+    /// the backend does report is pinned where it belongs, by this module's own tests.
+    #[cfg(test)]
+    pub(crate) fn deliver_vanished_for_test(&self, path: &Path) {
+        self.ingest_for_test(Ok(Event {
+            kind: EventKind::Remove(notify::event::RemoveKind::Folder),
+            paths: vec![path.to_path_buf()],
+            attrs: Default::default(),
+        }));
+    }
+
     /// Number of registered cursors. Used by tests to wait deterministically for a
     /// sink to subscribe instead of sleeping a guessed interval.
     #[cfg(test)]
@@ -1847,6 +2074,145 @@ impl WatchTarget {
         }
     }
 }
+
+/// Why a watch is in place, and therefore what may take it away.
+///
+/// The declared set is not everything the backend ends up holding. A directory an event
+/// reveals can be a door out of every declared tree — a symlink, a mount point — and the
+/// arm that follows it registers a subtree the declaration does not name. Recording both
+/// kinds without telling them apart produces one of two opposite defects: a re-arm that
+/// disarms what nothing will ever arm again, or coverage that outlives the topology which
+/// justified it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArmOrigin {
+    /// The declared set asks for this target. It is what a declaration is compared
+    /// against, what is published as a watched root, and what a re-arm may disarm.
+    Declared,
+    /// An event revealed the directory while no armed recursive watch reached it. The
+    /// declaration never names it, so a re-arm cannot arm it back and must not take it
+    /// away with the declared targets; it lives exactly as long as the scope still walks
+    /// the path it was armed on.
+    Incidental,
+}
+
+/// One watch the backend is actually holding.
+///
+/// In its own module so the resolved spelling cannot be written from outside, for the same
+/// reason [`ResolvedTargets`] hides its fields: three separate comparisons read that
+/// spelling, the rule for it was once applied in two different ways, and the two agree on
+/// every path whose leaf resolves — so a producer that reverts to the other rule breaks
+/// nothing a test can see. The constructor is the guarantee; a convention is not.
+mod arming {
+    use std::path::{Path, PathBuf};
+
+    use super::{resolve_as_far_as_it_goes, ArmOrigin, WatchTarget};
+
+    fn birth_of(path: &Path) -> Option<std::time::SystemTime> {
+        std::fs::metadata(path).ok().and_then(|meta| meta.created().ok())
+    }
+
+    #[derive(Debug, Clone)]
+    pub(super) struct ArmedTarget {
+        target: WatchTarget,
+        resolved: PathBuf,
+        /// When the thing at `resolved` came into being, as far as the file system will
+        /// say. Best-effort by nature — a file system without a birth time reports none for
+        /// every target, and there this simply never disagrees — which is the same bargain
+        /// [`Fingerprint`] makes for a declared root.
+        born: Option<std::time::SystemTime>,
+        origin: ArmOrigin,
+    }
+
+    impl ArmedTarget {
+        /// The ONE place an armed target's resolved spelling is decided, and it is decided
+        /// by [`resolve_as_far_as_it_goes`]: a whole-path `canonicalize` with a fallback to
+        /// the raw spelling answers differently for exactly the path whose leaf cannot be
+        /// resolved, and under a symlinked ancestor the raw spelling and the resolved one
+        /// are two different paths that no comparison will ever bring together.
+        ///
+        /// Read BEFORE the backend is asked to take the watch, never after. A link
+        /// retargeted in that instant is a race either way — the backend does its own
+        /// resolution inside `watch` — but the two readings fail differently. Recorded
+        /// beforehand, the record disagrees with the snapshot taken later, the coverage
+        /// check calls that movement, and the race costs one extra re-arm. Recorded
+        /// afterwards, the record and the snapshot agree on the NEW target while the
+        /// backend is still watching the old one, so nothing ever contradicts anything and
+        /// the watch stays where nobody is looking. The snapshot is taken before arming for
+        /// exactly this reason; this is the same trade on the same race.
+        pub(super) fn arming(target: WatchTarget, origin: ArmOrigin) -> Self {
+            let resolved = resolve_as_far_as_it_goes(&target.path);
+            let born = birth_of(&resolved);
+            Self { target, resolved, born, origin }
+        }
+
+        pub(super) fn target(&self) -> &WatchTarget {
+            &self.target
+        }
+
+        pub(super) fn resolved(&self) -> &Path {
+            &self.resolved
+        }
+
+        /// Whether the declaration owns this watch. The declared entries are the whole of
+        /// what a declaration is compared against; the rest is coverage nobody asked for
+        /// by name.
+        pub(super) fn is_declared(&self) -> bool {
+            matches!(self.origin, ArmOrigin::Declared)
+        }
+
+        /// The same watch, named by the spelling the declaration now uses.
+        ///
+        /// A re-arm keeps a target the backend is already holding, and the new declaration
+        /// may name it by a DIFFERENT spelling of the same directory — two links to one
+        /// tree, a link declared beside its target. The registration has not moved, so the
+        /// resolution is carried as it stands and no rule is applied here; the spelling
+        /// must follow the declaration, because that is the one the scope now accepts and
+        /// the one the backend reports under once the defensive pass re-arms it. A set left
+        /// on the dropped spelling describes a root the scope has stopped taking events
+        /// for, and reads as different from the declaration for ever after — a full re-arm,
+        /// and the reconcile it costs everyone, on every declaration of the same set.
+        pub(super) fn under(&self, target: WatchTarget) -> Self {
+            Self { target, resolved: self.resolved.clone(), born: self.born, origin: self.origin }
+        }
+
+        /// Whether two records name the SAME watch: the same mode, the same place, and the
+        /// same object at that place.
+        ///
+        /// The object is the half a path comparison cannot see. A directory removed and
+        /// recreated under one name resolves identically, so a re-arm matching on the path
+        /// alone would carry the old record forward and leave the backend watching what is
+        /// gone — the very case the periodic check has just detected, since the snapshot
+        /// fingerprints birth time for exactly this reason.
+        pub(super) fn names_the_same_watch_as(&self, other: &ArmedTarget) -> bool {
+            self.target.recursive == other.target.recursive
+                && self.resolved == other.resolved
+                && self.born == other.born
+        }
+
+        /// Whether the spelling still leads where this record says the registration went.
+        ///
+        /// Asked to decide whether a registration must be RE-POINTED, never to claim one. A
+        /// record that answers `true` is not evidence that the backend still delivers from
+        /// there: nothing re-arms a door between events, and a stale record allowed to claim
+        /// coverage would suppress exactly the arm that would have made it true again.
+        ///
+        /// And a `false` is not grounds to FORGET the record either. A door whose target has
+        /// stepped aside for a moment — a rebuild renaming a directory and putting it back —
+        /// answers `false` while the link itself never changed and will never fire another
+        /// event, so the record is the only thing left that can re-point it.
+        pub(super) fn still_leads_where_recorded(&self) -> bool {
+            // The same PLACE and the same THING. A directory removed and recreated under
+            // one name keeps the spelling while the registration stays on the object that
+            // is gone, so comparing where the path leads would call a dead registration
+            // live — and nothing else in the module would ever notice, because the link
+            // itself never changed and fires no event.
+            resolve_as_far_as_it_goes(&self.target.path) == self.resolved
+                && birth_of(&self.resolved) == self.born
+        }
+    }
+}
+
+use arming::ArmedTarget;
 
 /// The full watch-target set for a workspace: the drift-scan roots (recursive)
 /// plus the workspace root itself, non-recursively, so config-file
@@ -1992,17 +2358,19 @@ fn coverage_moved(declared: &[WatchTarget], previous: &Snapshot, current: &Snaps
 /// Asked on a declaration and not on the tick: a declaration arrives once per rebuild,
 /// whereas the tick runs on a period, and a target whose `watch` keeps failing would then
 /// buy every consumer a full walk every period for as long as the obstacle lasts.
-fn cover_differs_from_armed(
-    cover: &[(WatchTarget, PathBuf)],
-    armed: &[(WatchTarget, PathBuf)],
-) -> bool {
-    let key = |list: &[(WatchTarget, PathBuf)]| -> Vec<(PathBuf, bool)> {
-        let mut keys: Vec<(PathBuf, bool)> =
-            list.iter().map(|(t, _)| (t.path.clone(), t.recursive)).collect();
-        keys.sort();
-        keys
-    };
-    key(cover) != key(armed)
+fn cover_differs_from_armed(cover: &[(WatchTarget, PathBuf)], armed: &[ArmedTarget]) -> bool {
+    let mut wanted: Vec<(PathBuf, bool)> =
+        cover.iter().map(|(t, _)| (t.path.clone(), t.recursive)).collect();
+    // Declared entries alone: the question is whether the watch stands where the
+    // declaration asks, and a watch no declaration names can never answer it either way.
+    let mut held: Vec<(PathBuf, bool)> = armed
+        .iter()
+        .filter(|entry| entry.is_declared())
+        .map(|entry| (entry.target().path.clone(), entry.target().recursive))
+        .collect();
+    wanted.sort();
+    held.sort();
+    wanted != held
 }
 
 /// The declared targets that exist and are not watched, with the canonical path the
@@ -2020,12 +2388,21 @@ fn cover_differs_from_armed(
 fn blind_targets(
     declared: &[WatchTarget],
     snapshot: &Snapshot,
-    armed: &[(WatchTarget, PathBuf)],
+    armed: &[ArmedTarget],
 ) -> Vec<(WatchTarget, PathBuf)> {
+    // Matched against the DECLARED entries, as is the absorption question below: a record
+    // of a door is a statement about the moment it was armed and nothing ever re-reads it,
+    // so letting one answer here would call a target covered on the strength of a watch
+    // that may since have stopped reaching it. This asks whether the target the
+    // declaration named is itself held; the absorption question — is some other declared
+    // recursive watch already reaching it — is asked below.
     let mut blind: Vec<(WatchTarget, PathBuf)> = cover_from_snapshot(declared, snapshot)
         .into_iter()
         .filter(|(target, canonical)| {
-            !armed.iter().any(|(at, ac)| at.recursive == target.recursive && ac == canonical)
+            !armed.iter().filter(|entry| entry.is_declared()).any(|entry| {
+                entry.target().recursive == target.recursive
+                    && entry.resolved() == canonical.as_path()
+            })
         })
         .collect();
     for target in declared {
@@ -2037,10 +2414,9 @@ fn blind_targets(
         // second test is the absorption the cover would have applied — an armed recursive
         // ancestor watches it already, and calling it blind would degrade the hub for ever
         // over a subtree that is in fact covered.
-        let covered = armed.iter().any(|(at, _)| {
-            (at.recursive == target.recursive && at.path == target.path)
-                || (at.recursive && target.path.starts_with(&at.path))
-        });
+        let covered = armed.iter().filter(|entry| entry.is_declared()).any(|entry| {
+            entry.target().recursive == target.recursive && entry.target().path == target.path
+        }) || an_armed_recursive_target_covers(armed, &target.path);
         if !covered {
             blind.push((target.clone(), target.path.clone()));
         }
@@ -2062,14 +2438,15 @@ fn refresh_blind_targets(
     inner: &HubInner,
     declared: &[WatchTarget],
     snapshot: &Snapshot,
-    armed: &[(WatchTarget, PathBuf)],
+    armed: &[ArmedTarget],
 ) {
     let blind = blind_targets(declared, snapshot, armed);
-    let newly = {
+    let (newly, cleared) = {
         let mut published = inner.blind_targets.lock().unwrap_or_else(PoisonError::into_inner);
         let newly = blind.iter().any(|(target, _)| !published.contains(&target.path));
+        let cleared = !published.is_empty() && blind.is_empty();
         *published = blind.iter().map(|(target, _)| target.path.clone()).collect();
-        newly
+        (newly, cleared)
     };
     if newly {
         for (target, _) in &blind {
@@ -2077,21 +2454,64 @@ fn refresh_blind_targets(
         }
         inner.lock_acc().enter_rescan(false, DegradeReason::RewatchFailed);
         inner.notify();
+    } else if cleared {
+        // The TRANSITION out of blindness, not merely the absence of it: the obstacle this
+        // pass announced has ended, and this is where that becomes knowable, since `drain`
+        // closes a window from the consumer's side and a hub nobody has subscribed to has no
+        // consumer's side. Read off the transition because `RewatchFailed` has a second
+        // producer — a watch this module could not extend over a subtree an event revealed —
+        // and a set that was never blind has ended no obstacle at all. A lost stream, an
+        // overflow, a reconcile miss are other obstacles again, and a check that never read
+        // them has no business answering for them.
+        let mut acc = inner.lock_acc();
+        if acc.degrade_reason == Some(DegradeReason::RewatchFailed) {
+            acc.close_window_if_settled();
+        }
     }
+}
+
+/// The path with every link resolved that CAN be resolved, keeping the rest as spelled.
+///
+/// A whole-path `canonicalize` answers all or nothing, and it answers nothing for
+/// reasons that say nothing about where the path lies: the leaf does not exist yet (a
+/// declared root created later, a config file about to be written), or a directory on
+/// the way has been made unreadable. Every link ABOVE that point still resolves exactly
+/// as it did, so falling straight back to the raw spelling throws away a resolution that
+/// was available — and through a symlinked ancestor the raw spelling and the resolved
+/// one are two different paths that no comparison will ever bring together.
+///
+/// Resolving the longest ancestor that still answers is also the stricter reading: a
+/// missing leaf under a LINK inside a root lands where the link points, so a caller
+/// asking "is this inside my root" gets the true answer instead of the one the spelling
+/// suggests.
+pub(crate) fn resolve_as_far_as_it_goes(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut current = path;
+    while let (Some(parent), Some(name)) = (current.parent(), current.file_name()) {
+        tail.push(name);
+        if let Ok(mut resolved) = parent.canonicalize() {
+            resolved.extend(tail.iter().rev());
+            return resolved;
+        }
+        current = parent;
+    }
+    path.to_path_buf()
 }
 
 /// Reduce a set of watch targets to the minimal cover: drop any target nested under
 /// a RECURSIVE target (a non-recursive ancestor covers only its direct children, so
 /// it absorbs nothing), and collapse exact duplicates — a recursive duplicate wins
-/// over a non-recursive one. Comparison is by canonical path; the RAW path is what
-/// gets watched, so event paths keep the spelling consumers strip against (the
-/// search sink strips the non-canonical source root). Returns each kept target with
-/// the canonical path used for the decision.
+/// over a non-recursive one. Comparison is by the resolved path
+/// ([`resolve_as_far_as_it_goes`], so a target that does not exist yet is still placed
+/// against the tree it lies in); the RAW path is what gets watched, so event paths keep
+/// the spelling consumers strip against (the search sink strips the non-canonical source
+/// root). Returns each kept target with the resolved path used for the decision.
 fn dedup_targets(targets: Vec<WatchTarget>) -> Vec<(WatchTarget, PathBuf)> {
-    let mut pairs: Vec<(PathBuf, WatchTarget)> = targets
-        .into_iter()
-        .map(|t| (t.path.canonicalize().unwrap_or_else(|_| t.path.clone()), t))
-        .collect();
+    let mut pairs: Vec<(PathBuf, WatchTarget)> =
+        targets.into_iter().map(|t| (resolve_as_far_as_it_goes(&t.path), t)).collect();
     // Parents sort before descendants; among equal canonicals the recursive one first.
     pairs.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.recursive.cmp(&a.1.recursive)));
     pairs.dedup_by(|a, b| a.0 == b.0);
@@ -2104,6 +2524,27 @@ fn dedup_targets(targets: Vec<WatchTarget>) -> Vec<(WatchTarget, PathBuf)> {
         kept.push((target, canonical));
     }
     kept
+}
+
+/// Record a watch the backend has just taken, replacing whatever stood under the same
+/// declared spelling.
+///
+/// One path is one registration, so it has to be one record. A door re-armed after it was
+/// retargeted — a link removed and recreated elsewhere, a mount point replaced — arrives
+/// here a second time, and appending would keep the abandoned resolution beside the true
+/// one for the life of the daemon.
+///
+/// Same ORIGIN only. A declared record and a door can name one spelling at once — a
+/// declared root that is itself a link, re-pointed while an event describes it — and a
+/// door must never take a declaration's place: the declared entries are the whole of what
+/// a declaration is compared against, and a set that had quietly demoted one would report
+/// an armed root as unwatched.
+fn record_arm(armed: &mut Vec<ArmedTarget>, entry: ArmedTarget) {
+    armed.retain(|standing| {
+        standing.is_declared() != entry.is_declared()
+            || standing.target().path != entry.target().path
+    });
+    armed.push(entry);
 }
 
 /// How long a re-arm caller waits for the hub thread's acknowledgement before
@@ -2142,7 +2583,7 @@ fn run_hub_thread(
     );
 
     let mut watcher = match watcher {
-        Ok(backend) => Watch { backend, refuses: watch_refusal },
+        Ok(backend) => Watch { backend, seams: watch_refusal },
         Err(error) => {
             tracing::warn!("workspace change hub failed to create watcher: {error}");
             inner.mark_setup_failed();
@@ -2159,7 +2600,7 @@ fn run_hub_thread(
     // targets whose relative spellings are already placed: the backend receives an
     // absolute path and never reads the process-wide current directory again, so
     // the scope cannot end up describing a different tree than the one armed.
-    let mut armed: Vec<(WatchTarget, PathBuf)> = Vec::new();
+    let mut armed: Vec<ArmedTarget> = Vec::new();
     let targets = ResolvedTargets::here(targets);
     if !targets.is_complete() {
         inner.note_unplaced_targets();
@@ -2177,16 +2618,26 @@ fn run_hub_thread(
     if let Some(before_arm) = before_arm {
         before_arm();
     }
-    for (target, canonical) in dedup_targets(targets.into_inner()) {
-        match watcher.arm(&target.path, target.mode()) {
+    for (target, _) in dedup_targets(targets.into_inner()) {
+        let candidate = ArmedTarget::arming(target, ArmOrigin::Declared);
+        match watcher.arm(&candidate.target().path, candidate.target().mode()) {
             Ok(()) => {
-                tracing::info!(root = ?target.path, recursive = target.recursive, "workspace change hub watching root");
-                armed.push((target, canonical));
+                tracing::info!(root = ?candidate.target().path, recursive = candidate.target().recursive, "workspace change hub watching root");
+                // No debt for the window between one arm and the next, though on FSEvents
+                // that window is real: arming the second target restarts the stream the
+                // first one started. Nothing was lost that anybody has to go looking for —
+                // a consumer reaching the hub at startup has no baseline yet and builds one
+                // by walking the tree, which covers this window and every earlier moment
+                // besides. Owing a reconcile here would turn every boot with two declared
+                // targets into a cold one, which is what
+                // `a_second_boot_over_a_matching_cache_declares_every_source_root_to_the_hub`
+                // measures and refuses.
+                armed.push(candidate);
             }
             // A single unwatchable root (a missing extension dir, an inotify-limit) leaves
             // that subtree to the reconciler rather than failing the whole hub.
             Err(error) => {
-                tracing::warn!(root = ?target.path, "workspace change hub failed to watch root: {error}")
+                tracing::warn!(root = ?candidate.target().path, "workspace change hub failed to watch root: {error}")
             }
         }
     }
@@ -2221,8 +2672,91 @@ fn run_hub_thread(
         match msg {
             HubMsg::Event(res) => {
                 for dir in inner.ingest_event(res) {
-                    if let Err(error) = watcher.arm(&dir, RecursiveMode::Recursive) {
-                        inner.note_rewatch_failed(&dir, &error);
+                    // Placed first, so the directory is resolved ONCE and by the one rule:
+                    // three decisions turn on where it lies, and they must not answer
+                    // differently.
+                    let candidate =
+                        ArmedTarget::arming(WatchTarget::recursive(dir), ArmOrigin::Incidental);
+                    let dir = candidate.target().path.clone();
+
+                    // A spelling the DECLARATION holds is the declaration's to re-point,
+                    // and the periodic check does that whole: the old registration dropped
+                    // before the new one is placed, the record corrected, the defensive
+                    // pass, the debt. Doing half of it from here leaves a door's record
+                    // beside a declared one that still names the tree it used to reach,
+                    // after which the check reads the set as a retarget and pays for the
+                    // swap a second time. What it costs to wait is bounded by
+                    // `COVERAGE_TICK_PERIOD`, which is the bound this module already
+                    // accepts for a root re-pointed in place.
+                    if armed.iter().any(|held| held.is_declared() && held.target().path == dir) {
+                        continue;
+                    }
+
+                    // A door whose spelling no longer leads where its record says names a
+                    // registration nothing reaches through it any more, and this is the only
+                    // moment anything can still name it: the kernel keys a watch by inode,
+                    // so the same path over a new target takes a new descriptor while
+                    // `notify` keys its own map by path and forgets the old one. Dropped
+                    // BEFORE the question of whether a new watch is worth placing — whether
+                    // the new target happens to be covered already says nothing about the
+                    // old registration. The record goes with it: from here on it names
+                    // nothing.
+                    let replacing = armed.iter().any(|entry| {
+                        !entry.is_declared()
+                            && entry.target().path == dir
+                            && !entry.still_leads_where_recorded()
+                    });
+                    if replacing {
+                        if let Err(error) = watcher.disarm(&dir) {
+                            tracing::debug!(root = ?dir, "workspace change hub unwatch of a door being replaced: {error}");
+                        }
+                        // The record is NOT dropped here. It is stale on purpose from this
+                        // moment: it names where the door used to lead, which is what makes
+                        // the periodic check see a difference and try again. Dropping it
+                        // would leave a failed arm with nothing to retry from — no
+                        // declaration names a door, and a link that merely stands there
+                        // fires no event, so the watch would be lost for the life of the
+                        // daemon. A successful arm replaces it a few lines below.
+                        //
+                        // Paid HERE, not after the arm. The registration is already gone —
+                        // on FSEvents the unwatch rebuilt the stream from "now" and on
+                        // inotify the descriptors went — while whether a new watch is worth
+                        // placing is a later question that may end this round without ever
+                        // reaching the arm.
+                        inner.note_arming_window(&dir);
+                    }
+
+                    let covered = an_armed_recursive_watch_reaches(&armed, candidate.resolved());
+                    if !watch_is_additive_and_needed(covered) {
+                        continue;
+                    }
+                    let recorded = an_arm_already_recorded_covers(&armed, &candidate);
+                    match watcher.arm(&dir, RecursiveMode::Recursive) {
+                        Ok(()) => {
+                            // A replacement is a window on EVERY backend — the old
+                            // registration is gone and the new one starts from now — so the
+                            // debt does not wait on the platform question.
+                            if arming_restarts_the_stream() {
+                                inner.note_arming_window(&dir);
+                            }
+                            if !recorded {
+                                record_arm(&mut armed, candidate);
+                            }
+                            if replacing {
+                                restore_watches_beneath(&inner, &mut watcher, &mut armed, &dir);
+                            }
+                        }
+                        Err(error) => {
+                            // The door itself has nothing to take back: a replacement
+                            // dropped both the old registration and its record above, and a
+                            // first arm placed neither. What DOES have to be put back is
+                            // everything the unwatch took from beneath it — the arm that
+                            // would have re-walked that subtree is the one that just failed.
+                            if replacing {
+                                restore_watches_beneath(&inner, &mut watcher, &mut armed, &dir);
+                            }
+                            inner.note_rewatch_failed(&dir, &error);
+                        }
                     }
                 }
             }
@@ -2273,12 +2807,23 @@ fn run_hub_thread(
 fn coverage_tick(
     inner: &Arc<HubInner>,
     watcher: &mut Watch,
-    armed: &mut Vec<(WatchTarget, PathBuf)>,
+    armed: &mut Vec<ArmedTarget>,
     declared: &[WatchTarget],
     snapshot: &mut Snapshot,
 ) {
+    // First, before a single arm in this tick: a watch dropped after one would take, on
+    // inotify, the registrations that arm had just placed beneath it. Counted as movement,
+    // so the re-arm below pays for the window the unwatch cost and puts back whatever it
+    // stripped — the same bargain `apply_rearm` makes for every other unwatch it issues.
+    let doors_gone = drop_doors_that_are_gone(watcher, armed);
+    rearm_doors_that_moved(inner, watcher, armed);
     let current = snapshot_of(declared, snapshot);
-    let moved = coverage_moved(declared, snapshot, &current);
+    // A door that went costs a re-arm only where the unwatch cost the stream: there the
+    // window has to be paid for and whatever the swap dropped put back. Where it does not,
+    // the only registrations it took were reachable through the very path that is gone, so
+    // nothing is owed and nothing needs restoring.
+    let moved = coverage_moved(declared, snapshot, &current)
+        || (doors_gone && unwatching_restarts_the_stream());
     // Stored on BOTH branches. "Coverage did not move" is a statement about the targets
     // IN the cover; the ones outside it can still have changed, and blindness is read off
     // this snapshot. A target first described as undescribable and later proven gone moves
@@ -2321,25 +2866,25 @@ fn coverage_tick(
 fn retry_blind_targets(
     inner: &HubInner,
     watcher: &mut Watch,
-    armed: &mut Vec<(WatchTarget, PathBuf)>,
+    armed: &mut Vec<ArmedTarget>,
     declared: &[WatchTarget],
     snapshot: &Snapshot,
 ) {
     let mut armed_any = false;
     for (target, _) in blind_targets(declared, snapshot, armed) {
-        match watcher.arm(&target.path, target.mode()) {
+        // Placed through the one constructor, like every other arming path: a target the
+        // snapshot could not describe has no resolved path to carry, and one it could may
+        // have moved since, so the truthful spelling is the one taken now — by the rule
+        // the three comparisons that read it all expect.
+        let candidate = ArmedTarget::arming(target, ArmOrigin::Declared);
+        match watcher.arm(&candidate.target().path, candidate.target().mode()) {
             Ok(()) => {
-                tracing::info!(root = ?target.path, recursive = target.recursive, "workspace change hub watching root (retry)");
-                // Canonicalized HERE, at the moment the watch went in, like every other
-                // arming path: a target the snapshot could not describe has no canonical
-                // path to carry, and one it could may have moved since — either way the
-                // truthful key is the one taken now.
-                let canonical = target.path.canonicalize().unwrap_or_else(|_| target.path.clone());
-                armed.push((target, canonical));
+                tracing::info!(root = ?candidate.target().path, recursive = candidate.target().recursive, "workspace change hub watching root (retry)");
+                record_arm(armed, candidate);
                 armed_any = true;
             }
             Err(error) => {
-                tracing::debug!(root = ?target.path, "workspace change hub retry still cannot watch root: {error}")
+                tracing::debug!(root = ?candidate.target().path, "workspace change hub retry still cannot watch root: {error}")
             }
         }
     }
@@ -2347,7 +2892,9 @@ fn retry_blind_targets(
         return;
     }
     inner.publish_watched_roots(armed);
-    inner.lock_acc().enter_rescan(false, DegradeReason::Rearmed);
+    // Owed to whoever was listening across the blind window: a cursor taken after the retry
+    // begins where that window ended.
+    inner.lock_acc().enter_rescan_for_listeners(DegradeReason::Rearmed);
     inner.notify();
 }
 
@@ -2361,7 +2908,7 @@ fn retry_blind_targets(
 fn apply_declaration(
     inner: &Arc<HubInner>,
     watcher: &mut Watch,
-    armed: &mut Vec<(WatchTarget, PathBuf)>,
+    armed: &mut Vec<ArmedTarget>,
     declared: &mut Vec<WatchTarget>,
     snapshot: &mut Snapshot,
     targets: Vec<WatchTarget>,
@@ -2385,16 +2932,496 @@ fn apply_declaration(
         // one left without that report.
         apply_rearm(inner, watcher, armed, resolved);
         inner.rearms.fetch_add(1, Ordering::Relaxed);
-    } else if !resolved.is_complete() {
-        // A target that could not be placed silently narrows the scope, and the caller
-        // already counts this declaration as delivered — so it is reported here, like at
-        // every other placement point, rather than left to look like agreement.
-        inner.note_unplaced_targets();
+    } else {
+        if !resolved.is_complete() {
+            // A target that could not be placed silently narrows the scope, and the caller
+            // already counts this declaration as delivered — so it is reported here, like
+            // at every other placement point, rather than left to look like agreement.
+            inner.note_unplaced_targets();
+        }
+        // Only on this branch, and only because nothing was armed on it: a scope can narrow
+        // without the cover moving at all — a root carved back out of an exclusion is
+        // absorbed by its recursive ancestor and never reaches the cover — and a door
+        // inside what the scope has stopped walking is a registration nothing else will
+        // ever drop. On the other branch `apply_rearm` has already done it, and doing it
+        // again there would put an unwatch AFTER the defensive pass, which on inotify
+        // strips exactly what that pass had just restored.
+        let dropped = drop_doors_the_scope_stopped_reaching(watcher, armed, &inner.scope());
+        // And its own defensive pass, because this branch has no other. A recursive unwatch
+        // takes the registrations beneath it by SPELLING on inotify, and a declared root can
+        // be spelled under a door while resolving somewhere else entirely — which is exactly
+        // why it stands as a registration of its own instead of being absorbed. Its record
+        // survives the strip, so nothing downstream would ever notice: the blind set reads
+        // the set, not the backend.
+        if !dropped.is_empty() && a_kept_target_must_be_re_armed() {
+            let mut restored: Vec<ArmedTarget> = Vec::with_capacity(armed.len());
+            for entry in armed.drain(..) {
+                if !entry.is_declared() {
+                    restored.push(entry);
+                    continue;
+                }
+                match watcher.arm(&entry.target().path, entry.target().mode()) {
+                    Ok(()) => restored.push(entry),
+                    // DROPPED on failure, exactly as the same pass drops one in
+                    // `apply_rearm`: the set is read as "already covered", so a record left
+                    // over a watch that may be gone keeps the blind set silent and the retry
+                    // away for ever. Dropping it is what lets the refresh below report the
+                    // root and the periodic check put it back.
+                    Err(error) => {
+                        tracing::warn!(root = ?entry.target().path, "workspace change hub lost a root while restoring it after dropping a watch above it: {error}");
+                    }
+                }
+            }
+            *armed = restored;
+            // Republished because the set changed here: `ensure_roots` compares the live
+            // list against what it is about to declare, and a root left in it after its
+            // record was dropped would answer the next identical declaration "already
+            // covered" over a subtree nothing is watching.
+            inner.publish_watched_roots(armed);
+        }
+        if !dropped.is_empty() {
+            // The unwatch above took whatever lay beneath it and the pass put it back, and
+            // between the two nothing was watching — the same window `apply_rearm` pays for
+            // at its end, for the same reason, so it is owed here too.
+            inner.lock_acc().enter_rescan_for_listeners(DegradeReason::Rearmed);
+            inner.notify();
+        }
     }
     // On BOTH branches. A declaration that re-arms nothing is exactly how a blind target
     // leaves the set: outside the cover, so dropping it moves no coverage at all, and a
     // set reconciled only inside `apply_rearm` would hold ill health over it forever.
     refresh_blind_targets(inner, declared, snapshot, armed);
+}
+
+/// Whether arming `dir` is worth what the backend charges for it.
+///
+/// A question about ONE backend's mechanics, not about recursion in general — so the
+/// answer is per platform, and the platform is what the two bodies below select on.
+///
+/// FSEvents: a single kernel stream watches whole subtrees, and `watch` does not extend
+/// a running one. `fsevent::watch_inner` stops the stream, rebuilds it over the widened
+/// path list and starts the new one from "now" (`kFSEventStreamEventIdSinceNow`), so
+/// every change ANYWHERE in the tree during that swap is dropped and never reported
+/// again. A directory that appears under an armed recursive root is already inside that
+/// stream's subtree, so arming it registers nothing new and pays a blind window for it —
+/// and one arm per created directory turns a checkout of a large configuration into
+/// thousands of blind windows over the very tree the hub exists to follow.
+///
+/// inotify: NOT recursive. `RecursiveMode::Recursive` is emulated — the backend walks
+/// the tree and registers each directory separately, and a directory created later is
+/// covered only once the backend has learnt of it from an event and registered it in
+/// turn. So the arm here is what creates the registration, nothing is torn down to do
+/// it, and skipping it would take away coverage rather than a redundancy. That is the
+/// whole reason this is gated instead of applied everywhere: extending the skip to
+/// inotify would trade a wasted arm for silent blindness.
+///
+/// Takes the coverage answer rather than deriving it, because the caller needs the same
+/// answer for a second decision — whether the registration this arm places is one the
+/// declared set accounts for — and one path resolved twice is one that can be resolved two
+/// ways.
+#[cfg(target_os = "macos")]
+fn watch_is_additive_and_needed(already_covered: bool) -> bool {
+    !already_covered
+}
+
+#[cfg(not(target_os = "macos"))]
+fn watch_is_additive_and_needed(_already_covered: bool) -> bool {
+    true
+}
+
+/// Drop every watch no declaration names whose SPELLING has gone from disk, and say
+/// whether any went.
+///
+/// A door is reached only through its own spelling: no declaration names it, and a re-arm
+/// builds only from what is declared. Once the link itself is gone nothing will ever
+/// deliver an event under it again, so the registration it left behind is one only this can
+/// name — and a link put back in its place fires a create, which arms and records it
+/// afresh.
+///
+/// ABSENCE is the test, deliberately, and not where the spelling leads. A door whose tree
+/// merely moved out from under it is still a door: forgetting it there would leave nothing
+/// able to name that registration when the tree came back, and no event would ever say so,
+/// because the link itself never changed.
+fn drop_doors_that_are_gone(watcher: &mut Watch, armed: &mut Vec<ArmedTarget>) -> bool {
+    let mut gone: Vec<PathBuf> = Vec::new();
+    armed.retain(|entry| {
+        if entry.is_declared() || !the_spelling_is_gone(&entry.target().path) {
+            return true;
+        }
+        gone.push(entry.target().path.clone());
+        false
+    });
+    for path in &gone {
+        if let Err(error) = watcher.disarm(path) {
+            tracing::debug!(root = ?path, "workspace change hub unwatch of a watch whose path is gone: {error}");
+        }
+    }
+    !gone.is_empty()
+}
+
+/// Re-point every watch no declaration names whose door no longer leads where its record
+/// says.
+///
+/// The registration stands on what the door reached when it was armed. A link re-pointed
+/// with nothing to say so, or a target removed and recreated under one name, leaves it there
+/// while the door leads somewhere else — and nothing else would ever notice, because no
+/// declaration names a door and a link that merely stands there fires no event. This is the
+/// only pass that can put it right.
+///
+/// A door leading NOWHERE is left exactly as it stands: the arm would fail, and the record
+/// is both the only handle to the registration and the only thing that will notice when the
+/// tree comes back.
+fn rearm_doors_that_moved(inner: &HubInner, watcher: &mut Watch, armed: &mut Vec<ArmedTarget>) {
+    let moved: Vec<WatchTarget> = armed
+        .iter()
+        .filter(|entry| !entry.is_declared() && !entry.still_leads_where_recorded())
+        .map(|entry| entry.target().clone())
+        .collect();
+    for target in &moved {
+        if let Err(error) = watcher.disarm(&target.path) {
+            tracing::debug!(root = ?target.path, "workspace change hub unwatch of a door being re-pointed: {error}");
+        }
+        // The record stays across the attempt, for the reason the event branch keeps it:
+        // stale is what makes the next check try again, and a successful arm replaces it.
+        let candidate = ArmedTarget::arming(target.clone(), ArmOrigin::Incidental);
+        if !candidate.resolved().is_dir() {
+            // The door leads nowhere a watch can be placed — a dangling link, or one now
+            // pointing at a file. The registration is dropped all the same, because it goes
+            // on delivering for a tree the door has stopped reaching and every one of those
+            // events arrives spelled as though it were still inside the workspace. The
+            // RECORD stays, now describing where the door leads (nowhere), so the next check
+            // sees the difference the moment a directory appears there again — and so
+            // something is still able to name the watch when it does.
+            record_arm(armed, candidate);
+            inner.note_arming_window(&target.path);
+            continue;
+        }
+        match watcher.arm(&target.path, target.mode()) {
+            Ok(()) => {
+                // A replacement is a window on every backend: the old registration is gone
+                // and the new one starts from now.
+                inner.note_arming_window(&target.path);
+                record_arm(armed, candidate);
+                restore_watches_beneath(inner, watcher, armed, &target.path);
+            }
+            Err(error) => {
+                // The arm that would have re-walked what lies under this spelling is the one
+                // that failed, so nothing else will put back what the unwatch took from
+                // beneath it.
+                restore_watches_beneath(inner, watcher, armed, &target.path);
+                // Logged, not reported. The transition into this state was reported once
+                // already, where the door first failed to move; repeating it every period
+                // would buy every consumer a full walk each period for as long as the
+                // obstacle lasts — the precise cost `refresh_blind_targets` refuses for the
+                // same reason. The record stays, so the next check tries again.
+                tracing::debug!(root = ?target.path, "workspace change hub still cannot re-point a watch no declaration names: {error}");
+            }
+        }
+    }
+}
+
+/// Place again every watch recorded UNDER a path that was just handed to `unwatch`.
+///
+/// A recursive unwatch takes the registrations whose spelling begins with the one given, and
+/// the arm that follows it re-walks only what lies behind the path itself. Anything else
+/// recorded beneath that spelling — a door revealed inside another door, a declared root
+/// written under one — has to be placed again, or the set goes on naming registrations the
+/// backend no longer holds. A watch that cannot be placed is DROPPED for the same reason: a
+/// record is read as a registration that can still be dropped, and one over a watch that is
+/// gone can never be made true.
+///
+/// Asked of the platform first, because where an unwatch takes only what it was given there
+/// is nothing beneath it to restore.
+fn restore_watches_beneath(
+    inner: &HubInner,
+    watcher: &mut Watch,
+    armed: &mut Vec<ArmedTarget>,
+    dropped: &Path,
+) {
+    if !an_unwatch_takes_what_lies_beneath_it() {
+        return;
+    }
+    let mut lost: Vec<PathBuf> = Vec::new();
+    for entry in armed.iter() {
+        let path = &entry.target().path;
+        if path == dropped || !path.starts_with(dropped) {
+            continue;
+        }
+        if let Err(error) = watcher.arm(path, entry.target().mode()) {
+            tracing::warn!(root = ?path, "workspace change hub lost a watch that lay under one it dropped: {error}");
+            lost.push(path.clone());
+        }
+    }
+    if lost.is_empty() {
+        return;
+    }
+    armed.retain(|entry| !lost.contains(&entry.target().path));
+    // Republished because the set changed: `ensure_roots` compares the live list against
+    // what it is about to declare, and a root left in it after its record was dropped would
+    // answer the next identical declaration "already covered" over a subtree nothing is
+    // watching.
+    inner.publish_watched_roots(armed);
+}
+
+/// Where a spelling itself lies, with the leaf left as written.
+///
+/// Not where it LEADS. A door is a link, and following it answers with the tree behind it;
+/// what is asked here is whether the door itself is still inside a declared tree. A root
+/// re-declared under an equivalent spelling — another link to the same directory — moves
+/// that answer only when it is read physically, and a door judged on the dropped spelling
+/// alone is dropped with it while the tree behind it stays perfectly reachable and
+/// perfectly unwatched.
+fn where_the_spelling_lies(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => resolve_as_far_as_it_goes(parent).join(name),
+        _ => resolve_as_far_as_it_goes(path),
+    }
+}
+
+/// Whether the scope still leads to a watch no declaration names, and the watch is still
+/// nameable at all.
+///
+/// Two questions, and NOT a third. Where the spelling now leads is deliberately not asked:
+/// a door whose target has stepped aside for a moment — a rebuild renaming a directory and
+/// putting it back — would answer no, and dropping it there destroys the only record able to
+/// re-point it, while the link itself never changed and will never fire another event. That
+/// state is the periodic check's to mend, and it mends it by re-pointing rather than by
+/// forgetting. What a re-arm does own is the spelling that is GONE: nothing will ever
+/// deliver under it again, so the registration behind it is one only this can still name.
+fn the_scope_still_reaches(scope: &Scope, entry: &ArmedTarget) -> bool {
+    let path = &entry.target().path;
+    (scope.may_walk(path) || scope.may_walk(&where_the_spelling_lies(path)))
+        && !the_spelling_is_gone(path)
+}
+
+/// Whether a path is PROVABLY absent, as against merely impossible to look at.
+///
+/// A parent made unsearchable for a moment answers `PermissionDenied`, and taking that for a
+/// removal would drop the only handle to a live registration over a link that never changed
+/// — after which no event would ever say so. The distinction `fingerprint_of` draws, for the
+/// same reason.
+fn the_spelling_is_gone(path: &Path) -> bool {
+    // And the absence has to be about THIS spelling. A `NotFound` on a nested path proves
+    // only that something on the way is missing — an ancestor link whose target has stepped
+    // aside answers exactly that — and forgetting the record there destroys the only thing
+    // able to re-point it once the way back opens. So the parent must be reachable, THROUGH
+    // its links, before the leaf's absence means anything.
+    let reached = path.parent().is_some_and(|parent| parent.metadata().is_ok());
+    reached && path.symlink_metadata().is_err_and(|error| target_cannot_exist(error.kind()))
+}
+
+/// Drop every watch no declaration names that the scope has stopped reaching, and hand
+/// each one to `unwatch`. Gives back what it dropped.
+///
+/// A door lives on two conditions, and losing either ends it: the scope must still walk the
+/// spelling — that is what a declaration reaching a door means — and the spelling must still
+/// be there at all, because nothing will ever deliver under one that is gone. Where the
+/// spelling now LEADS is deliberately not among them; [`the_scope_still_reaches`] says why,
+/// and the periodic check is what mends that state, by re-pointing rather than forgetting.
+fn drop_doors_the_scope_stopped_reaching(
+    watcher: &mut Watch,
+    armed: &mut Vec<ArmedTarget>,
+    scope: &Scope,
+) -> Vec<PathBuf> {
+    let mut dropped: Vec<PathBuf> = Vec::new();
+    armed.retain(|entry| {
+        if entry.is_declared() || the_scope_still_reaches(scope, entry) {
+            return true;
+        }
+        dropped.push(entry.target().path.clone());
+        false
+    });
+    for path in &dropped {
+        if let Err(error) = watcher.disarm(path) {
+            tracing::debug!(root = ?path, "workspace change hub unwatch of a watch no declaration names: {error}");
+        }
+    }
+    dropped
+}
+
+/// Whether a target the watcher IS holding recursively already reaches `path`.
+///
+/// One implementation, because two callers ask it and they must not answer differently:
+/// the blind set decides whether a declared target it cannot describe is nonetheless
+/// being watched, and the re-watch decides whether a directory that just appeared needs
+/// arming at all. The same armed set, the same question — and a disagreement would mean
+/// one of them reporting a subtree as unwatched while the other declines to watch it.
+///
+/// Asked of where the two paths LIE, not of how they are written. A recursive watch
+/// covers a file-system subtree, and neither backend follows links out of it: a symlink
+/// (or a mount point) created inside a watched root is a door into another tree, and
+/// everything behind it is unwatched however plainly the spelling reads as "inside".
+/// Measured, not assumed — a write in the target of such a link is delivered only once
+/// the link itself has been armed. Resolving the candidate first is also what makes the
+/// two spellings of the root a non-question: a path written through the root's declared
+/// name resolves to the same place as one written through its resolved name.
+///
+/// The root's side is the resolution CAPTURED AT WATCH TIME and is never re-derived: a
+/// root retargeted since then no longer matches, which is the conservative answer —
+/// coverage it has actually lost is not claimed.
+///
+/// Read off the DECLARED watches only. A declared target's resolution is policed: the
+/// periodic check re-fingerprints the declaration and re-arms the whole set the moment it
+/// moves, so a record of one is a statement about now. Nothing polices a door — no
+/// declaration names it, and a symlink that merely stands there fires no event — so a
+/// record of one is a statement about the moment it was armed and may since have become
+/// false. Letting that answer here would suppress exactly the arm that would have made it
+/// true again: the cost of arming a tree twice is one stream swap, the cost of not arming
+/// it is every change in it, for ever.
+fn an_armed_recursive_target_covers(armed: &[ArmedTarget], path: &Path) -> bool {
+    an_armed_recursive_watch_reaches(armed, &resolve_as_far_as_it_goes(path))
+}
+
+/// Whether a registration this arm is about to place is one an existing record already
+/// answers for — the only ground on which recording it can be skipped.
+///
+/// About REGISTRATIONS, not about trees, and the difference is the whole point. A record
+/// exists so that a re-arm can hand its path to `unwatch`; another record answers for this
+/// one exactly when un-watching that one takes this one with it, which is a question about
+/// the paths the backend was given. Two doors into ONE tree are two registrations and two
+/// spellings: the second lies under neither the first nor any declared root, so nothing
+/// would ever drop it, and its watch would outlive every topology that could justify it.
+/// A directory revealed BEHIND a door does lie under the door's spelling, and that is what
+/// keeps the set from taking a record for every directory a checkout creates.
+fn an_arm_already_recorded_covers(armed: &[ArmedTarget], candidate: &ArmedTarget) -> bool {
+    if !an_unwatch_takes_what_lies_beneath_it() {
+        return false;
+    }
+    armed.iter().any(|entry| {
+        // Inside the other registration BOTH ways: under its spelling, so the unwatch takes
+        // it, and inside the tree it reaches, so the arm that follows puts it back. A
+        // directory created behind a door — or inside a declared root — satisfies both, and
+        // that is what keeps the set from taking a record for every directory a checkout
+        // creates. A door revealed INSIDE another registration does not: it leads out of
+        // that tree, so re-arming the outer one never places it again, and without a record
+        // of its own nothing could ever name what it left behind when its own link is later
+        // re-pointed.
+        //
+        // Declared and incidental alike, because the question is about what an unwatch
+        // takes, and the backend does not care why a registration was placed.
+        candidate.resolved().starts_with(entry.resolved())
+            // The candidate's OWN spelling is excluded, and it is the reason this is a
+            // function and not an inline `starts_with`: containment is reflexive, so a
+            // record of this very door would otherwise answer "already covered" and send
+            // the arm past the one place that refreshes it. The record would then keep the
+            // resolution the door had BEFORE it was retargeted, and the re-arm — which
+            // reads exactly that to decide what to drop — would unwatch a live door the
+            // declaration still reaches, with nothing left able to arm it again.
+            && entry.target().path != candidate.target().path
+            && candidate.target().path.starts_with(&entry.target().path)
+    })
+}
+
+/// The same question asked of a path already placed, for the caller that has the
+/// resolution in hand and must not read it a second time.
+fn an_armed_recursive_watch_reaches(armed: &[ArmedTarget], lies_at: &Path) -> bool {
+    armed.iter().any(|entry| {
+        entry.is_declared() && entry.target().recursive && lies_at.starts_with(entry.resolved())
+    })
+}
+
+/// Whether handing a path to `unwatch` takes the registrations placed beneath it.
+///
+/// A fourth question about one backend's mechanics, and the one that decides when a record
+/// may be left out: a registration inside another's reach goes when that one goes, and only
+/// then does it need no name of its own.
+///
+/// inotify: yes. `remove_watch` walks its own map and drops every entry whose PATH begins
+/// with the one given, so a directory armed behind a door goes with the door.
+///
+/// FSEvents: the question does not arise — nothing beneath an armed recursive watch is ever
+/// armed separately there, and events behind a door arrive under the physical path, outside
+/// every declared root, so no such directory is ever revealed to begin with. Answering `no`
+/// costs nothing and keeps the claim to what can be shown.
+///
+/// Windows: no. Each `ReadDirectoryChangesW` registration stands on its own, so a child
+/// armed behind a door survives the door's removal and would be left with no record able to
+/// name it — a handle held for the life of the process.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn an_unwatch_takes_what_lies_beneath_it() -> bool {
+    true
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn an_unwatch_takes_what_lies_beneath_it() -> bool {
+    false
+}
+
+/// Whether arming a path costs the stream that was already running.
+///
+/// A third question about one backend's mechanics, per platform for the same reason as
+/// [`watch_is_additive_and_needed`], and the reason a debt is owed on one platform and
+/// would be ruinous on the other.
+///
+/// FSEvents: yes. `fsevent::watch_inner` stops the running stream, rebuilds it over the
+/// widened path list and starts the new one from `kFSEventStreamEventIdSinceNow`, so every
+/// change ANYWHERE in the watched tree between the stop and the start is dropped and never
+/// reported again. Nobody can name what was lost — that is what makes it a window and not
+/// an event — so the only honest answer is the one a reconcile gives.
+///
+/// inotify: no. A registration is added beside the ones already in place; nothing is torn
+/// down and nothing is lost. Owing a reconcile here would cost every consumer a full tree
+/// walk for each of the thousands of directories a checkout creates, to describe a window
+/// that never existed.
+#[cfg(target_os = "macos")]
+fn arming_restarts_the_stream() -> bool {
+    true
+}
+
+#[cfg(not(target_os = "macos"))]
+fn arming_restarts_the_stream() -> bool {
+    false
+}
+
+/// Whether handing a path to `unwatch` costs the stream that was already running.
+///
+/// The same mechanics as [`arming_restarts_the_stream`] read from the other end.
+///
+/// FSEvents: yes — `fsevent::unwatch_inner` stops the stream, rebuilds it over the narrowed
+/// path list and starts the new one from "now", so removing one path costs everything that
+/// happened anywhere in the tree during the swap.
+///
+/// inotify: no. `remove_watch` drops the descriptors whose stored path begins with the one
+/// given and touches nothing else — and every one of those was reachable only through the
+/// path just removed. Nothing that is still reachable was lost, so charging a reconcile
+/// there would turn an ordinary symlink churn into a full workspace walk for every
+/// consumer.
+#[cfg(target_os = "macos")]
+fn unwatching_restarts_the_stream() -> bool {
+    true
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unwatching_restarts_the_stream() -> bool {
+    false
+}
+
+/// Whether a target the watcher is ALREADY holding, and which stays in the set, has to
+/// be armed a second time after obsolete targets were unwatched.
+///
+/// Another question about one backend's mechanics, per platform for the same reason as
+/// [`watch_is_additive_and_needed`].
+///
+/// inotify: yes. Registrations are per directory, and a recursive `unwatch` of an
+/// obsolete root that overlapped a kept one strips the kept target's descendants along
+/// with its own. Arming it again re-registers exactly what was taken, and costs nothing
+/// but the walk — no other registration is disturbed.
+///
+/// FSEvents: no, and it is not merely wasted. There is nothing to restore — an unwatch
+/// removes one path from the stream's list and leaves the rest of the subtree covered —
+/// while the arm itself rebuilds the whole stream from "now", so every change in the
+/// tree during the swap is lost. Measured on a re-arm onto an UNCHANGED set, where this
+/// pass is the only watcher call made at all: a directory removed alongside it went
+/// undelivered in roughly one run in twelve, with nothing delivered in its place. A
+/// re-arm is asked for after every rebuild, so this is a blind window on a schedule.
+#[cfg(target_os = "macos")]
+fn a_kept_target_must_be_re_armed() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+fn a_kept_target_must_be_re_armed() -> bool {
+    true
 }
 
 /// Re-point the watch set at `new_targets`, on the hub thread. Additions are armed
@@ -2406,11 +3433,14 @@ fn apply_declaration(
 /// covered" and be re-armed, not silently claimed. Every cursor is then flagged to
 /// rescan once: anything a consumer derived under the old set predates the new
 /// targets' coverage, and events inside a newly-added root from before its arm were
-/// never delivered. Returns whether EVERY desired target is armed afterwards.
+/// never delivered. A watch no declaration names — a door an event revealed — is neither
+/// re-armed nor disarmed with the declared targets: it is kept while the new scope still
+/// walks it and dropped when it does not. Returns whether EVERY desired target is armed
+/// afterwards.
 fn apply_rearm(
     inner: &HubInner,
     watcher: &mut Watch,
-    armed: &mut Vec<(WatchTarget, PathBuf)>,
+    armed: &mut Vec<ArmedTarget>,
     new_targets: ResolvedTargets,
 ) -> bool {
     // Scope follows the DESIRED set, before de-duplication: a target absorbed by a
@@ -2425,22 +3455,78 @@ fn apply_rearm(
     if !full_coverage {
         inner.note_unplaced_targets();
     }
-    inner.set_scope(inner.scope_from(&new_targets));
+    // Taken once and used twice: the scope the events are filtered by, and the same
+    // question asked of the watches no declaration names — a door is kept exactly while
+    // the new declaration still leads to it.
+    let scope = inner.scope_from(&new_targets);
+    inner.set_scope(scope.clone());
     let desired = dedup_targets(new_targets.into_inner());
-    let is_armed = |list: &[(WatchTarget, PathBuf)], t: &WatchTarget, c: &PathBuf| {
-        list.iter().any(|(at, ac)| at.recursive == t.recursive && ac == c)
+    // Spellings this pass has already handed to `unwatch`, before placing the new
+    // registration under them. The obsolete loop below matches the same records — their
+    // resolutions differ, which is what made them retargets — and unwatching a second time
+    // would take away the registration this pass has just placed.
+    let mut retargeted: Vec<PathBuf> = Vec::new();
+    let held = |list: &[ArmedTarget], wanted: &ArmedTarget| {
+        list.iter().any(|entry| entry.is_declared() && entry.names_the_same_watch_as(wanted))
     };
 
-    let mut next_armed: Vec<(WatchTarget, PathBuf)> = Vec::new();
-    for (target, canonical) in &desired {
-        if is_armed(armed, target, canonical) {
-            next_armed.push((target.clone(), canonical.clone()));
+    // Spellings the defensive pass must place again — which is not quite "the spellings this
+    // pass unwatched", and the difference is deliberate. The retarget and alias branches
+    // unwatch one spelling meaning the watch to end up under ANOTHER, so it is the
+    // destination that goes in here; the obsolete loop unwatches and means it, so what it
+    // records is its own. What every entry has in common is the only thing the pass asks:
+    // this spelling needs a watch and may not have one.
+    let mut needs_placing: Vec<PathBuf> = Vec::new();
+    let mut next_armed: Vec<ArmedTarget> = Vec::new();
+    for (target, _) in &desired {
+        let candidate = ArmedTarget::arming(target.clone(), ArmOrigin::Declared);
+        if let Some(standing) = armed
+            .iter()
+            .find(|entry| entry.is_declared() && entry.names_the_same_watch_as(&candidate))
+        {
+            // The RESOLUTION is carried as it stands — it was captured when the backend
+            // took the watch, and re-deriving it here would swap that fact for a fresh
+            // reading of a tree that may have moved since. The SPELLING is the declaration's
+            // (see [`ArmedTarget::under`]): the match was made on the resolution, so this is
+            // the same watch named a second way, and the name has to be the one the scope
+            // now accepts.
+            if standing.target().path != target.path {
+                // The record moves to the declaration's spelling while the registration it
+                // names stands under the one it came from, so the new spelling is marked for
+                // the defensive pass: the watch has to end up under the name the record now
+                // claims, not under one nothing will ever look for again.
+                needs_placing.push(target.path.clone());
+                // And the registration under the OLD spelling has to go — the backend is
+                // keyed by the path it was given, so left in place it would hold the dropped
+                // alias for the life of the process, and a run of alias swaps would pile up
+                // one per swap. Unless the declaration still NAMES that spelling: then
+                // another target in this same pass owns it, and unwatching here would take
+                // away exactly what that one placed.
+                if !desired.iter().any(|(other, _)| other.path == standing.target().path) {
+                    if let Err(error) = watcher.disarm(&standing.target().path) {
+                        tracing::debug!(root = ?standing.target().path, "workspace change hub unwatch of an alias the declaration dropped: {error}");
+                    }
+                }
+            }
+            next_armed.push(standing.under(target.clone()));
             continue;
         }
-        match watcher.arm(&target.path, target.mode()) {
+        // The spelling is held, but not by the same watch: a RETARGET, not an addition, and
+        // this is the last moment anything can name what it used to hold — the same path
+        // over a new object takes a new inotify descriptor while `notify` keys its own map
+        // by path and forgets the old one. Arming additions before removals exists to spare
+        // a subtree that is in BOTH sets an unwatched window, and a retarget is in neither:
+        // the tree it used to reach has left the set.
+        if armed.iter().any(|entry| entry.is_declared() && entry.target().path == target.path) {
+            if let Err(error) = watcher.disarm(&target.path) {
+                tracing::debug!(root = ?target.path, "workspace change hub unwatch of a root being retargeted: {error}");
+            }
+            retargeted.push(target.path.clone());
+        }
+        match watcher.arm(&candidate.target().path, candidate.target().mode()) {
             Ok(()) => {
                 tracing::info!(root = ?target.path, recursive = target.recursive, "workspace change hub watching root (re-arm)");
-                next_armed.push((target.clone(), canonical.clone()));
+                next_armed.push(candidate);
             }
             Err(error) => {
                 tracing::warn!(root = ?target.path, "workspace change hub failed to watch new root: {error}");
@@ -2448,38 +3534,130 @@ fn apply_rearm(
             }
         }
     }
-    for (target, canonical) in armed.iter() {
-        if !is_armed(&next_armed, target, canonical) {
-            if let Err(error) = watcher.disarm(&target.path) {
-                tracing::debug!(root = ?target.path, "workspace change hub unwatch on re-arm: {error}");
-            }
+    // Which DECLARED spellings were handed to `unwatch`, not merely which targets left.
+    // The backend is keyed by the path it was given, and one path can be both obsolete and
+    // kept at once: a symlinked root retargeted in place keeps its spelling while its
+    // resolution moves, so it enters the loop above as a new target (a different canonical)
+    // and this one as an obsolete entry (the old canonical) — and the unwatch here takes
+    // away the watch that was just armed. Whatever the re-arm policy below, such a target
+    // has to be armed again.
+    for entry in armed.iter().filter(|entry| entry.is_declared()) {
+        if retargeted.contains(&entry.target().path) {
+            continue;
         }
+        if !held(&next_armed, entry) {
+            if let Err(error) = watcher.disarm(&entry.target().path) {
+                tracing::debug!(root = ?entry.target().path, "workspace change hub unwatch on re-arm: {error}");
+            }
+            needs_placing.push(entry.target().path.clone());
+        }
+    }
+    // A watch no declaration names cannot be re-armed from a declared set, and nothing
+    // will name it again until an event happens to reveal the same door a second time —
+    // which a door that merely stands there never does. So taking it away alongside the
+    // obsolete targets would blind the subtree behind it for as long as the daemon runs.
+    // It is kept exactly while the NEW scope still walks the path it was armed on, the
+    // condition that put it there, and dropped the moment that stops holding, so the
+    // registration cannot outlive the topology that justified it either.
+    //
+    // Decided HERE, among the other unwatches and before the defensive pass below, not
+    // after it: a recursive unwatch strips descendant registrations on inotify, so a door
+    // dropped after the re-arm would take a kept target that lies behind it with it and
+    // leave `armed` claiming a root nothing watches.
+    let mut doors: Vec<ArmedTarget> = Vec::new();
+    for entry in armed.iter().filter(|entry| !entry.is_declared()) {
+        // A spelling the declaration now HOLDS is the declaration's: keeping the door
+        // beside it would leave two records over one registration. Read off `next_armed`
+        // and not off the desired set — a declared arm that failed placed nothing, and
+        // dropping the door on the strength of an intention would leave its registration
+        // standing with no record left to name it by.
+        if next_armed.iter().any(|held| held.target().path == entry.target().path) {
+            continue;
+        }
+        // Two questions, and the lexical one alone is not enough — see
+        // [`the_scope_still_reaches`], which also names the third question this deliberately
+        // does not ask and what asking it would cost.
+        if the_scope_still_reaches(&scope, entry) {
+            doors.push(entry.clone());
+            continue;
+        }
+        if let Err(error) = watcher.disarm(&entry.target().path) {
+            tracing::debug!(root = ?entry.target().path, "workspace change hub unwatch of a watch no declaration names: {error}");
+        }
+        needs_placing.push(entry.target().path.clone());
     }
     // Defensive re-arm of every kept target: on inotify a recursive unwatch of an
     // overlapping obsolete root strips descendant registrations, including a kept
-    // target's. Re-watching an already-watched path is idempotent.
+    // target's. Re-watching an already-watched path is idempotent there, and it restores
+    // exactly what the unwatch above may have taken away.
     //
     // A target that fails here is DROPPED, exactly as one that fails the first pass:
     // `armed` is what every later decision reads as "already covered", so leaving it
     // there would make the next request for the same set find coverage equal and answer
     // yes over a subtree nothing is watching. Dropping a target whose watch may in fact
     // still stand costs one retry; keeping one that does not costs the events.
-    let mut kept: Vec<(WatchTarget, PathBuf)> = Vec::with_capacity(next_armed.len());
-    for (target, canonical) in next_armed {
-        match watcher.arm(&target.path, target.mode()) {
-            Ok(()) => kept.push((target, canonical)),
+    let mut kept: Vec<ArmedTarget> = Vec::with_capacity(next_armed.len() + doors.len());
+    for entry in next_armed {
+        if !a_kept_target_must_be_re_armed() && !needs_placing.contains(&entry.target().path) {
+            kept.push(entry);
+            continue;
+        }
+        match watcher.arm(&entry.target().path, entry.target().mode()) {
+            Ok(()) => kept.push(entry),
             Err(error) => {
-                tracing::warn!(root = ?target.path, "workspace change hub lost a kept root on re-arm: {error}");
+                tracing::warn!(root = ?entry.target().path, "workspace change hub lost a kept root on re-arm: {error}");
                 full_coverage = false;
             }
         }
     }
+    // The surviving doors take the same defensive pass, because the unwatches above can
+    // have stripped them for the same reason they strip a kept root. A door that fails is
+    // DROPPED rather than kept on trust — `armed` is read as "already covered", and a
+    // record over a registration that is gone is how a whole linked subtree goes silent —
+    // but it does not deny COVERAGE: the declaration never asked for it, so its loss is
+    // not an answer to what the declaration asked.
+    for entry in doors {
+        if !a_kept_target_must_be_re_armed() && !needs_placing.contains(&entry.target().path) {
+            kept.push(entry);
+            continue;
+        }
+        // Was the registration this record names PROVABLY gone before the pass ran? Only
+        // where an unwatch takes what lies beneath it, and only when one of the paths handed
+        // to `unwatch` above is an ancestor of this one. Then a failed arm is not an open
+        // question: the record would name nothing, and no later pass would ever notice,
+        // because the door still leads where it did and the object behind it has not moved.
+        let stripped = an_unwatch_takes_what_lies_beneath_it()
+            && needs_placing.iter().any(|gone| entry.target().path.starts_with(gone));
+        if let Err(error) = watcher.arm(&entry.target().path, entry.target().mode()) {
+            if stripped {
+                tracing::warn!(root = ?entry.target().path, "workspace change hub lost a watch no declaration names and could not place it again: {error}");
+                continue;
+            }
+            // KEPT, unlike a declared target that fails the same pass. There the record is a
+            // claim of coverage, so holding one over a watch that may be gone would answer
+            // the next declaration yes over an unwatched subtree — and the blind set reports
+            // the loss and the retry puts it back. A door's record claims nothing and is
+            // reached by neither: it is the only handle anything has on the registration,
+            // and this pass is defensive, so the watch it names may well still stand.
+            // Dropping it would leave that registration with nothing able to name it again.
+            //
+            // What the record cannot do is say whether the subtree is still being watched,
+            // so that is reported instead — the same answer this module has always given
+            // for a watch it could not extend, and the only honest one when nothing can
+            // tell which way the arm failed.
+            inner.note_rewatch_failed(&entry.target().path, &error);
+        }
+        kept.push(entry);
+    }
     *armed = kept;
     inner.publish_watched_roots(armed);
 
-    let mut acc = inner.lock_acc();
-    acc.enter_rescan(false, DegradeReason::Rearmed);
-    drop(acc);
+    // Owed to whoever was listening across the swap, and under one hold of the lock, like
+    // every other Rearmed debt: a set re-pointed before any consumer exists has taken
+    // nothing from anyone, and a debt over an empty cursor set is one nobody can
+    // acknowledge — it would leave the hub calling itself degraded and hand the first
+    // subscriber a reconcile for a window it was never inside.
+    inner.lock_acc().enter_rescan_for_listeners(DegradeReason::Rearmed);
     inner.notify();
     full_coverage
 }
@@ -2591,6 +3769,19 @@ mod tests {
 
     fn entry_names(batch: &DrainBatch) -> Vec<String> {
         batch.entries.iter().map(|e| e.raw.to_string_lossy().into_owned()).collect()
+    }
+
+    /// A temporary directory named the way the file system resolves it.
+    ///
+    /// `tempfile` can hand back a path carrying an unresolved link component (macOS puts
+    /// temporaries under `/var`, a link to `/private/var`), and a backend that resolves
+    /// its watch path before arming then reports every event under a spelling the test
+    /// never wrote down. A test about DELIVERY has no business being sensitive to that;
+    /// the tests that ARE about spelling name both spellings themselves.
+    fn resolved_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap_or_else(|_| dir.path().to_path_buf());
+        (dir, path)
     }
 
     /// A workspace whose scan root is reached through a symlink, so the root can be
@@ -2806,7 +3997,11 @@ mod tests {
     /// re-watch failed must not sit in it: the failed call is reported once, and then the
     /// next request for the same set finds coverage equal and answers yes over a subtree
     /// nothing is watching.
-    #[cfg(unix)]
+    /// Gated off FSEvents, where the input cannot exist: there is no defensive pass to
+    /// lose a root in (see [`a_kept_target_must_be_re_armed`]), so a target that is
+    /// already armed and stays in the set is never asked to arm a second time and has no
+    /// second chance to fail. The first pass's own failure is covered wherever this runs.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_target_whose_defensive_watch_failed_is_not_claimed_as_covered() {
         let dir = tempdir().unwrap();
@@ -3046,7 +4241,11 @@ mod tests {
     /// pass, and it is the pass no arming loop reports: an implementation registering only
     /// the first would call the hub healthy the moment the re-arm's own reconcile window
     /// closed, over a root nothing watches.
-    #[cfg(unix)]
+    /// Gated off FSEvents, where the input cannot exist: there is no defensive pass to
+    /// lose a root in (see [`a_kept_target_must_be_re_armed`]), so a target that is
+    /// already armed and stays in the set is never asked to arm a second time and has no
+    /// second chance to fail. The first pass's own failure is covered wherever this runs.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_root_lost_in_the_defensive_pass_keeps_the_hub_unhealthy() {
         let dir = tempdir().unwrap();
@@ -3087,7 +4286,11 @@ mod tests {
     /// never unregistered the watch the first pass had already placed, so events under
     /// the root may well keep arriving — the hub's own record is what went wrong, and a
     /// retry restricted to roots that failed the FIRST pass would leave it wrong forever.
-    #[cfg(unix)]
+    /// Gated off FSEvents, where the input cannot exist: there is no defensive pass to
+    /// lose a root in (see [`a_kept_target_must_be_re_armed`]), so a target that is
+    /// already armed and stays in the set is never asked to arm a second time and has no
+    /// second chance to fail. The first pass's own failure is covered wherever this runs.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_root_lost_in_the_defensive_pass_is_armed_by_a_later_tick() {
         let dir = tempdir().unwrap();
@@ -3284,6 +4487,20 @@ mod tests {
         assert!(
             eventually(Duration::from_secs(10), || !entry_names(&hub.drain(cursor)).is_empty()),
             "a change under the only declared spelling must still be delivered"
+        );
+
+        // And the set has SETTLED on the spelling the declaration uses. A watch left named
+        // by the alias that was dropped reads as different from every later declaration of
+        // the same tree, so each one re-arms and charges every consumer a reconcile —
+        // coverage that looks agreed while nothing ever agrees. The declaration below adds
+        // back a target its recursive twin absorbs, so the cover does not move and nothing
+        // is owed unless the armed set is still named by the alias.
+        let settled = hub.drain(hub.subscribe()).cursor;
+        assert!(hub.ensure_roots(&[WatchTarget::recursive(second), WatchTarget::recursive(first),]));
+        assert!(hub.tick_now(Duration::from_secs(5)));
+        assert!(
+            !hub.drain(settled).rescan_required,
+            "a declaration whose cover is already in force must cost nothing",
         );
     }
 
@@ -3760,8 +4977,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn both_spellings_of_a_scan_root_are_in_scope() {
-        let dir = tempdir().unwrap();
-        let workspace = dir.path().to_path_buf();
+        // Resolved, so that the spelling this test calls canonical really is one: under an
+        // unresolved link component `real` is a THIRD spelling, neither declared nor
+        // canonical, and the case the test means to cover would never be reached.
+        let (_dir, workspace) = resolved_tempdir();
         let real = workspace.join("real");
         std::fs::create_dir_all(&real).unwrap();
         let link = workspace.join("link");
@@ -4455,7 +5674,6 @@ mod tests {
     /// the two happen to coincide; a symlinked root is the same defect, reproducible here.
     #[cfg(unix)]
     #[test]
-    #[cfg(unix)]
     fn the_excluded_root_is_recognised_under_either_spelling() {
         let real = tempdir().unwrap();
         let links = tempdir().unwrap();
@@ -4764,15 +5982,15 @@ mod tests {
     /// root), so drift in a disjoint extension tree is event-delivered, not left to a scan.
     #[test]
     fn watches_all_roots() {
-        let a = tempdir().unwrap();
-        let b = tempdir().unwrap();
-        let hub = WorkspaceChangeHub::start(vec![a.path().to_path_buf(), b.path().to_path_buf()]);
+        let (_a, a) = resolved_tempdir();
+        let (_b, b) = resolved_tempdir();
+        let hub = WorkspaceChangeHub::start(vec![a.clone(), b.clone()]);
         assert!(hub.wait_until_watching(Duration::from_secs(5)));
         let cursor = hub.subscribe();
 
         std::thread::sleep(Duration::from_millis(100));
         // A change in the SECOND root must be observed.
-        let file = b.path().join("Ext.bsl");
+        let file = b.join("Ext.bsl");
         std::fs::write(&file, "Процедура П()\nКонецПроцедуры").unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -4793,8 +6011,8 @@ mod tests {
     /// `dependsOn` edit would never be event-delivered to any consumer.
     #[test]
     fn watch_targets_cover_config_files_above_the_scan_roots() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
+        let (_dir, root) = resolved_tempdir();
+        let root = root.as_path();
         let source = root.join("src/cf");
         std::fs::create_dir_all(&source).unwrap();
         let toml = root.join("bsl-analyzer.toml");
@@ -4827,8 +6045,8 @@ mod tests {
     /// permanently kill a watch on the file itself.
     #[test]
     fn config_creation_and_atomic_replace_are_delivered_via_the_root_watch() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
+        let (_dir, root) = resolved_tempdir();
+        let root = root.as_path();
         let source = root.join("src/cf");
         std::fs::create_dir_all(&source).unwrap();
         // NO config file exists yet.
@@ -4867,18 +6085,15 @@ mod tests {
     /// event-delivered afterwards.
     #[test]
     fn rearm_extends_coverage_and_flags_cursors_to_rescan() {
-        let a = tempdir().unwrap();
-        let b = tempdir().unwrap();
-        let hub = WorkspaceChangeHub::start(vec![a.path().to_path_buf()]);
+        let (_a, a) = resolved_tempdir();
+        let (_b, b) = resolved_tempdir();
+        let hub = WorkspaceChangeHub::start(vec![a.clone()]);
         assert!(hub.wait_until_watching(Duration::from_secs(5)));
         let cursor = hub.subscribe();
 
         assert!(
             hub.rearm(
-                vec![
-                    WatchTarget::recursive(a.path().to_path_buf()),
-                    WatchTarget::recursive(b.path().to_path_buf()),
-                ],
+                vec![WatchTarget::recursive(a.clone()), WatchTarget::recursive(b.clone())],
                 Duration::from_secs(10)
             ),
             "the hub thread acknowledges the re-arm with full coverage"
@@ -4889,7 +6104,7 @@ mod tests {
         assert_eq!(hub.health(), Health::Healthy, "health recovers once cursors acknowledge");
 
         std::thread::sleep(Duration::from_millis(100));
-        let file = b.path().join("Новый.bsl");
+        let file = b.join("Новый.bsl");
         std::fs::write(&file, "Процедура П()\nКонецПроцедуры").unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -4918,6 +6133,54 @@ mod tests {
         let batch = hub.drain(cursor);
         assert!(!batch.rescan_required, "an unchanged root set must not force a rescan");
         assert_eq!(hub.health(), Health::Healthy);
+    }
+
+    /// A re-arm onto a set the watcher is ALREADY holding must not touch the watcher at
+    /// all on FSEvents, where an arm is a whole-stream swap: the stream is stopped,
+    /// rebuilt and restarted from "now", so everything that happens in the tree while
+    /// that is in flight is lost. A re-arm is asked for after every rebuild, which would
+    /// make that a scheduled blind window over an unchanged watch set.
+    ///
+    /// Counted through the refusal seam, which the hub consults on every arm and on
+    /// nothing else — `notify` reports no registration count of its own. The seam refuses
+    /// nothing here, so the count is the arms that were actually attempted.
+    ///
+    /// The control is the second half: a root that is NOT yet armed must still be armed by
+    /// the same re-arm, or the rule would read as "re-arms do nothing".
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_re_arm_does_not_touch_a_watch_the_backend_already_holds() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // Disjoint, not nested: a root under a recursive one is absorbed by the minimal
+        // cover and never reaches the watcher, so it could not be the control.
+        let elsewhere = tempdir().unwrap();
+        let second = elsewhere.path().canonicalize().unwrap();
+
+        let refusals = RefusedWatches::none();
+        let hub = WorkspaceChangeHub::start_targets_refusing(
+            vec![WatchTarget::recursive(root.clone())],
+            Duration::from_secs(3600),
+            &refusals,
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert_eq!(refusals.arms_of(&root), 1, "the initial arm is the one being counted");
+
+        refusals.forget_asks();
+        assert!(hub.rearm(vec![WatchTarget::recursive(root.clone())], Duration::from_secs(10)));
+        assert_eq!(
+            refusals.arms_of(&root),
+            0,
+            "a re-arm onto the live set rebuilt the stream over a watch already held",
+        );
+
+        refusals.forget_asks();
+        assert!(hub.rearm(
+            vec![WatchTarget::recursive(root.clone()), WatchTarget::recursive(second.clone())],
+            Duration::from_secs(10),
+        ));
+        assert_eq!(refusals.arms_of(&second), 1, "a root not yet armed must still be armed");
+        assert_eq!(refusals.arms_of(&root), 0, "and the one already held still must not be");
     }
 
     /// A re-arm that cannot watch one of the new roots reports partial coverage (the
@@ -5061,6 +6324,1348 @@ mod tests {
         drop(hub);
         let waited = started.elapsed();
         assert!(waited < STOP_BUDGET, "a stop with nothing left to stop is immediate: {waited:?}");
+    }
+
+    /// On FSEvents an arm is a whole-stream swap: the running stream is stopped and a
+    /// new one started from "now", and every change anywhere in the tree during the swap
+    /// is dropped for good. A directory that appeared under an armed recursive root is
+    /// already covered there, so arming it costs a blind window and buys nothing.
+    ///
+    /// The negative controls are the point: a directory OUTSIDE every armed root, and one
+    /// under a NON-recursive target (which covers only its direct children), still have to
+    /// be armed — a rule that refused those would go blind to whole subtrees instead.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_directory_already_inside_a_recursive_watch_is_not_re_armed() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let recursive = root.join("scan");
+        let config_dir = root.join("conf");
+        let outside = root.join("elsewhere");
+        let armed = vec![
+            ArmedTarget::arming(WatchTarget::recursive(recursive.clone()), ArmOrigin::Declared),
+            ArmedTarget::arming(
+                WatchTarget { path: config_dir.clone(), recursive: false },
+                ArmOrigin::Declared,
+            ),
+        ];
+
+        let needs_arming = |dir: &Path| {
+            watch_is_additive_and_needed(an_armed_recursive_target_covers(&armed, dir))
+        };
+
+        assert!(
+            !needs_arming(&recursive.join("CommonModules")),
+            "a directory the recursive root already covers must not restart the stream",
+        );
+        assert!(
+            needs_arming(&config_dir.join("sub")),
+            "a non-recursive target covers only its direct children, so this one needs arming",
+        );
+        assert!(
+            needs_arming(&outside.join("sub")),
+            "a directory no armed root covers needs arming",
+        );
+    }
+
+    /// A root declared through a symlink is armed under the DECLARED spelling while its
+    /// resolved one is what the watch captured, and the two callers hold different ones:
+    /// the blind set has only the declared spelling, an event arrives under whatever the
+    /// backend reports. A path written either way lies in the same place, so coverage has
+    /// to answer the same for both — reading one spelling alone would report a watched
+    /// subtree as blind on one caller and restart the stream for nothing on the other.
+    #[cfg(unix)]
+    #[test]
+    fn coverage_of_an_armed_root_is_read_in_both_spellings() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let real = root.join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let armed =
+            vec![ArmedTarget::arming(WatchTarget::recursive(link.clone()), ArmOrigin::Declared)];
+
+        assert!(
+            an_armed_recursive_target_covers(&armed, &link.join("sub")),
+            "the declared spelling missed",
+        );
+        assert!(
+            an_armed_recursive_target_covers(&armed, &real.join("sub")),
+            "the resolved spelling missed",
+        );
+        // A control, so the two above cannot be held by a predicate that covers everything.
+        assert!(
+            !an_armed_recursive_target_covers(&armed, &root.join("elsewhere").join("sub")),
+            "a directory outside the root was called covered",
+        );
+    }
+
+    /// A recursive watch covers a file-system SUBTREE, and neither backend follows a link
+    /// out of it. So a symlink created inside a watched root — a vendored dependency, a
+    /// shared common-module tree, a mount point — is a door into another tree, and nothing
+    /// behind it is watched however plainly the spelling reads as "inside". It needs a
+    /// watch of its own, and a coverage test decided lexically would suppress exactly that
+    /// one and leave the linked tree silent.
+    ///
+    /// Measured before it was written: with the root armed and the link not, a write in
+    /// the link's target is delivered only after the link itself is armed.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_subtree_is_not_covered_by_the_root_it_hangs_in() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let outside = tempdir().unwrap();
+        let outside = outside.path().canonicalize().unwrap();
+        let link = root.join("linked");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        std::fs::create_dir_all(root.join("plain")).unwrap();
+        let armed =
+            vec![ArmedTarget::arming(WatchTarget::recursive(root.clone()), ArmOrigin::Declared)];
+
+        assert!(
+            !an_armed_recursive_target_covers(&armed, &link),
+            "a door into another tree was called covered, so its watch is never armed",
+        );
+        // The control that keeps the rule from reading as "nothing under a root is
+        // covered": an ordinary directory created there is covered, which is the whole
+        // point of not re-arming on FSEvents.
+        assert!(
+            an_armed_recursive_target_covers(&armed, &root.join("plain")),
+            "an ordinary directory inside the root must stay covered",
+        );
+    }
+
+    /// A hub over `first`, with a door out of the watched tree already armed, and a second
+    /// declarable root beside it. The tree behind the door is what `arms_of` and the
+    /// unwatch log both key on, so a stand can watch the door's whole life through it.
+    #[cfg(unix)]
+    fn hub_with_a_door() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        WorkspaceChangeHub,
+        Arc<RefusedWatches>,
+    ) {
+        let (shared_dir, shared) = resolved_tempdir();
+        std::fs::write(shared.join("Shared.bsl"), "Процедура П() КонецПроцедуры").unwrap();
+        let (dir, root) = resolved_tempdir();
+        let (first, second) = (root.join("first"), root.join("second"));
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+
+        let refusals = RefusedWatches::none();
+        let hub = WorkspaceChangeHub::start_targets_refusing(
+            vec![WatchTarget::recursive(first.clone())],
+            Duration::from_secs(3600),
+            &refusals,
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        std::os::unix::fs::symlink(&shared, first.join("door")).unwrap();
+        assert!(
+            eventually(Duration::from_secs(10), || refusals.arms_of(&shared) >= 1),
+            "the door out of the watched tree is armed",
+        );
+        assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
+        refusals.forget_asks();
+        (shared_dir, dir, first, second, shared, hub, refusals)
+    }
+
+    #[cfg(unix)]
+    fn unwatched(refusals: &RefusedWatches, path: &Path) -> bool {
+        let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        refusals
+            .calls()
+            .iter()
+            .any(|(kind, called)| *kind == WatchCallKind::Disarm && *called == key)
+    }
+
+    /// One spelling keeps one record — but a declaration is never taken over by a door.
+    /// A declared root that is itself a link can be described by an event while its
+    /// recorded resolution is already stale, and the declared entries are the whole of what
+    /// a declaration is compared against: a set that had quietly demoted one would report
+    /// an armed root as unwatched, and publish it away from the roots it names.
+    #[test]
+    fn a_record_replaces_only_its_own_kind() {
+        let (_dir, root) = resolved_tempdir();
+        let door = root.join("door");
+        let mut armed =
+            vec![ArmedTarget::arming(WatchTarget::recursive(door.clone()), ArmOrigin::Declared)];
+
+        record_arm(
+            &mut armed,
+            ArmedTarget::arming(WatchTarget::recursive(door.clone()), ArmOrigin::Incidental),
+        );
+        assert!(
+            armed.iter().any(|entry| entry.is_declared()),
+            "a door took the place of the declaration that named the same path",
+        );
+
+        record_arm(
+            &mut armed,
+            ArmedTarget::arming(WatchTarget::recursive(door), ArmOrigin::Incidental),
+        );
+        assert_eq!(armed.len(), 2, "one spelling kept more than one record of a kind");
+    }
+
+    /// A watch armed because an event revealed a door out of the watched tree is a
+    /// registration the declaration does not name, and the set holds it for one reason: so
+    /// that a declaration which stops reaching it can take it away. Nothing else can — a
+    /// re-arm builds only from what is declared — so a registration left out of the set
+    /// outlives every topology that could justify it, for the life of the daemon.
+    #[cfg(unix)]
+    #[test]
+    fn a_watch_armed_by_an_event_goes_when_the_declaration_stops_reaching_it() {
+        let (_shared_dir, _dir, _first, second, shared, hub, refusals) = hub_with_a_door();
+
+        assert!(hub.ensure_roots(&[WatchTarget::recursive(second)]));
+
+        assert!(
+            unwatched(&refusals, &shared),
+            "the declaration stopped leading to the door and nothing dropped its watch: {:?}",
+            refusals.calls(),
+        );
+    }
+
+    /// A scope can narrow without the watch cover moving at all: a root declared inside an
+    /// excluded subtree is absorbed by its recursive ancestor and never reaches the cover,
+    /// while it does carve a hole back out of the exclusion. Dropping such a root leaves the
+    /// cover identical and the scope smaller — and a door inside what the scope has stopped
+    /// walking is a registration nothing else will ever hand to `unwatch`.
+    #[cfg(unix)]
+    #[test]
+    fn a_door_the_scope_stopped_walking_goes_even_when_the_cover_did_not_move() {
+        let (_shared_dir, shared) = resolved_tempdir();
+        std::fs::write(shared.join("Shared.bsl"), "Процедура П() КонецПроцедуры").unwrap();
+        let (_dir, workspace) = resolved_tempdir();
+        let cache = workspace.join("cache");
+        let extension = cache.join("ext");
+        std::fs::create_dir_all(&extension).unwrap();
+
+        let refusals = RefusedWatches::none();
+        let hub = WorkspaceChangeHub::start_seamed(
+            vec![
+                WatchTarget::recursive(workspace.clone()),
+                WatchTarget::recursive(extension.clone()),
+            ],
+            DEFAULT_CAPACITY,
+            Duration::from_secs(3600),
+            false,
+            None,
+            Some(refusals.as_refusal()),
+            vec![cache.clone()],
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        std::os::unix::fs::symlink(&shared, extension.join("door")).unwrap();
+        assert!(
+            eventually(Duration::from_secs(10), || refusals.arms_of(&shared) >= 1),
+            "a door inside the carved-out root is armed",
+        );
+        assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
+        refusals.forget_asks();
+
+        let cursor = hub.drain(hub.subscribe()).cursor;
+        assert!(hub.ensure_roots(&[WatchTarget::recursive(workspace)]));
+        assert!(hub.tick_now(Duration::from_secs(10)), "the declaration is applied");
+
+        assert!(
+            unwatched(&refusals, &shared),
+            "the scope stopped walking the door and its watch was left standing: {:?}",
+            refusals.calls(),
+        );
+        assert!(
+            hub.materialize(cursor).rescan_required,
+            "a registration was taken away, and on a backend that strips descendants with \
+             it whatever lay beneath was taken and put back — a window nobody was told of",
+        );
+    }
+
+    /// The point stream and the walk have to describe ONE file universe. A link named one
+    /// thing onto a file named another resolves to a key the scan of the TARGET's root does
+    /// list, and no walk of this root ever produces it — so delivering it reports a file
+    /// from outside the workspace as drift inside it.
+    #[cfg(unix)]
+    #[test]
+    fn a_point_event_on_a_role_mismatched_link_carries_nothing() {
+        let (_dir, base) = resolved_tempdir();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("Target.bsl");
+        std::fs::write(&target, "Процедура П() КонецПроцедуры").unwrap();
+        std::os::unix::fs::symlink(&target, base.join("Alias.txt")).unwrap();
+        std::os::unix::fs::symlink(&target, base.join("Agreed.bsl")).unwrap();
+
+        assert!(
+            classify_path(&base.join("Alias.txt")).is_none(),
+            "a link whose name and target disagree on role was taken into drift",
+        );
+        // The control, so this cannot read as "links are never taken".
+        assert_eq!(
+            classify_path(&base.join("Agreed.bsl")),
+            Some((target, ChangeKind::MaybeChanged)),
+            "a link both spellings agree about must be delivered, resolved",
+        );
+    }
+
+    /// Every raise is its own window. Two in a row carry the same reason, so a shared
+    /// counter left still would let a batch taken against the first still look current —
+    /// and a sink already waiting on it would sleep out its whole timeout over a loss it
+    /// has just been handed.
+    #[test]
+    fn a_second_window_moves_the_generation_a_sink_waits_on() {
+        let mut acc = Accumulator::new(8);
+        let id = acc.subscribe(None);
+
+        acc.enter_rescan(false, DegradeReason::Rearmed);
+        let taken = acc.materialize(id);
+        let before = acc.generation;
+
+        assert!(acc.enter_rescan_for_listeners(DegradeReason::Rearmed), "a second window opens");
+        assert!(acc.generation > before, "a sink waiting on the generation was not woken");
+
+        acc.acknowledge(&taken);
+        assert!(
+            acc.materialize(id).rescan_required,
+            "the second window was cleared by an acknowledgement taken against the first",
+        );
+    }
+
+    /// A declared root re-named to an equivalent spelling — another link to the same
+    /// directory — leaves every door under it physically where it was. Judged on the
+    /// dropped spelling alone a door goes with the alias, and nothing will name it again: a
+    /// re-arm builds only from what is declared, and a link that merely stands there fires
+    /// no event.
+    ///
+    /// Asked of the predicate rather than through a hub, because the spelling a door is
+    /// recorded under is the backend's: FSEvents reports physical paths, so a door there is
+    /// already recorded as `real/door` and the question never arises; inotify reports under
+    /// the path it was given, which is where it does.
+    #[cfg(unix)]
+    #[test]
+    fn a_door_is_in_scope_by_where_it_lies_not_only_by_how_it_is_spelled() {
+        let (_shared_dir, shared) = resolved_tempdir();
+        let (_dir, base) = resolved_tempdir();
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let (first, second) = (base.join("first"), base.join("second"));
+        std::os::unix::fs::symlink(&real, &first).unwrap();
+        std::os::unix::fs::symlink(&real, &second).unwrap();
+        std::os::unix::fs::symlink(&shared, real.join("door")).unwrap();
+
+        let door =
+            ArmedTarget::arming(WatchTarget::recursive(first.join("door")), ArmOrigin::Incidental);
+        let scope =
+            Scope::from_targets_for_test(&ResolvedTargets::here(vec![WatchTarget::recursive(
+                second.clone(),
+            )]));
+
+        assert!(
+            the_scope_still_reaches(&scope, &door),
+            "the root was re-declared by an equivalent spelling and the door under it stops \
+             counting as reached, though it stands exactly where it did",
+        );
+        // The control: a door under a root the declaration really dropped is not reached.
+        let elsewhere =
+            Scope::from_targets_for_test(&ResolvedTargets::here(vec![WatchTarget::recursive(
+                base.join("nowhere"),
+            )]));
+        assert!(
+            !the_scope_still_reaches(&elsewhere, &door),
+            "a door no declared root leads to must not count as reached",
+        );
+    }
+
+    /// A record carried onto the declaration's spelling still names a registration standing
+    /// under the one it came from, and anything in the same pass may unwatch that one. On a
+    /// backend without an unconditional defensive pass, only being marked as unwatched gets
+    /// it armed under the name it now claims — otherwise the set names a tree nothing
+    /// watches, and says so to every later declaration.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_record_carried_to_another_spelling_is_armed_under_the_one_it_now_names() {
+        let (_dir, base) = resolved_tempdir();
+        let (real_one, real_two) = (base.join("real1"), base.join("real2"));
+        std::fs::create_dir(&real_one).unwrap();
+        std::fs::create_dir(&real_two).unwrap();
+        let root = base.join("root");
+        std::os::unix::fs::symlink(&real_one, &root).unwrap();
+
+        let refusals = RefusedWatches::none();
+        let hub = WorkspaceChangeHub::start_targets_refusing(
+            vec![WatchTarget::recursive(root.clone())],
+            Duration::from_secs(3600),
+            &refusals,
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        // The root moves to another tree while a second spelling takes over the first.
+        std::fs::remove_file(&root).unwrap();
+        std::os::unix::fs::symlink(&real_two, &root).unwrap();
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&real_one, &alias).unwrap();
+        refusals.forget_asks();
+
+        assert!(hub.ensure_roots(&[WatchTarget::recursive(root), WatchTarget::recursive(alias),]));
+        assert!(
+            refusals.arms_of(&real_one) >= 1,
+            "the tree the surviving record names was left to nobody: {:?}",
+            refusals.calls(),
+        );
+    }
+
+    /// A record carried onto another spelling of the same directory leaves a registration
+    /// standing under the one it came from. The backend is keyed by the path it was given,
+    /// so that one has to go: left in place it holds the dropped alias for the life of the
+    /// process, and a run of alias swaps piles up one registration per swap — and after the
+    /// record has moved, nothing names the old one any more.
+    #[cfg(unix)]
+    #[test]
+    fn an_alias_the_declaration_dropped_does_not_keep_its_registration() {
+        let (_dir, base) = resolved_tempdir();
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let (first, second) = (base.join("first"), base.join("second"));
+        std::os::unix::fs::symlink(&real, &first).unwrap();
+        std::os::unix::fs::symlink(&real, &second).unwrap();
+
+        let refusals = RefusedWatches::none();
+        let hub = WorkspaceChangeHub::start_targets_refusing(
+            vec![WatchTarget::recursive(first)],
+            Duration::from_secs(3600),
+            &refusals,
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        refusals.forget_asks();
+
+        assert!(hub.ensure_roots(&[WatchTarget::recursive(second)]));
+        assert!(hub.tick_now(Duration::from_secs(10)), "the declaration is applied");
+
+        let calls = refusals.calls();
+        assert!(
+            calls.iter().any(|(kind, _)| *kind == WatchCallKind::Disarm),
+            "the alias the declaration dropped kept its registration: {calls:?}",
+        );
+    }
+
+    /// A door whose target steps aside for a moment — a rebuild renaming a directory and
+    /// putting it back — is not a door that has gone. Dropping its record there destroys the
+    /// only thing able to re-point it: the link itself never changed, so no event will ever
+    /// describe it again, and no declaration names it.
+    #[cfg(unix)]
+    #[test]
+    fn a_door_whose_target_stepped_aside_survives_a_re_arm() {
+        let (_shared_dir, shared) = resolved_tempdir();
+        let slot = shared.join("current");
+        std::fs::create_dir(&slot).unwrap();
+        let (_dir, root) = resolved_tempdir();
+        let (first, second) = (root.join("first"), root.join("second"));
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+
+        let refusals = RefusedWatches::none();
+        let hub = WorkspaceChangeHub::start_targets_refusing(
+            vec![WatchTarget::recursive(first.clone())],
+            Duration::from_secs(3600),
+            &refusals,
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        std::os::unix::fs::symlink(&slot, first.join("door")).unwrap();
+        assert!(
+            eventually(Duration::from_secs(10), || refusals.arms_of(&slot) >= 1),
+            "the door is armed",
+        );
+        assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
+
+        // A declaration arrives while the target is away, and the target comes back.
+        std::fs::rename(&slot, shared.join("previous")).unwrap();
+        assert!(hub.ensure_roots(&[
+            WatchTarget::recursive(first),
+            WatchTarget::recursive(second.clone()),
+        ]));
+        std::fs::rename(shared.join("previous"), &slot).unwrap();
+        refusals.forget_asks();
+
+        // The record has to have survived, and the one observable of that is the only thing
+        // a record is for: a declaration that stops reaching the door can still drop it.
+        assert!(hub.ensure_roots(&[WatchTarget::recursive(second)]));
+        assert!(
+            unwatched(&refusals, &slot),
+            "the record was thrown away while the target was away, so nothing was left able \
+             to name the registration afterwards: {:?}",
+            refusals.calls(),
+        );
+    }
+
+    /// A cursor that arrives while blindness is being published is not a clean one. The
+    /// standing blind set and the cursors live under two locks, taken in that order so
+    /// neither path holds one while asking for the other, and a subscription can land in the
+    /// gap — after the hub thread flagged everybody it could see, before this cursor
+    /// existed. It is flagged after the fact, and alone: whoever was there already has the
+    /// window.
+    #[test]
+    fn a_cursor_that_arrived_in_the_gap_is_flagged_alone() {
+        let mut acc = Accumulator::new(8);
+        let early = acc.subscribe(None);
+        let late = acc.subscribe(None);
+
+        acc.force_rescan(late, DegradeReason::RewatchFailed);
+
+        assert!(acc.materialize(late).rescan_required, "the cursor that arrived in the gap");
+        assert!(
+            !acc.materialize(early).rescan_required,
+            "nobody else is owed anything: the window, if there was one, found them",
+        );
+    }
+
+    /// That nobody is here to be owed a new window says nothing about a reason recorded
+    /// earlier. `health` reports the hub's condition to a status caller, and an unrelated
+    /// operation that owes nothing must not answer for it.
+    #[test]
+    fn a_window_nobody_can_be_owed_does_not_erase_the_reason_before_it() {
+        let mut acc = Accumulator::new(8);
+        acc.enter_rescan(false, DegradeReason::RuntimeError);
+
+        assert!(
+            !acc.enter_rescan_for_listeners(DegradeReason::Rearmed),
+            "with no cursor there is nobody to owe a window to",
+        );
+        assert_eq!(
+            acc.health(),
+            Health::Degraded(DegradeReason::RuntimeError),
+            "the reason recorded before it was erased by an operation that owed nothing",
+        );
+    }
+
+    /// A DECLARED target names an object too. A directory removed and recreated under one
+    /// absolute path resolves identically, so a re-arm matching on the path alone carries
+    /// the old record forward and leaves the backend watching what is gone — on the very
+    /// pass the periodic check reached because it had already seen the object change.
+    #[cfg(unix)]
+    #[test]
+    fn a_declared_directory_recreated_under_one_name_is_re_armed() {
+        let (_dir, base) = resolved_tempdir();
+        let root = base.join("root");
+        std::fs::create_dir(&root).unwrap();
+
+        let refusals = RefusedWatches::none();
+        let hub = WorkspaceChangeHub::start_targets_refusing(
+            vec![WatchTarget::recursive(root.clone())],
+            Duration::from_secs(3600),
+            &refusals,
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        refusals.forget_asks();
+
+        std::fs::rename(&root, base.join("previous")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        assert!(hub.tick_now(Duration::from_secs(10)), "the periodic check reads the root");
+
+        let calls = refusals.calls();
+        assert!(
+            calls.iter().any(|(kind, _)| *kind == WatchCallKind::Disarm)
+                && calls.iter().any(|(kind, _)| *kind == WatchCallKind::Arm),
+            "the watch stayed on the directory that is gone: {calls:?}",
+        );
+    }
+
+    /// A check that reads one obstacle must not answer for another. The declared set being
+    /// fully watched says nothing about a stream that was lost — and with no consumer there
+    /// to acknowledge anything, the two would otherwise be closed together, erasing a loss
+    /// nobody has read from the report that is the only place it appears.
+    #[test]
+    fn an_empty_blind_set_does_not_close_a_reason_it_never_read() {
+        let (_dir, root) = resolved_tempdir();
+        let hub = WorkspaceChangeHub::start_targets_with_period(
+            vec![WatchTarget::recursive(root)],
+            Duration::from_secs(3600),
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        hub.ingest_for_test(Err(notify::Error::generic("the stream is gone")));
+        assert_eq!(hub.health(), Health::Degraded(DegradeReason::RuntimeError));
+
+        assert!(hub.tick_now(Duration::from_secs(10)), "the periodic check runs");
+        assert_eq!(
+            hub.health(),
+            Health::Degraded(DegradeReason::RuntimeError),
+            "a check that never read the lost stream closed the report of it",
+        );
+    }
+
+    /// A `NotFound` on a nested spelling proves only that something on the way is missing.
+    /// An ancestor whose target steps aside for a moment answers exactly that, and forgetting
+    /// the record there destroys the only thing able to re-point the door once the way back
+    /// opens — nothing else names it, and the link itself never changed.
+    #[cfg(unix)]
+    #[test]
+    fn a_door_is_not_forgotten_because_the_way_to_it_was_briefly_shut() {
+        let (_outer_dir, outer_target) = resolved_tempdir();
+        let (_dir, root) = resolved_tempdir();
+        let slot = root.join("slot");
+        std::fs::rename(&outer_target, &slot).unwrap();
+        let (_inner_dir, inner_target) = resolved_tempdir();
+
+        let refusals = RefusedWatches::none();
+        let hub = WorkspaceChangeHub::start_targets_refusing(
+            vec![WatchTarget::recursive(root.clone())],
+            Duration::from_secs(3600),
+            &refusals,
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        std::os::unix::fs::symlink(&slot, root.join("outer")).unwrap();
+        std::os::unix::fs::symlink(&inner_target, slot.join("inner")).unwrap();
+        assert!(
+            eventually(Duration::from_secs(10), || refusals.arms_of(&inner_target) >= 1),
+            "the door behind the outer link is armed",
+        );
+        assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
+
+        // The way to it is shut for a moment and opened again. Nothing about the door itself
+        // changed, so nothing will ever describe it again.
+        let aside = root.join("aside");
+        std::fs::rename(&slot, &aside).unwrap();
+        assert!(hub.tick_now(Duration::from_secs(10)), "a check lands while the way is shut");
+        std::fs::rename(&aside, &slot).unwrap();
+        refusals.forget_asks();
+
+        // Only a record can notice this: the door is re-pointed with no event to say so.
+        let (_moved_dir, moved_to) = resolved_tempdir();
+        std::fs::remove_file(slot.join("inner")).unwrap();
+        std::os::unix::fs::symlink(&moved_to, slot.join("inner")).unwrap();
+        assert!(hub.tick_now(Duration::from_secs(10)), "the check reads the doors again");
+        assert!(
+            refusals.arms_of(&moved_to) >= 1,
+            "the record was thrown away while the way to it was shut: {:?}",
+            refusals.calls(),
+        );
+    }
+
+    /// `RewatchFailed` has two producers, and the blind set is only one of them. A watch this
+    /// module could not extend over a subtree an event revealed is a different obstacle, and
+    /// a check that never read it must not close the only report of it.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_arm_over_a_revealed_subtree_is_not_closed_by_the_blind_check() {
+        let (_shared_dir, shared) = resolved_tempdir();
+        let (_dir, root) = resolved_tempdir();
+
+        let refusals = RefusedWatches::refusing(vec![shared.clone()]);
+        let hub = WorkspaceChangeHub::start_targets_refusing(
+            vec![WatchTarget::recursive(root.clone())],
+            Duration::from_secs(3600),
+            &refusals,
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        std::os::unix::fs::symlink(&shared, root.join("door")).unwrap();
+        assert!(
+            eventually(Duration::from_secs(10), || {
+                hub.health() == Health::Degraded(DegradeReason::RewatchFailed)
+            }),
+            "the arm over the revealed subtree failed and was reported",
+        );
+
+        assert!(hub.tick_now(Duration::from_secs(10)), "the periodic check runs");
+        assert_eq!(
+            hub.health(),
+            Health::Degraded(DegradeReason::RewatchFailed),
+            "a check that read only the declared set closed the report of a subtree it \
+             never looked at",
+        );
+    }
+
+    /// A door that leads nowhere a watch can be placed — a dangling link, or one now
+    /// pointing at a file — still holds the registration it was armed with, and that
+    /// registration goes on delivering for a tree the door has stopped reaching. Every one
+    /// of those events arrives spelled as though it were still inside the workspace.
+    #[cfg(unix)]
+    #[test]
+    fn a_door_that_leads_nowhere_loses_the_registration_it_held() {
+        let (_shared_dir, _dir, first, _second, shared, hub, refusals) = hub_with_a_door();
+        let door = first.join("door");
+
+        std::fs::remove_file(&door).unwrap();
+        std::os::unix::fs::symlink(shared.join("never-was"), &door).unwrap();
+        assert!(hub.tick_now(Duration::from_secs(10)), "the periodic check reads the doors");
+
+        // Named by the DOOR: the link no longer resolves, so that is the only key the
+        // watcher was given and the only one it is logged under.
+        assert!(
+            unwatched(&refusals, &door),
+            "the door leads nowhere and the watch it held on the old tree was left \
+             standing: {:?}",
+            refusals.calls(),
+        );
+    }
+
+    /// A record names an OBJECT, not only a spelling. A directory removed and recreated
+    /// under one name leaves the registration on the one that is gone while the door still
+    /// reads as leading exactly where it did — and nothing else in the module would ever
+    /// notice, because the link itself never changed and fires no event.
+    #[cfg(unix)]
+    #[test]
+    fn a_door_whose_target_was_recreated_under_one_name_is_re_pointed() {
+        let (_shared_dir, shared) = resolved_tempdir();
+        let slot = shared.join("current");
+        std::fs::create_dir(&slot).unwrap();
+        let (_dir, root) = resolved_tempdir();
+
+        let refusals = RefusedWatches::none();
+        let hub = WorkspaceChangeHub::start_targets_refusing(
+            vec![WatchTarget::recursive(root.clone())],
+            Duration::from_secs(3600),
+            &refusals,
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        std::os::unix::fs::symlink(&slot, root.join("door")).unwrap();
+        assert!(
+            eventually(Duration::from_secs(10), || refusals.arms_of(&slot) >= 1),
+            "the door is armed on the directory the slot holds now",
+        );
+        assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
+
+        // Same name, different directory — and the link is untouched, so nothing says so.
+        std::fs::rename(&slot, shared.join("previous")).unwrap();
+        std::fs::create_dir(&slot).unwrap();
+        refusals.forget_asks();
+
+        assert!(hub.tick_now(Duration::from_secs(10)), "the periodic check reads the door");
+        assert!(
+            refusals.arms_of(&slot) >= 1,
+            "the registration stayed on the directory that is gone: {:?}",
+            refusals.calls(),
+        );
+    }
+
+    /// A window raised before anyone subscribed is not INHERITED by whoever comes next: a
+    /// cursor takes its debt from the blind set alone, never from the transient reason. The
+    /// reason itself stands, because `health` reports the hub's condition to a status
+    /// caller whether or not a consumer exists to be owed anything.
+    #[test]
+    fn a_window_raised_before_the_first_cursor_is_not_handed_to_it() {
+        let mut acc = Accumulator::new(8);
+        acc.enter_rescan(false, DegradeReason::RuntimeError);
+        let id = acc.subscribe(None);
+        assert!(
+            !acc.materialize(id).rescan_required,
+            "a consumer that arrived after the window was handed the window",
+        );
+    }
+
+    /// A window nobody can be owed is a window that is over. With no cursor to acknowledge
+    /// it, a reconcile raised before a full recovery would outlive that recovery and be
+    /// handed to the first consumer to subscribe — for a window that ended before it
+    /// arrived.
+    #[cfg(unix)]
+    #[test]
+    fn a_recovery_with_nobody_listening_leaves_no_window_behind() {
+        let (_dir, _a, b, hub, refusals) = partly_blind_hub();
+        assert_eq!(
+            hub.health(),
+            Health::Degraded(DegradeReason::RewatchFailed),
+            "the refused root is the obstacle the stand starts from",
+        );
+
+        refusals.allow(&b);
+        assert!(hub.tick_now(Duration::from_secs(10)), "the retry arms it");
+
+        assert_eq!(hub.health(), Health::Healthy, "the obstacle is gone and so is the window");
+        let newcomer = hub.subscribe();
+        assert!(
+            !hub.materialize(newcomer).rescan_required,
+            "a consumer that arrived after the recovery inherited the window it closed",
+        );
+    }
+
+    /// A door is reached only through its own spelling, so once the link is gone nothing
+    /// will ever deliver an event under it again — and the registration it left behind is
+    /// one only the periodic check can still name. Waiting for a declaration to arrive
+    /// leaves it standing indefinitely, and every door created and removed since adds
+    /// another.
+    #[cfg(unix)]
+    #[test]
+    fn a_door_removed_from_disk_is_dropped_by_the_periodic_check() {
+        let (_shared_dir, _dir, first, _second, _shared, hub, refusals) = hub_with_a_door();
+        let door = first.join("door");
+
+        std::fs::remove_file(&door).unwrap();
+        assert!(hub.tick_now(Duration::from_secs(10)), "the periodic check runs");
+
+        // Named by the DOOR, not by the tree it led to: the spelling no longer resolves, so
+        // that is the only key the watcher was given and the only one it is logged under.
+        assert!(
+            unwatched(&refusals, &door),
+            "the door is gone from disk and its watch was left standing, with nothing able \
+             to name it again: {:?}",
+            refusals.calls(),
+        );
+    }
+
+    /// A declared root that is itself a link is re-pointed the same way a door is, and an
+    /// event describes it long before the periodic check re-reads its fingerprint. The
+    /// event branch leaves it alone all the same: re-pointing a declared target is the
+    /// check's work and it does the whole of it — the old registration dropped before the
+    /// new one is placed, the record corrected, the defensive pass, the debt — where doing
+    /// half of it from an event leaves a door's record beside a declared one that still
+    /// names the tree it used to reach, and the check then pays for the swap a second time.
+    /// What waiting costs is bounded by the period, which is the bound this module already
+    /// accepts for a root re-pointed in place.
+    #[cfg(unix)]
+    #[test]
+    fn a_declared_link_re_pointed_at_runtime_is_left_to_the_periodic_check() {
+        let (_old_dir, old) = resolved_tempdir();
+        let (_new_dir, new) = resolved_tempdir();
+        std::fs::write(new.join("Moved.bsl"), "Процедура П() КонецПроцедуры").unwrap();
+        let (_dir, workspace) = resolved_tempdir();
+        let extension = workspace.join("ext");
+        std::os::unix::fs::symlink(&old, &extension).unwrap();
+
+        let refusals = RefusedWatches::none();
+        let hub = WorkspaceChangeHub::start_targets_refusing(
+            vec![
+                WatchTarget::recursive(workspace.clone()),
+                WatchTarget::recursive(extension.clone()),
+            ],
+            Duration::from_secs(3600),
+            &refusals,
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        let mut cursor = hub.subscribe();
+        refusals.forget_asks();
+
+        std::fs::remove_file(&extension).unwrap();
+        std::os::unix::fs::symlink(&new, &extension).unwrap();
+        assert!(
+            eventually(Duration::from_secs(10), || {
+                let batch = hub.drain(cursor);
+                cursor = batch.cursor;
+                batch.entries.iter().any(|entry| entry.raw.to_string_lossy().contains("Moved"))
+            }),
+            "the hub saw the re-pointed root",
+        );
+        assert!(hub.tick_now(Duration::from_secs(10)), "and handled the message carrying it");
+
+        // ONE unwatch over the whole window: the event left the spelling alone and the
+        // check re-pointed it once. Two is the event branch having done half the work and
+        // the check having paid for the swap all over again.
+        //
+        // Counted on the unwatches and not on the arms, because how many arms a re-point
+        // costs is platform-dependent by design here: off macOS the defensive pass arms
+        // every kept target again after the unwatches, so a two-target declaration is three
+        // arms for one re-point. The unwatch count is one on every backend.
+        let calls = refusals.calls();
+        assert_eq!(
+            calls.iter().filter(|(kind, _)| *kind == WatchCallKind::Disarm).count(),
+            1,
+            "one re-point is one unwatch: {calls:?}",
+        );
+        let first_arm = calls.iter().position(|(kind, _)| *kind == WatchCallKind::Arm);
+        let first_drop = calls.iter().position(|(kind, _)| *kind == WatchCallKind::Disarm);
+        assert!(
+            matches!((first_drop, first_arm), (Some(drop), Some(arm)) if drop < arm),
+            "the old registration was left standing under the same spelling: {calls:?}",
+        );
+    }
+
+    /// Whether the tree a door now leads to happens to be watched already says nothing about
+    /// the registration the door used to hold. Deciding the arm first and the replacement
+    /// second lets a door re-pointed INTO a covered tree keep its old registration on the
+    /// outside one, which no event and no pass would ever name again.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_door_re_pointed_into_a_covered_tree_still_drops_what_it_held() {
+        let (_shared_dir, _dir, first, _second, _shared, hub, refusals) = hub_with_a_door();
+        let inside = first.join("inside");
+        std::fs::create_dir(&inside).unwrap();
+        let door = first.join("door");
+        let cursor = hub.drain(hub.subscribe()).cursor;
+        assert!(!hub.materialize(cursor).rescan_required, "the stand starts level");
+
+        std::fs::remove_file(&door).unwrap();
+        std::os::unix::fs::symlink(&inside, &door).unwrap();
+        // No tick as a barrier: the periodic check re-points a moved door itself, and its
+        // own debt would stand in for the one this stand is about.
+        assert!(
+            eventually(Duration::from_secs(10), || unwatched(&refusals, &inside)),
+            "the door now leads inside the watched tree, and the watch it held on the tree \
+             outside was left standing: {:?}",
+            refusals.calls(),
+        );
+        // And the window that unwatch cost is owed. Whether a NEW watch is worth placing is
+        // a later question — here the answer is no, because the tree is already covered —
+        // and the debt must not ride on it.
+        assert!(
+            eventually(Duration::from_secs(10), || hub.materialize(cursor).rescan_required),
+            "the unwatch restarted the stream and nobody was told",
+        );
+    }
+
+    /// A replacement whose new arm fails has already dropped the old registration, and the
+    /// record is what is left to try again from. Nothing else can: no declaration names a
+    /// door, and a link that merely stands there fires no event — so a record thrown away on
+    /// a transient refusal costs the subtree behind the door for the life of the daemon.
+    /// Kept, it is stale by design, and staleness is exactly what the periodic check reads
+    /// to know there is something to re-point.
+    #[cfg(unix)]
+    #[test]
+    fn a_door_whose_replacement_failed_is_tried_again() {
+        let (_shared_dir, _dir, first, _second, _shared, hub, refusals) = hub_with_a_door();
+        let (_new_dir, moved_to) = resolved_tempdir();
+        std::fs::write(moved_to.join("Moved.bsl"), "Процедура П() КонецПроцедуры").unwrap();
+        let door = first.join("door");
+
+        refusals.refuse(&moved_to);
+        std::fs::remove_file(&door).unwrap();
+        std::os::unix::fs::symlink(&moved_to, &door).unwrap();
+        assert!(
+            eventually(Duration::from_secs(10), || refusals.arms_of(&moved_to) >= 1),
+            "the hub tried to arm the door where it leads now, and was refused",
+        );
+        assert!(hub.tick_now(Duration::from_secs(10)), "the attempt is over");
+
+        refusals.allow(&moved_to);
+        refusals.forget_asks();
+        assert!(hub.tick_now(Duration::from_secs(10)), "the periodic check tries again");
+
+        assert!(
+            refusals.arms_of(&moved_to) >= 1,
+            "the obstacle cleared and nothing tried the door again: {:?}",
+            refusals.calls(),
+        );
+    }
+
+    /// A DECLARED spelling re-pointed at another directory is a retarget, not an addition,
+    /// and the old registration has to go before the new one is taken. The kernel keys a
+    /// watch by inode, so the same path over a new target takes a new descriptor while
+    /// `notify` keys its map by path and forgets the old one — after which nothing can name
+    /// it. Arming additions before removals is for a subtree that is in BOTH sets; the tree
+    /// a retarget left is in neither.
+    #[cfg(unix)]
+    #[test]
+    fn a_declared_retarget_drops_the_registration_it_replaces() {
+        let (_dir, base) = resolved_tempdir();
+        let (old, new) = (base.join("old"), base.join("new"));
+        std::fs::create_dir(&old).unwrap();
+        std::fs::create_dir(&new).unwrap();
+        let root = base.join("root");
+        std::os::unix::fs::symlink(&old, &root).unwrap();
+
+        let refusals = RefusedWatches::none();
+        let hub = WorkspaceChangeHub::start_targets_refusing(
+            vec![WatchTarget::recursive(root.clone())],
+            Duration::from_secs(3600),
+            &refusals,
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        refusals.forget_asks();
+
+        std::fs::remove_file(&root).unwrap();
+        std::os::unix::fs::symlink(&new, &root).unwrap();
+        assert!(hub.tick_now(Duration::from_secs(10)), "the periodic check sees the retarget");
+
+        let calls = refusals.calls();
+        let first_arm = calls.iter().position(|(kind, _)| *kind == WatchCallKind::Arm);
+        let first_drop = calls.iter().position(|(kind, _)| *kind == WatchCallKind::Disarm);
+        assert!(
+            matches!((first_drop, first_arm), (Some(drop), Some(arm)) if drop < arm),
+            "the root was armed on its new target before the watch on the old one was \
+             dropped, so nothing can name that one again: {calls:?}",
+        );
+        assert_eq!(
+            calls.iter().filter(|(kind, _)| *kind == WatchCallKind::Disarm).count(),
+            1,
+            "one retarget is one unwatch: a second, after the new registration is in place, \
+             takes away exactly what the first made room for: {calls:?}",
+        );
+    }
+
+    /// The restore that follows a dropped door answers a failure the way the same pass does
+    /// in a re-arm: by DROPPING the record. A record is read as "already covered", so one
+    /// left over a watch that may be gone keeps the blind set silent and the retry away for
+    /// ever — the hub would call itself healthy over a declared root nothing watches.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_root_lost_while_restoring_it_is_reported_and_retried() {
+        let (_shared_dir, shared) = resolved_tempdir();
+        std::fs::write(shared.join("Shared.bsl"), "Процедура П() КонецПроцедуры").unwrap();
+        let (_dir, workspace) = resolved_tempdir();
+        let cache = workspace.join("cache");
+        let extension = cache.join("ext");
+        std::fs::create_dir_all(&extension).unwrap();
+
+        let refusals = RefusedWatches::none();
+        let hub = WorkspaceChangeHub::start_seamed(
+            vec![
+                WatchTarget::recursive(workspace.clone()),
+                WatchTarget::recursive(extension.clone()),
+            ],
+            DEFAULT_CAPACITY,
+            Duration::from_secs(3600),
+            false,
+            None,
+            Some(refusals.as_refusal()),
+            vec![cache.clone()],
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        std::os::unix::fs::symlink(&shared, extension.join("door")).unwrap();
+        assert!(
+            eventually(Duration::from_secs(10), || refusals.arms_of(&shared) >= 1),
+            "a door inside the carved-out root is armed",
+        );
+        assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
+
+        // The restore of the workspace root fails, so its record must not survive.
+        refusals.refuse(&workspace);
+        assert!(hub.ensure_roots(&[WatchTarget::recursive(workspace.clone())]));
+        assert!(hub.tick_now(Duration::from_secs(10)), "the declaration is applied");
+        assert_eq!(
+            hub.health(),
+            Health::Degraded(DegradeReason::RewatchFailed),
+            "a root nothing watches is not health",
+        );
+
+        refusals.allow(&workspace);
+        refusals.forget_asks();
+        assert!(hub.tick_now(Duration::from_secs(10)), "the periodic check retries it");
+        assert!(
+            refusals.arms_of(&workspace) >= 1,
+            "the root was never tried again: {:?}",
+            refusals.calls(),
+        );
+    }
+
+    /// A door whose link is re-pointed is a registration on a tree its spelling no longer
+    /// reaches, and arming again does not replace it: inotify keys a watch by inode, so the
+    /// same path over a new target takes a new descriptor while `notify` keys its own map
+    /// by path and forgets the old one — unremovable by anything afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn a_retargeted_door_drops_the_registration_it_replaces() {
+        let (_shared_dir, _dir, first, _second, _old, hub, refusals) = hub_with_a_door();
+        let (_new_dir, moved_to) = resolved_tempdir();
+        std::fs::write(moved_to.join("Moved.bsl"), "Процедура П() КонецПроцедуры").unwrap();
+        let door = first.join("door");
+
+        std::fs::remove_file(&door).unwrap();
+        std::os::unix::fs::symlink(&moved_to, &door).unwrap();
+        assert!(
+            eventually(Duration::from_secs(10), || refusals.arms_of(&moved_to) >= 1),
+            "the retargeted door is armed where it leads now",
+        );
+        assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
+
+        // Asserted on the ORDER, because the seam keys a call by where the path resolved
+        // when it was made: by the time the old registration is dropped the link already
+        // points elsewhere, so both ends of the replacement are logged under the new tree.
+        // What distinguishes a replacement from a second registration is that the drop
+        // comes first.
+        let calls = refusals.calls();
+        let first_arm = calls.iter().position(|(kind, _)| *kind == WatchCallKind::Arm);
+        let first_drop = calls.iter().position(|(kind, _)| *kind == WatchCallKind::Disarm);
+        assert!(
+            matches!((first_drop, first_arm), (Some(drop), Some(arm)) if drop < arm),
+            "the registration on the tree the door used to reach was left standing, and \
+             nothing can name it again: {calls:?}",
+        );
+    }
+
+    /// A door re-armed after it was retargeted has to leave a record of where it leads NOW.
+    /// The only reader of that half is the re-arm's own decision about what to drop, so a
+    /// record left on the old resolution inverts exactly the decision it exists for: the
+    /// watch the declaration still reaches is dropped, and nothing can arm it again.
+    #[cfg(unix)]
+    #[test]
+    fn a_door_re_armed_after_a_retarget_records_where_it_leads_now() {
+        let (_shared_dir, _dir, first, second, _old, hub, refusals) = hub_with_a_door();
+        let (_new_dir, moved_to) = resolved_tempdir();
+        std::fs::write(moved_to.join("Moved.bsl"), "Процедура П() КонецПроцедуры").unwrap();
+        let door = first.join("door");
+
+        std::fs::remove_file(&door).unwrap();
+        std::os::unix::fs::symlink(&moved_to, &door).unwrap();
+        assert!(
+            eventually(Duration::from_secs(10), || refusals.arms_of(&moved_to) >= 1),
+            "the retargeted door is armed where it leads now",
+        );
+        assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
+        refusals.forget_asks();
+
+        assert!(hub.ensure_roots(&[WatchTarget::recursive(first), WatchTarget::recursive(second),]));
+        assert!(
+            !unwatched(&refusals, &moved_to),
+            "the declaration still leads to the door and the door still leads to the tree, \
+             yet the watch was dropped: {:?}",
+            refusals.calls(),
+        );
+    }
+
+    /// A watch re-pointed before any consumer exists has taken nothing from anyone. A debt
+    /// raised over an empty cursor set is one nobody can acknowledge: it leaves the hub
+    /// calling itself degraded for the rest of its life, and hands the first subscriber a
+    /// full reconcile for a window it was never inside.
+    #[test]
+    fn a_re_arm_nobody_was_listening_to_owes_nothing() {
+        let (_dir, root) = resolved_tempdir();
+        let (_other, second) = resolved_tempdir();
+        let hub = WorkspaceChangeHub::start_targets_with_period(
+            vec![WatchTarget::recursive(root.clone())],
+            Duration::from_secs(3600),
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+
+        assert!(hub.ensure_roots(&[WatchTarget::recursive(root), WatchTarget::recursive(second),]));
+
+        assert_eq!(hub.health(), Health::Healthy, "a debt nobody can acknowledge is not health");
+        let newcomer = hub.subscribe();
+        assert!(
+            !hub.materialize(newcomer).rescan_required,
+            "a consumer that arrived after the swap inherited a reconcile for it",
+        );
+    }
+
+    /// The role has to hold for BOTH spellings. A link named one thing onto a file named
+    /// another resolves to a key the walk of the TARGET's root does list — and this walk was
+    /// never entitled to reach it, so handing it over would register a file from outside
+    /// the workspace as drift inside it.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_whose_two_spellings_disagree_on_role_is_not_handed_over() {
+        let (_dir, base) = resolved_tempdir();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("Target.bsl");
+        std::fs::write(&target, "Процедура П() КонецПроцедуры").unwrap();
+        let incoming = base.join("incoming");
+        std::fs::create_dir_all(&incoming).unwrap();
+        std::os::unix::fs::symlink(&target, incoming.join("Alias.txt")).unwrap();
+        std::os::unix::fs::symlink(&target, incoming.join("Agreed.bsl")).unwrap();
+
+        let mut records = Vec::new();
+        collect_subtree(&incoming, &mut records);
+        let keys: Vec<&PathBuf> = records.iter().map(|(canonical, _, _)| canonical).collect();
+
+        assert_eq!(
+            keys.len(),
+            1,
+            "a link whose name and target disagree on role was handed over: {keys:?}",
+        );
+        // The control: a link the walk WOULD take is still taken, resolved.
+        assert_eq!(keys[0], &target, "a link both spellings agree about must be delivered");
+    }
+
+    /// Two doors into ONE tree are two registrations, and the set has to name both. The
+    /// second lies under neither the first's spelling nor any declared root, so nothing
+    /// else would ever hand it to `unwatch` — and a record kept only for the first would
+    /// leave its twin watching a tree no topology declares, for the life of the daemon.
+    #[cfg(unix)]
+    #[test]
+    fn every_watch_armed_by_an_event_is_named_by_the_set() {
+        let (_shared_dir, _dir, first, second, shared, hub, refusals) = hub_with_a_door();
+
+        std::os::unix::fs::symlink(&shared, first.join("other-door")).unwrap();
+        assert!(
+            eventually(Duration::from_secs(10), || refusals.arms_of(&shared) >= 1),
+            "the second door into the same tree is armed too",
+        );
+        assert!(hub.tick_now(Duration::from_secs(10)), "the arm is in place");
+        refusals.forget_asks();
+
+        assert!(hub.ensure_roots(&[WatchTarget::recursive(second)]));
+
+        let key = shared.canonicalize().unwrap();
+        let dropped = refusals
+            .calls()
+            .iter()
+            .filter(|(kind, path)| *kind == WatchCallKind::Disarm && *path == key)
+            .count();
+        assert_eq!(
+            dropped,
+            2,
+            "both registrations into the tree had to be dropped: {:?}",
+            refusals.calls(),
+        );
+    }
+
+    /// A door whose spelling the declaration takes over is the declaration's — but only
+    /// once the declaration actually HOLDS it. An arm that failed placed nothing, and a
+    /// record dropped on the strength of the intention leaves the old registration standing
+    /// with nothing able to name it again.
+    #[cfg(unix)]
+    #[test]
+    fn a_door_whose_promotion_failed_keeps_the_record_that_can_drop_it() {
+        let (_shared_dir, _dir, first, second, shared, hub, refusals) = hub_with_a_door();
+        let door = first.join("door");
+
+        refusals.refuse(&door);
+        assert!(
+            !hub.ensure_roots(&[
+                WatchTarget::recursive(first),
+                WatchTarget::recursive(door.clone()),
+            ]),
+            "a declared root that will not arm is not full coverage",
+        );
+        refusals.allow(&door);
+        refusals.forget_asks();
+
+        assert!(hub.ensure_roots(&[WatchTarget::recursive(second)]));
+        assert!(
+            unwatched(&refusals, &shared),
+            "the declaration never took the door's watch, and the record that could drop \
+             it was thrown away anyway: {:?}",
+            refusals.calls(),
+        );
+    }
+
+    /// A door removed from disk keeps a spelling that still reads as inside the scope while
+    /// the registration it placed hangs over a tree nothing will walk again. Deciding on
+    /// the spelling alone is how such a watch survives every re-arm.
+    #[cfg(unix)]
+    #[test]
+    fn a_door_that_is_gone_is_dropped_even_though_its_spelling_is_in_scope() {
+        let (_shared_dir, _dir, first, second, _shared, hub, refusals) = hub_with_a_door();
+        let door = first.join("door");
+
+        std::fs::remove_file(&door).unwrap();
+        refusals.forget_asks();
+
+        assert!(hub.ensure_roots(&[WatchTarget::recursive(first), WatchTarget::recursive(second),]));
+        assert!(
+            unwatched(&refusals, &door),
+            "the door is gone and its watch was kept because the spelling still reads as \
+             inside the scope: {:?}",
+            refusals.calls(),
+        );
+    }
+
+    /// The defensive pass exists on backends where a recursive unwatch strips descendants,
+    /// and a door that fails it is KEPT. Unlike a declared target — which the blind set
+    /// reports and the retry puts back — a door is reached by neither, so its record is the
+    /// only handle anything has on the registration; the pass is defensive, so the watch it
+    /// names may well still stand, and dropping the record would leave it unnameable.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_door_that_fails_the_defensive_pass_keeps_the_record_that_can_drop_it() {
+        let (_shared_dir, _dir, first, second, shared, hub, refusals) = hub_with_a_door();
+
+        refusals.refuse(&shared);
+        assert!(hub.ensure_roots(&[
+            WatchTarget::recursive(first),
+            WatchTarget::recursive(second.clone()),
+        ]));
+        refusals.allow(&shared);
+        refusals.forget_asks();
+
+        assert!(hub.ensure_roots(&[WatchTarget::recursive(second)]));
+        assert!(
+            unwatched(&refusals, &shared),
+            "a defensive arm that failed threw away the only record that could drop the \
+             watch: {:?}",
+            refusals.calls(),
+        );
+    }
+
+    /// And it must NOT go while the declaration still reaches it. No declaration names such
+    /// a watch, so a re-arm cannot put it back, and nothing will reveal the door a second
+    /// time — a symlink that merely stands there fires no event. Taking it away with the
+    /// declared targets is the trade the obvious fix for the leak makes: coverage lost for
+    /// coverage leaked, which is the worse half.
+    #[cfg(unix)]
+    #[test]
+    fn a_watch_armed_by_an_event_survives_a_re_arm_that_still_reaches_it() {
+        let (_shared_dir, _dir, first, second, shared, hub, refusals) = hub_with_a_door();
+
+        assert!(hub.ensure_roots(&[WatchTarget::recursive(first), WatchTarget::recursive(second),]));
+
+        assert!(
+            !unwatched(&refusals, &shared),
+            "a declaration that still leads to the door took its watch away, and nothing \
+             will ever place it again: {:?}",
+            refusals.calls(),
+        );
+    }
+
+    /// On FSEvents an arm is a whole-stream swap: the running stream is stopped and a new
+    /// one started from "now", so every change anywhere in the watched tree during the swap
+    /// is dropped and never reported again. The arm SUCCEEDS, which is why nothing else
+    /// here says a word about it — the blind set reports the opposite case, and a consumer
+    /// that is never told cannot know to go looking.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn arming_a_watch_over_a_revealed_subtree_owes_the_window_it_cost() {
+        let (_shared_dir, shared) = resolved_tempdir();
+        let (_dir, root) = resolved_tempdir();
+        let hub = WorkspaceChangeHub::start_targets_with_period(
+            vec![WatchTarget::recursive(root.clone())],
+            Duration::from_secs(3600),
+        );
+        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        let cursor = hub.drain(hub.subscribe()).cursor;
+        assert!(!hub.materialize(cursor).rescan_required, "the stand starts level");
+
+        std::os::unix::fs::symlink(&shared, root.join("door")).unwrap();
+
+        assert!(
+            eventually(Duration::from_secs(10), || hub.materialize(cursor).rescan_required),
+            "the stream was restarted to reach the linked subtree, and the window that \
+             cost is owed to every consumer",
+        );
+    }
+
+    /// A target that does not exist YET — a declared root created later — cannot be
+    /// canonicalised, and the raw spelling left over is not the spelling its recursive
+    /// ancestor is remembered by once a link sits above them both. Compared that way the
+    /// ancestor does not contain it, so it is armed on its own, fails on a path that is
+    /// not there, and the whole set reports itself uncovered — over a subtree the
+    /// ancestor's recursive watch is in fact already following.
+    ///
+    /// The second half is the control that keeps this from reading as "anything missing
+    /// is absorbed": the resolution is real, so a missing path behind a link that leaves
+    /// the root lands outside it and stays a target of its own.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_that_does_not_exist_yet_is_still_placed_against_its_ancestor() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let real = base.join("real");
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, real.join("out")).unwrap();
+
+        let inside = link.join("later").join("ext");
+        let kept = dedup_targets(vec![
+            WatchTarget::recursive(link.clone()),
+            WatchTarget::recursive(inside),
+        ]);
+        assert_eq!(
+            kept.iter().map(|(t, _)| t.path.clone()).collect::<Vec<_>>(),
+            vec![link.clone()],
+            "a root the ancestor's recursive watch covers was armed separately",
+        );
+
+        let out_of_the_root = link.join("out").join("ext");
+        let kept = dedup_targets(vec![
+            WatchTarget::recursive(link.clone()),
+            WatchTarget::recursive(out_of_the_root.clone()),
+        ]);
+        let mut placed: Vec<PathBuf> = kept.iter().map(|(t, _)| t.path.clone()).collect();
+        placed.sort();
+        let mut expected = vec![link, out_of_the_root];
+        expected.sort();
+        assert_eq!(
+            placed, expected,
+            "a missing path that resolves OUT of the root is not covered by it",
+        );
     }
 
     /// Nested targets collapse under a recursive ancestor so a subtree is never

@@ -179,6 +179,30 @@ pub(crate) fn verify_pipe_server_trusted(conn: &TokioStream) -> bool {
     }
 }
 
+/// The one spelling of [`SUPERVISED_PID_PLATFORMS`], in the only form that can serve both a
+/// value and an attribute.
+///
+/// `names` expands to the slice; `gate` prefixes an item with the matching `#[cfg]`. The gate
+/// has to come from here because `cfg!` is an expression and its argument is never
+/// macro-expanded, so an attribute cannot read a list any other way — which is how the list
+/// used to acquire copies that drifted from it in silence.
+macro_rules! cfg_supervised_pid {
+    (@platforms $mode:tt $($rest:tt)*) => {
+        $crate::broker::security::cfg_supervised_pid! { @$mode
+            ["android", "freebsd", "fuchsia", "linux", "netbsd", "openbsd", "redox", "windows"]
+            $($rest)*
+        }
+    };
+    (@names [$($os:tt),*]) => { &[$($os),*] };
+    (@gate [$($os:tt),*] $item:item) => {
+        #[cfg(any($(target_os = $os),*))]
+        $item
+    };
+    (names) => { $crate::broker::security::cfg_supervised_pid!(@platforms names) };
+    (gate $item:item) => { $crate::broker::security::cfg_supervised_pid! { @platforms gate $item } };
+}
+pub(crate) use cfg_supervised_pid;
+
 /// Platforms whose peer credentials carry the peer's PID, which is the identity the supervised
 /// broker pins to.
 ///
@@ -188,10 +212,11 @@ pub(crate) fn verify_pipe_server_trusted(conn: &TokioStream) -> bool {
 /// carry no PID at all, so pinning there cannot be verified and the mode is refused up front
 /// instead of failing every connection as an identity mismatch.
 ///
-/// This list is the single source: [`peer_pid_available`] answers the CLI gate from it, and the
-/// contract publishes it. A platform added to one and forgotten in the other is not possible.
-pub const SUPERVISED_PID_PLATFORMS: &[&str] =
-    &["android", "freebsd", "fuchsia", "linux", "netbsd", "openbsd", "redox", "windows"];
+/// This list is the single source: [`peer_pid_available`] answers the CLI gate from it, the
+/// contract publishes it, and code that can only exist where a peer PID is readable is gated on
+/// it through [`cfg_supervised_pid`]. A platform added to one and forgotten in another is not
+/// expressible.
+pub const SUPERVISED_PID_PLATFORMS: &[&str] = cfg_supervised_pid!(names);
 
 /// Whether the running platform's peer credentials carry the peer's PID.
 pub fn peer_pid_available() -> bool {
@@ -443,6 +468,9 @@ mod tests {
     /// The list is what the CLI refuses the supervised mode by, so it has to answer for the
     /// platform actually running. Darwin is the case that matters: `xucred` carries no PID, and
     /// claiming otherwise turns every connection there into an identity mismatch.
+    ///
+    /// The expectation is spelled from the OS name rather than from the list, so it is an
+    /// independent statement of the same fact rather than the list read back to itself.
     #[test]
     fn peer_pid_availability_answers_for_the_running_platform() {
         let carries_pid =
@@ -453,6 +481,27 @@ mod tests {
             carries_pid,
             "peer credentials on {} carry a PID: {carries_pid}",
             std::env::consts::OS
+        );
+    }
+
+    /// The list is exactly the platforms whose peer credentials carry a PID — no more and no
+    /// fewer — stated here so it holds on whatever host runs the suite.
+    ///
+    /// Checking only the running platform leaves a wrong entry to be found by running the
+    /// tests on that very platform: the platform whose answer already went wrong and, where
+    /// the entry was dropped rather than added, whose own gated tests disappeared along with
+    /// it. Equality rather than membership, because a name in neither column — a target added
+    /// to the list and to nothing else — would otherwise be published by the contract as
+    /// supported while nothing had ever read its credentials.
+    ///
+    /// The expectation is written out rather than read back out of the list, which would pass
+    /// whatever the list said.
+    #[test]
+    fn the_list_is_exactly_the_platforms_whose_credentials_carry_a_pid() {
+        assert_eq!(
+            super::SUPERVISED_PID_PLATFORMS,
+            ["android", "freebsd", "fuchsia", "linux", "netbsd", "openbsd", "redox", "windows"],
+            "a platform belongs here only once `PeerCreds::pid()` is known to answer on it",
         );
     }
 }

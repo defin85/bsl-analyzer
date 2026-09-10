@@ -5,9 +5,7 @@ use bsl_search::{IndexProgress, SearchEngine, WorkspaceRootsTransitionOutcome};
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -20,6 +18,11 @@ use std::time::Instant;
 /// owner deciding to stop and a late caller signalling more work.
 pub(super) struct EmbedFlight {
     state: Mutex<EmbedFlightState>,
+    /// Mirror of `state.in_flight` for the one reader that must not wait: the broker's serve
+    /// loop asks on every tick, and an async loop has no business blocking on another
+    /// thread's critical section, however short. Written under the same lock as the field it
+    /// mirrors, so the two cannot disagree.
+    in_flight_now: AtomicBool,
 }
 
 #[derive(Default)]
@@ -30,7 +33,10 @@ struct EmbedFlightState {
 
 impl EmbedFlight {
     pub(super) fn new() -> Arc<Self> {
-        Arc::new(Self { state: Mutex::new(EmbedFlightState::default()) })
+        Arc::new(Self {
+            state: Mutex::new(EmbedFlightState::default()),
+            in_flight_now: AtomicBool::new(false),
+        })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, EmbedFlightState> {
@@ -40,13 +46,23 @@ impl EmbedFlight {
     /// Try to claim the flight. `true` = THIS caller won and must run the pass; `false` = a
     /// pass is already running and a rerun was recorded so it loops again for this caller's
     /// (later-NULLed) chunks.
+    /// The ONE writer of the claim and its mirror, and the reason they cannot drift apart:
+    /// it takes `&mut EmbedFlightState`, which exists only while the caller holds the lock.
+    /// Written by hand, the mirror is one careless statement away from landing after the
+    /// guard is dropped — and an interleaved `claim` would then be blinded by that late
+    /// store, leaving a running pass invisible to the broker.
+    fn set_in_flight(&self, st: &mut EmbedFlightState, value: bool) {
+        st.in_flight = value;
+        self.in_flight_now.store(value, Ordering::SeqCst);
+    }
+
     fn claim(&self) -> bool {
         let mut st = self.lock();
         if st.in_flight {
             st.rerun_pending = true;
             false
         } else {
-            st.in_flight = true;
+            self.set_in_flight(&mut st, true);
             true
         }
     }
@@ -64,7 +80,7 @@ impl EmbedFlight {
         if st.rerun_pending {
             true
         } else {
-            st.in_flight = false;
+            self.set_in_flight(&mut st, false);
             false
         }
     }
@@ -72,12 +88,20 @@ impl EmbedFlight {
     /// Force-release the claim on an abnormal exit (panic / embed error). A leftover rerun
     /// request is harmless — the next owner clears it in `begin_pass` and runs anyway.
     fn release(&self) {
-        self.lock().in_flight = false;
+        let mut st = self.lock();
+        self.set_in_flight(&mut st, false);
+    }
+
+    /// Whether a pass owns the flight right now. This is the backend's liveness signal for
+    /// embedding: the claim is taken before the pass starts and released on every way out,
+    /// including a panic, by [`EmbedClaimGuard`].
+    pub(super) fn is_in_flight(&self) -> bool {
+        self.in_flight_now.load(Ordering::SeqCst)
     }
 
     #[cfg(test)]
-    fn is_in_flight(&self) -> bool {
-        self.lock().in_flight
+    pub(super) fn claim_for_test(&self) -> bool {
+        self.claim()
     }
 
     /// Whether a caller that lost the claim recorded a rerun — the observable proof that its
@@ -91,6 +115,7 @@ impl EmbedFlight {
     fn in_flight_for_test() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(EmbedFlightState { in_flight: true, rerun_pending: false }),
+            in_flight_now: AtomicBool::new(true),
         })
     }
 }
@@ -1234,11 +1259,39 @@ impl SharedState {
 }
 
 #[cfg(test)]
+mod flight_mirror_ownership {
+    /// The mirror exists so the broker can read the claim without waiting, and it is only
+    /// trustworthy while it is written under the same lock as the field. `set_in_flight` is
+    /// the one place that can do that safely, so a second hand-written store is a defect by
+    /// construction — this counts them rather than trusting review to notice the next one.
+    ///
+    /// The needle is assembled at run time: spelled out, it would match this gate's own
+    /// source and pass for the wrong reason.
+    #[test]
+    fn only_one_writer_publishes_the_claim_mirror() {
+        let source = include_str!("embed.rs");
+        let cut = ["\n#[cfg(test)]\n", "mod tests {"].concat();
+        assert_eq!(
+            source.matches(&cut).count(),
+            1,
+            "the production/test cut moved; this gate scans only what it can prove it scanned"
+        );
+        let production = source.split(&cut).next().unwrap_or(source);
+        let stores = ["in_flight_now", ".store("].concat();
+        assert_eq!(
+            production.matches(&stores).count(),
+            1,
+            "publish the claim mirror through set_in_flight, which holds the lock while it does"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::bootstrap::DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET;
     use super::super::test_support::{
-        mock_embedding_env, mock_semantic_config, spawn_mock_embedding_server, write_common_module,
-        ENV_LOCK,
+        env_lock, mock_embedding_env, mock_semantic_config, spawn_mock_embedding_server,
+        write_common_module,
     };
     use super::SharedState;
     use bsl_search::SearchEngine;
@@ -1603,7 +1656,7 @@ mod tests {
     /// shutdown and a post-handover publication.
     #[test]
     fn a_stopped_empty_embed_pass_does_not_publish() {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
         let dir = tempdir().unwrap();
@@ -1641,7 +1694,7 @@ mod tests {
     #[test]
     fn a_stop_after_the_precheck_still_blocks_the_publication() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
         let dir = tempdir().unwrap();
@@ -1682,7 +1735,7 @@ mod tests {
     #[test]
     fn an_incomplete_warmup_pass_reports_incomplete_not_no_diffs() {
         use std::os::unix::fs::PermissionsExt;
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
 
@@ -1742,7 +1795,7 @@ mod tests {
     #[test]
     fn an_unread_file_on_a_clean_scan_reports_incomplete_and_stays_dirty() {
         use std::os::unix::fs::PermissionsExt;
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
 
@@ -1804,7 +1857,7 @@ mod tests {
         use bsl_search::{Chunk, ChunkKind, Store};
         use std::time::{Duration, Instant};
 
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
 
@@ -1883,7 +1936,7 @@ mod tests {
     fn context_reembed_kick_is_single_flight() {
         use bsl_search::{Chunk, ChunkKind, Store};
 
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
 
@@ -1948,7 +2001,7 @@ mod tests {
         use bsl_search::{Chunk, ChunkKind, Store};
         use std::time::{Duration, Instant};
 
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
 
@@ -2964,7 +3017,7 @@ mod tests {
     fn an_embedding_pass_stops_between_batches_when_the_right_to_write_is_withdrawn() {
         use bsl_search::{Chunk, ChunkKind, SearchConfig, Store};
 
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
 
@@ -3020,7 +3073,7 @@ mod tests {
         use bsl_search::{Chunk, ChunkKind, Store};
         use std::time::{Duration, Instant};
 
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
 
@@ -3137,7 +3190,7 @@ mod tests {
         use bsl_search::{Chunk, ChunkKind, Store};
         use std::time::Instant;
 
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
 
@@ -3288,7 +3341,7 @@ mod tests {
         use bsl_search::{Chunk, ChunkKind, Store};
         use std::time::{Duration, Instant};
 
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
 

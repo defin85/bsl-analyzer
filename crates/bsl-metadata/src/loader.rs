@@ -1587,6 +1587,26 @@ fn load_simple_metadata_objects_parallel(dir: &Path, mdo_type: MdoType) -> Vec<M
         .collect()
 }
 
+/// Does this volume keep two names that differ only in case apart?
+///
+/// A case-insensitive volume (APFS and NTFS in their default setup) answers a
+/// lookup for any spelling, so `Alpha` and `alpha` are one entry there and a
+/// fixture cannot lay both down; the exact probe of a constructed path hits
+/// whatever the spelling, and the path handed back carries the CONSTRUCTED
+/// spelling instead of the one on disk. Both facts are observable, so a test
+/// asks the volume rather than the target OS: a case-sensitive volume mounted
+/// on macOS or Windows then still gets the full assertion.
+#[cfg(test)]
+fn fs_keeps_case_distinct(dir: &Path) -> bool {
+    let probe = dir.join("bsl_case_distinction_probe");
+    if fs::write(&probe, "").is_err() {
+        return false;
+    }
+    let distinct = fs::metadata(dir.join("BSL_CASE_DISTINCTION_PROBE")).is_err();
+    let _ = fs::remove_file(&probe);
+    distinct
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2002,7 +2022,11 @@ mod tests {
         ));
         let roles_dir = collection_dir(&bsl_conventions::RealFs, &root, "Roles");
         std::fs::create_dir_all(roles_dir.join("Alpha/Ext")).unwrap();
-        std::fs::create_dir_all(roles_dir.join("alpha/Ext")).unwrap();
+        std::fs::create_dir_all(roles_dir.join("Gamma/Ext")).unwrap();
+        let case_twin = fs_keeps_case_distinct(&roles_dir);
+        if case_twin {
+            std::fs::create_dir_all(roles_dir.join("alpha/Ext")).unwrap();
+        }
 
         let role_xml = |name: &str| {
             format!(
@@ -2020,10 +2044,14 @@ mod tests {
         };
 
         std::fs::write(roles_dir.join("Alpha.xml"), role_xml("Alpha")).unwrap();
-        std::fs::write(roles_dir.join("alpha.xml"), role_xml("alpha")).unwrap();
         std::fs::write(roles_dir.join("Beta.xml"), role_xml("Beta")).unwrap();
+        std::fs::write(roles_dir.join("Gamma.xml"), role_xml("Gamma")).unwrap();
         std::fs::write(roles_dir.join("Alpha/Ext/Rights.xml"), "<Rights/>").unwrap();
-        std::fs::write(roles_dir.join("alpha/Ext/Rights.txt"), "not xml").unwrap();
+        std::fs::write(roles_dir.join("Gamma/Ext/Rights.txt"), "not xml").unwrap();
+        if case_twin {
+            std::fs::write(roles_dir.join("alpha.xml"), role_xml("alpha")).unwrap();
+            std::fs::write(roles_dir.join("alpha/Ext/Rights.txt"), "not xml").unwrap();
+        }
         std::fs::write(roles_dir.join("ignored.txt"), "ignored").unwrap();
 
         let first = discover_role_structure(&root, &bsl_conventions::RealFs);
@@ -2036,14 +2064,20 @@ mod tests {
             .all(|role| role.main.extension().and_then(|ext| ext.to_str()) == Some("xml")));
 
         let discovered: BTreeSet<String> = first.iter().map(|d| d.name.clone()).collect();
-        assert_eq!(
-            first[0].name, "Alpha",
-            "roles with the same folded name should sort by main path"
-        );
+        assert_eq!(first[0].name, "Alpha");
         assert_eq!(first[0].rights, Some(roles_dir.join("Alpha/Ext/Rights.xml")));
-        assert_eq!(first[1].name, "alpha");
-        assert_eq!(first[1].rights, None);
+        if case_twin {
+            assert_eq!(
+                first[1].name, "alpha",
+                "roles with the same folded name should sort by main path"
+            );
+            assert_eq!(first[1].rights, None);
+        }
         assert!(discovered.contains("Beta"), "fixture sanity");
+        // Gamma is no case twin, so this rides on every volume: an `Ext` child
+        // that is not `Rights.xml` is not the rights sidecar.
+        let gamma = first.iter().find(|role| role.name == "Gamma").expect("fixture sanity");
+        assert_eq!(gamma.rights, None);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2196,6 +2230,76 @@ mod tests {
         );
     }
 
+    /// Discovery must not inherit the order a listing happens to arrive in:
+    /// `read_dir` promises none, so the same universe fed in two orders has to
+    /// discover the same list, and objects whose names fold together have to
+    /// sort by their main path. An in-memory tree is what pins this down —
+    /// it hands out the order it was given, and it holds the `Alpha`/`alpha`
+    /// twin that a case-insensitive volume cannot keep apart.
+    #[test]
+    fn discovery_order_does_not_follow_the_listing_order() {
+        use bsl_conventions::PathSetTree;
+
+        let files = [
+            "/ws/HTTPServices/alpha.xml",
+            "/ws/HTTPServices/alpha/Ext/Module.bsl",
+            "/ws/HTTPServices/Beta.xml",
+            "/ws/HTTPServices/Alpha.xml",
+            "/ws/WebServices/Beta.xml",
+            "/ws/WebServices/alpha.xml",
+            "/ws/WebServices/Alpha.xml",
+            "/ws/IntegrationServices/alpha.xml",
+            "/ws/IntegrationServices/Alpha.xml",
+            "/ws/IntegrationServices/Beta.xml",
+            "/ws/Roles/Beta.xml",
+            "/ws/Roles/alpha.xml",
+            "/ws/Roles/Alpha.xml",
+            "/ws/Roles/Alpha/Ext/Rights.xml",
+        ];
+        let forward = PathSetTree::from_files(files.iter().map(PathBuf::from));
+        let reversed = PathSetTree::from_files(files.iter().rev().map(PathBuf::from));
+        let root = Path::new("/ws");
+
+        // Each collection has its own discovery function with its own sort, so
+        // each is pinned in turn: a copy losing the rule stays visible.
+        macro_rules! assert_folded_names_sort_by_main {
+            ($discover:ident, $collection:literal) => {{
+                let discovered = $discover(root, &forward);
+                assert_eq!(
+                    discovered,
+                    $discover(root, &reversed),
+                    concat!($collection, " discovery follows the listing order")
+                );
+                assert_eq!(
+                    discovered.iter().map(|item| item.name.as_str()).collect::<Vec<_>>(),
+                    ["Alpha", "alpha", "Beta"],
+                    concat!($collection, ": names that fold together sort by main path")
+                );
+                discovered
+            }};
+        }
+
+        let services =
+            assert_folded_names_sort_by_main!(discover_http_service_structure, "HTTPServices");
+        assert_folded_names_sort_by_main!(discover_web_service_structure, "WebServices");
+        assert_folded_names_sort_by_main!(
+            discover_integration_service_structure,
+            "IntegrationServices"
+        );
+        let roles = assert_folded_names_sort_by_main!(discover_role_structure, "Roles");
+
+        assert_eq!(services[0].main, PathBuf::from("/ws/HTTPServices/Alpha.xml"));
+        assert_eq!(services[0].module_file, None);
+        assert_eq!(
+            services[1].module_file,
+            Some(PathBuf::from("/ws/HTTPServices/alpha/Ext/Module.bsl")),
+            "the body belongs to the twin that owns the directory"
+        );
+
+        assert_eq!(roles[0].rights, Some(PathBuf::from("/ws/Roles/Alpha/Ext/Rights.xml")));
+        assert_eq!(roles[1].rights, None);
+    }
+
     #[test]
     fn discover_metadata_structure_attaches_predefined_sidecar() {
         let root = std::env::temp_dir().join(format!(
@@ -2301,15 +2405,23 @@ mod tests {
         ));
         let services_dir = collection_dir(&bsl_conventions::RealFs, &root, "HTTPServices");
         std::fs::create_dir_all(services_dir.join("Alpha/Ext")).unwrap();
-        std::fs::create_dir_all(services_dir.join("alpha/Ext")).unwrap();
         std::fs::create_dir_all(services_dir.join("Beta/Ext")).unwrap();
+        std::fs::create_dir_all(services_dir.join("Gamma/Ext")).unwrap();
+        let case_twin = fs_keeps_case_distinct(&services_dir);
+        if case_twin {
+            std::fs::create_dir_all(services_dir.join("alpha/Ext")).unwrap();
+        }
 
         std::fs::write(services_dir.join("Alpha.xml"), "<MetaDataObject/>").unwrap();
-        std::fs::write(services_dir.join("alpha.xml"), "<MetaDataObject/>").unwrap();
         std::fs::write(services_dir.join("Beta.xml"), "<MetaDataObject/>").unwrap();
+        std::fs::write(services_dir.join("Gamma.xml"), "<MetaDataObject/>").unwrap();
         std::fs::write(services_dir.join("Alpha/Ext/Module.bsl"), "// alpha module").unwrap();
-        std::fs::write(services_dir.join("alpha/Ext/Module.txt"), "ignored").unwrap();
         std::fs::write(services_dir.join("Beta/Ext/Module.bsl"), "// beta module").unwrap();
+        std::fs::write(services_dir.join("Gamma/Ext/Module.txt"), "not a module").unwrap();
+        if case_twin {
+            std::fs::write(services_dir.join("alpha.xml"), "<MetaDataObject/>").unwrap();
+            std::fs::write(services_dir.join("alpha/Ext/Module.txt"), "ignored").unwrap();
+        }
         std::fs::write(services_dir.join("sidecar.json"), "ignored").unwrap();
 
         let first = discover_http_service_structure(&root, &bsl_conventions::RealFs);
@@ -2329,15 +2441,23 @@ mod tests {
             .collect();
 
         assert_eq!(first_view, second_view, "HTTP service discovery order must be stable");
-        assert_eq!(first_view[0].0, "Alpha");
-        assert_eq!(first_view[0].1, services_dir.join("Alpha.xml"));
-        assert_eq!(first_view[0].2, Some(services_dir.join("Alpha/Ext/Module.bsl")));
-        assert_eq!(first_view[1].0, "alpha");
-        assert_eq!(first_view[1].1, services_dir.join("alpha.xml"));
-        assert_eq!(first_view[1].2, None);
-        assert_eq!(first_view[2].0, "Beta");
-        assert_eq!(first_view[2].1, services_dir.join("Beta.xml"));
-        assert_eq!(first_view[2].2, Some(services_dir.join("Beta/Ext/Module.bsl")));
+        let mut expected = vec![(
+            "Alpha".to_string(),
+            services_dir.join("Alpha.xml"),
+            Some(services_dir.join("Alpha/Ext/Module.bsl")),
+        )];
+        if case_twin {
+            expected.push(("alpha".to_string(), services_dir.join("alpha.xml"), None));
+        }
+        expected.push((
+            "Beta".to_string(),
+            services_dir.join("Beta.xml"),
+            Some(services_dir.join("Beta/Ext/Module.bsl")),
+        ));
+        // Gamma is no case twin, so this rides on every volume: an `Ext` child
+        // that is not `Module.bsl` is not a module body.
+        expected.push(("Gamma".to_string(), services_dir.join("Gamma.xml"), None));
+        assert_eq!(first_view, expected);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2351,15 +2471,23 @@ mod tests {
         ));
         let services_dir = collection_dir(&bsl_conventions::RealFs, &root, "WebServices");
         std::fs::create_dir_all(services_dir.join("Alpha/Ext")).unwrap();
-        std::fs::create_dir_all(services_dir.join("alpha/Ext")).unwrap();
         std::fs::create_dir_all(services_dir.join("Beta/Ext")).unwrap();
+        std::fs::create_dir_all(services_dir.join("Gamma/Ext")).unwrap();
+        let case_twin = fs_keeps_case_distinct(&services_dir);
+        if case_twin {
+            std::fs::create_dir_all(services_dir.join("alpha/Ext")).unwrap();
+        }
 
         std::fs::write(services_dir.join("Alpha.xml"), "<MetaDataObject/>").unwrap();
-        std::fs::write(services_dir.join("alpha.xml"), "<MetaDataObject/>").unwrap();
         std::fs::write(services_dir.join("Beta.xml"), "<MetaDataObject/>").unwrap();
+        std::fs::write(services_dir.join("Gamma.xml"), "<MetaDataObject/>").unwrap();
         std::fs::write(services_dir.join("Alpha/Ext/Module.bsl"), "// alpha module").unwrap();
-        std::fs::write(services_dir.join("alpha/Ext/Module.txt"), "ignored").unwrap();
         std::fs::write(services_dir.join("Beta/Ext/Module.bsl"), "// beta module").unwrap();
+        std::fs::write(services_dir.join("Gamma/Ext/Module.txt"), "not a module").unwrap();
+        if case_twin {
+            std::fs::write(services_dir.join("alpha.xml"), "<MetaDataObject/>").unwrap();
+            std::fs::write(services_dir.join("alpha/Ext/Module.txt"), "ignored").unwrap();
+        }
         std::fs::write(services_dir.join("sidecar.json"), "ignored").unwrap();
 
         let first = discover_web_service_structure(&root, &bsl_conventions::RealFs);
@@ -2379,15 +2507,23 @@ mod tests {
             .collect();
 
         assert_eq!(first_view, second_view, "Web service discovery order must be stable");
-        assert_eq!(first_view[0].0, "Alpha");
-        assert_eq!(first_view[0].1, services_dir.join("Alpha.xml"));
-        assert_eq!(first_view[0].2, Some(services_dir.join("Alpha/Ext/Module.bsl")));
-        assert_eq!(first_view[1].0, "alpha");
-        assert_eq!(first_view[1].1, services_dir.join("alpha.xml"));
-        assert_eq!(first_view[1].2, None);
-        assert_eq!(first_view[2].0, "Beta");
-        assert_eq!(first_view[2].1, services_dir.join("Beta.xml"));
-        assert_eq!(first_view[2].2, Some(services_dir.join("Beta/Ext/Module.bsl")));
+        let mut expected = vec![(
+            "Alpha".to_string(),
+            services_dir.join("Alpha.xml"),
+            Some(services_dir.join("Alpha/Ext/Module.bsl")),
+        )];
+        if case_twin {
+            expected.push(("alpha".to_string(), services_dir.join("alpha.xml"), None));
+        }
+        expected.push((
+            "Beta".to_string(),
+            services_dir.join("Beta.xml"),
+            Some(services_dir.join("Beta/Ext/Module.bsl")),
+        ));
+        // Gamma is no case twin, so this rides on every volume: an `Ext` child
+        // that is not `Module.bsl` is not a module body.
+        expected.push(("Gamma".to_string(), services_dir.join("Gamma.xml"), None));
+        assert_eq!(first_view, expected);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2401,15 +2537,23 @@ mod tests {
         ));
         let services_dir = collection_dir(&bsl_conventions::RealFs, &root, "IntegrationServices");
         std::fs::create_dir_all(services_dir.join("Alpha/Ext")).unwrap();
-        std::fs::create_dir_all(services_dir.join("alpha/Ext")).unwrap();
         std::fs::create_dir_all(services_dir.join("Beta/Ext")).unwrap();
+        std::fs::create_dir_all(services_dir.join("Gamma/Ext")).unwrap();
+        let case_twin = fs_keeps_case_distinct(&services_dir);
+        if case_twin {
+            std::fs::create_dir_all(services_dir.join("alpha/Ext")).unwrap();
+        }
 
         std::fs::write(services_dir.join("Alpha.xml"), "<MetaDataObject/>").unwrap();
-        std::fs::write(services_dir.join("alpha.xml"), "<MetaDataObject/>").unwrap();
         std::fs::write(services_dir.join("Beta.xml"), "<MetaDataObject/>").unwrap();
+        std::fs::write(services_dir.join("Gamma.xml"), "<MetaDataObject/>").unwrap();
         std::fs::write(services_dir.join("Alpha/Ext/Module.bsl"), "// alpha module").unwrap();
-        std::fs::write(services_dir.join("alpha/Ext/Module.txt"), "ignored").unwrap();
         std::fs::write(services_dir.join("Beta/Ext/Module.bsl"), "// beta module").unwrap();
+        std::fs::write(services_dir.join("Gamma/Ext/Module.txt"), "not a module").unwrap();
+        if case_twin {
+            std::fs::write(services_dir.join("alpha.xml"), "<MetaDataObject/>").unwrap();
+            std::fs::write(services_dir.join("alpha/Ext/Module.txt"), "ignored").unwrap();
+        }
         std::fs::write(services_dir.join("sidecar.json"), "ignored").unwrap();
 
         let first = discover_integration_service_structure(&root, &bsl_conventions::RealFs);
@@ -2429,15 +2573,23 @@ mod tests {
             .collect();
 
         assert_eq!(first_view, second_view, "integration service discovery order must be stable");
-        assert_eq!(first_view[0].0, "Alpha");
-        assert_eq!(first_view[0].1, services_dir.join("Alpha.xml"));
-        assert_eq!(first_view[0].2, Some(services_dir.join("Alpha/Ext/Module.bsl")));
-        assert_eq!(first_view[1].0, "alpha");
-        assert_eq!(first_view[1].1, services_dir.join("alpha.xml"));
-        assert_eq!(first_view[1].2, None);
-        assert_eq!(first_view[2].0, "Beta");
-        assert_eq!(first_view[2].1, services_dir.join("Beta.xml"));
-        assert_eq!(first_view[2].2, Some(services_dir.join("Beta/Ext/Module.bsl")));
+        let mut expected = vec![(
+            "Alpha".to_string(),
+            services_dir.join("Alpha.xml"),
+            Some(services_dir.join("Alpha/Ext/Module.bsl")),
+        )];
+        if case_twin {
+            expected.push(("alpha".to_string(), services_dir.join("alpha.xml"), None));
+        }
+        expected.push((
+            "Beta".to_string(),
+            services_dir.join("Beta.xml"),
+            Some(services_dir.join("Beta/Ext/Module.bsl")),
+        ));
+        // Gamma is no case twin, so this rides on every volume: an `Ext` child
+        // that is not `Module.bsl` is not a module body.
+        expected.push(("Gamma".to_string(), services_dir.join("Gamma.xml"), None));
+        assert_eq!(first_view, expected);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2959,6 +3111,21 @@ mod case_parity_tests {
         std::fs::write(path, text).unwrap();
     }
 
+    /// The spelling a probe hands back under `root`: the one really on disk
+    /// where a wrong-case construction misses, the constructed canonical one
+    /// where the volume answers any spelling and the exact probe hits first.
+    fn probed_spelling(
+        root: &Path,
+        on_disk: &'static str,
+        canonical: &'static str,
+    ) -> &'static str {
+        if fs_keeps_case_distinct(root) {
+            on_disk
+        } else {
+            canonical
+        }
+    }
+
     const COMMON_XML: &str = concat!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
         "<MetaDataObject xmlns=\"http://v8.1c.ru/8.3/MDClasses\">",
@@ -2974,9 +3141,10 @@ mod case_parity_tests {
         write(&root.join("CommonModules/X/EXT/MODULE.BSL"), "// тело");
         let found = discover_common_module_structure(&root, &bsl_conventions::RealFs);
         assert_eq!(found.len(), 1);
+        let expected = probed_spelling(&root, "EXT/MODULE.BSL", "Ext/Module.bsl");
         assert!(
-            found[0].module_file.as_deref().is_some_and(|p| p.ends_with("EXT/MODULE.BSL")),
-            "тело найдено и несёт реальное написание: {:?}",
+            found[0].module_file.as_deref().is_some_and(|p| p.ends_with(expected)),
+            "тело найдено и несёт написание {expected}: {:?}",
             found[0].module_file
         );
     }
@@ -2990,15 +3158,13 @@ mod case_parity_tests {
         write(&root.join("WebServices/W/EXT/MODULE.BSL"), "//");
         write(&root.join("IntegrationServices/I.xml"), "<x/>");
         write(&root.join("IntegrationServices/I/EXT/MODULE.BSL"), "//");
+        let expected = probed_spelling(&root, "EXT/MODULE.BSL", "Ext/Module.bsl");
         let http = discover_http_service_structure(&root, &bsl_conventions::RealFs);
-        assert!(http[0].module_file.as_deref().is_some_and(|p| p.ends_with("EXT/MODULE.BSL")));
+        assert!(http[0].module_file.as_deref().is_some_and(|p| p.ends_with(expected)));
         let web = discover_web_service_structure(&root, &bsl_conventions::RealFs);
-        assert!(web[0].module_file.as_deref().is_some_and(|p| p.ends_with("EXT/MODULE.BSL")));
+        assert!(web[0].module_file.as_deref().is_some_and(|p| p.ends_with(expected)));
         let integration = discover_integration_service_structure(&root, &bsl_conventions::RealFs);
-        assert!(integration[0]
-            .module_file
-            .as_deref()
-            .is_some_and(|p| p.ends_with("EXT/MODULE.BSL")));
+        assert!(integration[0].module_file.as_deref().is_some_and(|p| p.ends_with(expected)));
     }
 
     #[test]
@@ -3031,8 +3197,9 @@ mod case_parity_tests {
         write(&root.join("Roles/Роль/EXT/RIGHTS.XML"), "<x/>");
         let roles = discover_role_structure(&root, &bsl_conventions::RealFs);
         assert_eq!(roles.len(), 1);
+        let expected = probed_spelling(&root, "EXT/RIGHTS.XML", "Ext/Rights.xml");
         assert!(
-            roles[0].rights.as_deref().is_some_and(|p| p.ends_with("EXT/RIGHTS.XML")),
+            roles[0].rights.as_deref().is_some_and(|p| p.ends_with(expected)),
             "права найдены через регистронезависимую пробу: {:?}",
             roles[0].rights
         );
@@ -3047,12 +3214,13 @@ mod case_parity_tests {
         let found = discover_metadata_structure(&root, &bsl_conventions::RealFs);
         let catalog = found.iter().find(|m| m.name == "Товар");
         assert!(catalog.is_some(), "каталог с соседним Товар.XML обнаружен");
+        let expected = probed_spelling(&root, "EXT/PREDEFINED.XML", "Ext/Predefined.xml");
         assert!(
             catalog
                 .unwrap()
                 .predefined
                 .as_deref()
-                .is_some_and(|p| p.to_string_lossy().ends_with("EXT/PREDEFINED.XML")),
+                .is_some_and(|p| p.to_string_lossy().ends_with(expected)),
             "predefined найден через пробу"
         );
     }
@@ -3077,10 +3245,15 @@ mod case_parity_tests {
         let config = load_from_directory(&root).unwrap();
         let module = config.common_modules().iter().find(|m| m.name() == "X").unwrap();
         use crate::traits::Module as _;
+        let expected = probed_spelling(
+            &root,
+            "COMMONMODULES/X/EXT/MODULE.BSL",
+            "CommonModules/X/Ext/Module.bsl",
+        );
         assert_eq!(
             module.uri(),
-            Some("COMMONMODULES/X/EXT/MODULE.BSL"),
-            "URI несёт РЕАЛЬНОЕ написание найденного пути, включая сегмент коллекции"
+            Some(expected),
+            "URI несёт написание найденного пути, включая сегмент коллекции"
         );
     }
 }

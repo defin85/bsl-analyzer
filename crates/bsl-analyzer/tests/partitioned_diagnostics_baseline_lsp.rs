@@ -41,16 +41,24 @@ extensions = ["A"]
     dir
 }
 
-fn expect_publications(lsp: &Lsp, root: &Path, paths: &[&str], empty: bool) {
+fn expect_publications(lsp: &mut Lsp, root: &Path, paths: &[&str], empty: bool) {
     let mut remaining: std::collections::BTreeSet<_> = paths
         .iter()
         .map(|path| lsp_types::Url::from_file_path(root.join(path)).unwrap().to_string())
         .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !remaining.is_empty() {
-        let published = lsp.wait_for(|message| {
+        // Poked, for the reason every wait in this file is: the baseline change these
+        // publications answer may have landed before the watcher was armed and raised no
+        // event, and the server notices that only when the client asks it for something.
+        let Some(published) = lsp.wait_for_within(std::time::Duration::from_secs(1), |message| {
             message["method"] == "textDocument/publishDiagnostics"
                 && message["params"]["uri"].as_str().is_some_and(|uri| remaining.contains(uri))
-        });
+        }) else {
+            assert!(std::time::Instant::now() < deadline, "the server never republished");
+            lsp.poke();
+            continue;
+        };
         let uri = published["params"]["uri"].as_str().unwrap();
         assert_eq!(
             published["params"]["diagnostics"].as_array().unwrap().is_empty(),
@@ -89,13 +97,25 @@ fn partitioned_baseline_lsp_main_extension_group_partial_and_recovery() {
     let object_relative = object.to_owned();
     let object = root.join("baselines").join(&object_relative);
     let valid = std::fs::read(&object).unwrap();
+    // Broken ONCE. The watcher is armed asynchronously, after the loader has already
+    // announced the load finished, so this write may raise no event at all — and the
+    // server has to notice it anyway, the next time the client asks it for anything.
     std::fs::write(&object, b"{broken").unwrap();
-    lsp.wait_for(|message| message["method"] == "window/showMessage");
-    expect_publications(&lsp, root, &paths, false);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while lsp
+        .wait_for_within(std::time::Duration::from_secs(1), |message| {
+            message["method"] == "window/showMessage"
+        })
+        .is_none()
+    {
+        assert!(std::time::Instant::now() < deadline, "the server never saw the broken object");
+        lsp.poke();
+    }
+    expect_publications(&mut lsp, root, &paths, false);
 
     let directory =
         project_model::ManagedBaselineDirectory::open(root, "baselines", false).unwrap();
     directory.create_file_new("replacement.tmp").unwrap().write_all(&valid).unwrap();
     directory.replace_file("replacement.tmp", &object_relative).unwrap();
-    expect_publications(&lsp, root, &paths, true);
+    expect_publications(&mut lsp, root, &paths, true);
 }

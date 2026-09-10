@@ -3,8 +3,7 @@ use crate::metadata::*;
 use crate::BodyContext;
 use crate::{Diagnostic, DiagnosticCode, Fix, TextEdit};
 use hir::LocalRange;
-use stdx::case::CaseExt;
-use syntax::{SyntaxKind, SyntaxToken};
+use syntax::{preproc_symbols, SyntaxKind, SyntaxToken};
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::CodeSmell,
@@ -41,43 +40,14 @@ fn is_in_preprocessor(token: &SyntaxToken) -> bool {
     false
 }
 
+/// Каноническое написание символа препроцессора.
+///
+/// Список написаний и правило сравнения регистра принадлежат реестру
+/// `syntax::preproc_symbols`, поэтому новый символ получает быструю правку
+/// без правки этого места.
 fn check_preproc_symbol(actual: &str) -> Option<String> {
-    let lower = actual.fold_lower();
-    match lower.as_str() {
-        "сервер" | "server" => check_keyword(actual, &["Сервер", "Server"]),
-        "клиент" | "client" => check_keyword(actual, &["Клиент", "Client"]),
-        "вебклиент" | "webclient" => check_keyword(actual, &["ВебКлиент", "WebClient"]),
-        "тонкийклиент" | "thinclient" => {
-            check_keyword(actual, &["ТонкийКлиент", "ThinClient"])
-        }
-        "толстыйклиентобычноеприложение" | "thickclientordinaryapplication" => {
-            check_keyword(
-                actual,
-                &["ТолстыйКлиентОбычноеПриложение", "ThickClientOrdinaryApplication"],
-            )
-        }
-        "толстыйклиентуправляемоеприложение" | "thickclientmanagedapplication" => {
-            check_keyword(
-                actual,
-                &["ТолстыйКлиентУправляемоеПриложение", "ThickClientManagedApplication"],
-            )
-        }
-        "мобильноеприложениеклиент" | "mobileappclient" => {
-            check_keyword(actual, &["МобильноеПриложениеКлиент", "MobileAppClient"])
-        }
-        "мобильноеприложениесервер" | "mobileappserver" => {
-            check_keyword(actual, &["МобильноеПриложениеСервер", "MobileAppServer"])
-        }
-        "мобильныйклиент" | "mobileclient" => {
-            check_keyword(actual, &["МобильныйКлиент", "MobileClient"])
-        }
-        "внешнеесоединение" | "externalconnection" => {
-            check_keyword(actual, &["ВнешнееСоединение", "ExternalConnection"])
-        }
-        "наклиенте" | "atclient" => check_keyword(actual, &["НаКлиенте", "AtClient"]),
-        "насервере" | "atserver" => check_keyword(actual, &["НаСервере", "AtServer"]),
-        _ => None,
-    }
+    let id = preproc_symbols::lookup(actual)?;
+    check_keyword(actual, &id.spellings())
 }
 
 fn check_keyword(actual: &str, canonical_forms: &[&str]) -> Option<String> {
@@ -222,6 +192,58 @@ mod tests {
     use super::*;
     use crate::test_utils::check_body_diagnostic_with_config;
     use crate::DiagnosticsConfig;
+    /// Каждый символ реестра получает быструю правку канонического
+    /// написания — и русскую, и английскую.
+    ///
+    /// Обход реестра, а не список руками: ровно из-за списка руками
+    /// `МобильныйАвтономныйСервер` правки не получал, хотя известным
+    /// символом считался.
+    #[test]
+    fn every_registry_symbol_gets_a_canonical_spelling_fix() {
+        use syntax::preproc_symbols::PreprocSymbolId;
+
+        for &id in PreprocSymbolId::ALL {
+            for canonical in id.spellings() {
+                let written = canonical.to_lowercase();
+                assert_ne!(written, canonical, "{canonical:?}: вход совпал с каноном");
+                let code =
+                    format!("Процедура Тест()\n#Если {written} Тогда\n#КонецЕсли\nКонецПроцедуры");
+                let diagnostics = check_body_diagnostic_with_config(
+                    &code,
+                    DiagnosticsConfig::default(),
+                    check_body,
+                );
+                let offered: Vec<&str> = diagnostics
+                    .iter()
+                    .filter(|d| d.code == DiagnosticCode::CanonicalSpellingKeywords)
+                    .flat_map(|d| &d.fixes)
+                    .flat_map(|fix| &fix.edits)
+                    .map(|edit| edit.new_text.as_str())
+                    .collect();
+                assert!(
+                    offered.contains(&canonical),
+                    "{written:?}: правка на {canonical:?} не предложена, предложено {offered:?}"
+                );
+            }
+        }
+    }
+
+    /// Символ, которого реестр не знает, правки не получает: иначе
+    /// диагностика предлагала бы канон для написания без источника.
+    #[test]
+    fn symbols_outside_the_registry_get_no_fix() {
+        for written in ["linux", "windows", "macos", "нечто"] {
+            let code =
+                format!("Процедура Тест()\n#Если {written} Тогда\n#КонецЕсли\nКонецПроцедуры");
+            let diagnostics =
+                check_body_diagnostic_with_config(&code, DiagnosticsConfig::default(), check_body);
+            assert!(
+                !diagnostics.iter().any(|d| d.code == DiagnosticCode::CanonicalSpellingKeywords),
+                "{written:?}: предложена правка написанию вне реестра: {diagnostics:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_canonical_keywords() {
         let code = r#"Процедура Тест()

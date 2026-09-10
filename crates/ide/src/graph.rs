@@ -13,7 +13,7 @@
 //! resolvable only when a workspace root is supplied.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use stdx::case::CaseExt;
 
@@ -488,7 +488,7 @@ impl Analysis {
     pub fn graph_overview(
         &self,
         source_root_id: SourceRootId,
-        workspace_root: Option<&Path>,
+        workspace_root: Option<&StripRoot>,
         top_n: usize,
     ) -> GraphOverview {
         let ctx = GraphCtx::new(self.database(), source_root_id, workspace_root);
@@ -499,7 +499,7 @@ impl Analysis {
     pub fn graph_node(
         &self,
         source_root_id: SourceRootId,
-        workspace_root: Option<&Path>,
+        workspace_root: Option<&StripRoot>,
         id: &str,
         detail: GraphDetail,
     ) -> Result<NodeResult, GraphError> {
@@ -513,7 +513,7 @@ impl Analysis {
     pub fn graph_resolve(
         &self,
         source_root_id: SourceRootId,
-        workspace_root: Option<&Path>,
+        workspace_root: Option<&StripRoot>,
         query: &str,
         limit: usize,
     ) -> ResolveResult {
@@ -525,7 +525,7 @@ impl Analysis {
     pub fn graph_neighbors(
         &self,
         source_root_id: SourceRootId,
-        workspace_root: Option<&Path>,
+        workspace_root: Option<&StripRoot>,
         params: &NeighborsParams<'_>,
     ) -> Result<NeighborsResult, GraphError> {
         let ctx = GraphCtx::new(self.database(), source_root_id, workspace_root);
@@ -538,7 +538,7 @@ impl Analysis {
     pub fn graph_source(
         &self,
         source_root_id: SourceRootId,
-        workspace_root: Option<&Path>,
+        workspace_root: Option<&StripRoot>,
         ids: &[String],
         max_output_tokens: usize,
     ) -> SourceResult {
@@ -939,7 +939,16 @@ pub fn build_workspace_graph_rows(
     let module_sig_hashes: FxHashMap<ModuleId, u64> =
         modules.iter().filter_map(|&m| index.module_sig_hash(m).map(|h| (m, h))).collect();
 
-    let encoder = GraphRowEncoder::new(&index, paths, workspace_root, mdo_files);
+    // The encoder strips the same rel from the same walked paths, so it has to be given the
+    // same root — otherwise a link in the declared spelling would leave the build minting
+    // basenames while everything served here minted the real rel.
+    let strip_root = workspace_root.map(StripRoot::resolve);
+    let encoder = GraphRowEncoder::new(
+        &index,
+        paths,
+        strip_root.as_ref().map(StripRoot::resolved),
+        mdo_files,
+    );
     let mut summary =
         GraphBuildSummary { modules: modules.len(), module_sig_hashes, ..Default::default() };
 
@@ -1232,7 +1241,16 @@ pub fn reproject_changed_modules(
         clear_node_caches(&pool);
     }
 
-    let encoder = GraphRowEncoder::new(&index, paths, workspace_root, mdo_files);
+    // The encoder strips the same rel from the same walked paths, so it has to be given the
+    // same root — otherwise a link in the declared spelling would leave the build minting
+    // basenames while everything served here minted the real rel.
+    let strip_root = workspace_root.map(StripRoot::resolve);
+    let encoder = GraphRowEncoder::new(
+        &index,
+        paths,
+        strip_root.as_ref().map(StripRoot::resolved),
+        mdo_files,
+    );
     let changed_set: FxHashSet<ModuleId> = changed.iter().copied().collect();
 
     // Phase A — method nodes for the changed modules only.
@@ -1301,19 +1319,21 @@ struct GraphCtx<'a> {
     graph: Arc<WorkspaceCallGraph>,
     index: Arc<ModuleIndex>,
     source_root: SourceRoot,
-    workspace_root: Option<&'a Path>,
+    /// The base this view's ids are stripped against, handed in already resolved by whoever
+    /// established the file universe — see [`StripRoot`].
+    strip_root: Option<StripRoot>,
 }
 
 impl<'a> GraphCtx<'a> {
     fn new(
         db: &'a RootDatabaseImpl,
         source_root_id: SourceRootId,
-        workspace_root: Option<&'a Path>,
+        workspace_root: Option<&'a StripRoot>,
     ) -> Self {
         let graph = db.workspace_call_graph(source_root_id);
         let index = db.module_index(source_root_id);
         let source_root = db.source_root_input(source_root_id).root(db).clone();
-        Self { db, graph, index, source_root, workspace_root }
+        Self { db, graph, index, source_root, strip_root: workspace_root.cloned() }
     }
 
     fn path_for(&self, file_id: FileId) -> Option<String> {
@@ -1322,7 +1342,7 @@ impl<'a> GraphCtx<'a> {
     }
 
     fn rel_path(&self, abs: &str) -> Option<String> {
-        workspace_rel_path(abs, self.workspace_root?)
+        self.strip_root.as_ref()?.rel(abs)
     }
 
     // ---- id encoding --------------------------------------------------------
@@ -2294,6 +2314,85 @@ impl<'a> GraphCtx<'a> {
     }
 }
 
+/// The workspace root a path-fallback rel is stripped against, in the spelling the row
+/// encoder uses.
+///
+/// A rel is only worth minting if it names the node the graph actually holds, and the encoder
+/// derives its rel one way: the WALK's spelling of the file — every link resolved — stripped
+/// against this root. So this type answers that one question, and the root it keeps is the
+/// resolved one for that reason.
+///
+/// Resolving belongs HERE and not inside [`workspace_rel_path`], which is deliberately a
+/// string operation so a caller reproduces the encoder's exact rel rather than the real path.
+/// What was wrong was never the strip; it was the spellings handed to it.
+///
+/// **The base belongs to a GENERATION, not to the current disk.** A workspace reached through
+/// a link names one directory while that generation's files were walked and possibly another
+/// by the time an answer about them is rendered; a base read at answer time would then strip
+/// the ids of one tree against the root of the next and mint none. So it is read off the disk
+/// exactly once — when the generation that walked those files is built, by
+/// [`StripRoot::resolve`] — and every consumer of that generation's paths carries it forward
+/// with [`StripRoot::pinned`] instead of resolving again. Resolving once is also what keeps a
+/// `canonicalize` of the same root off every node.
+///
+/// A root that cannot be resolved at all — deleted, or never on disk, as a stated root in a
+/// test is — keeps its declared spelling, so such a caller strips exactly as it always did.
+#[derive(Clone, Debug)]
+pub struct StripRoot {
+    /// The declared spelling only when the disk could not improve on it.
+    resolved: PathBuf,
+}
+
+impl StripRoot {
+    /// Read the declared root through the disk, at the moment a generation is built.
+    ///
+    /// The one call that may touch the filesystem for a root, and only whoever establishes a
+    /// file universe may make it: the value it returns is what the universe's ids mean. An
+    /// answer ABOUT that universe takes the base it produced, through [`Self::pinned`].
+    pub fn resolve(root: &Path) -> StripRoot {
+        StripRoot { resolved: std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()) }
+    }
+
+    /// The base a generation already resolved, carried to whoever decodes its ids.
+    pub fn pinned(resolved: &Path) -> StripRoot {
+        StripRoot { resolved: resolved.to_path_buf() }
+    }
+
+    /// The rel the encoder would have minted for `abs`, whichever spelling of the file `abs` is.
+    ///
+    /// The disk is asked FIRST, because the string strip cannot tell a wrong placement from a
+    /// right one. A link INSIDE the root — what a `source.root` that is itself a link produces
+    /// — leaves the declared spelling lexically under the root, so stripping
+    /// `ws/src/Documents/…` against `ws` yields `src/…` where the walk recorded `actual/…`: a
+    /// well-formed id under a directory the graph has no node beneath, which is worse than no
+    /// id at all. That the strip placed a path is therefore no evidence it placed it where the
+    /// encoder did, and only the filesystem can say two spellings are one file.
+    ///
+    /// The strip remains for the paths the disk cannot answer for — a deleted file, or a root
+    /// that was never on disk, as a stated root in a test is. There it strips exactly as it
+    /// always did.
+    ///
+    /// What is asked of the disk here is which FILE `abs` names, never which directory the
+    /// root names: the base was fixed when the generation was built and is not re-read. So the
+    /// generation's own spelling of a file — the walk's, links already resolved — mints the
+    /// generation's own rel for as long as that generation serves, whether or not the workspace
+    /// has been respelled since. Only a caller handing a spelling of its own (a declared path
+    /// through a link) still depends on where that link points now, which is what naming a file
+    /// through a link means.
+    fn rel(&self, abs: &str) -> Option<String> {
+        match std::fs::canonicalize(abs) {
+            Ok(canonical) => workspace_rel_path(canonical.to_str()?, &self.resolved),
+            Err(_) => workspace_rel_path(abs, &self.resolved),
+        }
+    }
+
+    /// The single spelling to hand a consumer that takes one — the row encoder, whose strip
+    /// lives in another crate and stays a plain string operation.
+    fn resolved(&self) -> &Path {
+        &self.resolved
+    }
+}
+
 /// Derive the durable method id for `method_name` in the module at `path`,
 /// without a database. Returns `None` when `path` is not an indexable user
 /// module (forms, commands, non-module files). Best-effort: the id is not
@@ -2337,18 +2436,24 @@ pub(crate) fn workspace_rel_path(abs: &str, root: &Path) -> Option<String> {
 /// `None` when neither form yields a resolvable id (e.g. an absolute path with no root, or a
 /// path not under the root) — a wrong, non-resolving id is worse than no decoration.
 ///
+/// The root arrives ALREADY RESOLVED, as a [`StripRoot`], and it is the base of the GENERATION
+/// whose paths `path` came from — the walk that established those ids, not the disk as it
+/// stands now. Taking it rather than deriving it is what keeps the two halves of one id from
+/// coming from two states of the tree, and it also keeps a `canonicalize` of the same root off
+/// every one of the nodes, hits and findings this is called for.
+///
 /// Distinct from [`method_id_for_path`], which stays module-keyed-only for the graph-enriched
 /// embedding path that deliberately does not enrich path-fallback methods.
 pub fn method_graph_id(
     path: &str,
     method_name: &str,
-    workspace_root: Option<&Path>,
+    workspace_root: Option<&StripRoot>,
 ) -> Option<String> {
     if let Some(key) = module_key_for_path(path) {
         return Some(format!("method/{}/{method_name}", encode_scope(&key)));
     }
     let rel = if Path::new(path).is_absolute() {
-        workspace_rel_path(path, workspace_root?)?
+        workspace_root?.rel(path)?
     } else {
         path.replace('\\', "/").trim_start_matches('/').to_string()
     };
@@ -2367,11 +2472,16 @@ pub fn method_graph_id(
 /// name and none when reached by position. An id that appears and disappears with the way a
 /// client spelled its request is worse than none: it makes two tools disagree about a symbol
 /// they both resolved.
+///
+/// Which is also why the base arrives as a [`StripRoot`] rather than a path to resolve here: a
+/// card and a finding about one method are answered by different tools over the same generation,
+/// and a base each of them read off the disk for itself would let them disagree exactly when the
+/// workspace is spelled through a link that has moved.
 pub fn graph_id_of_method(
     db: &crate::RootDatabaseImpl,
     file: vfs::FileId,
     method_name: &str,
-    workspace_root: Option<&Path>,
+    workspace_root: Option<&StripRoot>,
 ) -> Option<String> {
     // The file's OWN root, not the source root assumed by name: a body may be registered
     // under a root other than the configuration's, and asking the wrong root yields no path
@@ -3438,10 +3548,78 @@ mod tests {
         }
     }
 
+    /// The same parity, over a root that is a LINK to the tree the paths were walked from.
+    ///
+    /// The sibling gate below states its root as `/ws/proj`, a path that is on no disk. Nothing
+    /// resolves it, so declared and canonical coincide there and the two spellings never come
+    /// apart — which is precisely the case this one has to make real. Both encoders take the
+    /// same resolved root, so both mint the rel; either taking the declared one alone would
+    /// mint a basename and the two would disagree about a node they both hold.
+    #[cfg(unix)]
+    #[test]
+    fn build_time_encoder_matches_serve_time_through_a_linked_root() {
+        use hir::graph_index::{GraphIndex, GraphRowEncoder};
+        use hir::ConfigsDatabase;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("ws");
+        std::fs::create_dir_all(real.join("scripts")).unwrap();
+        let linked = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        // The file side is the walk's spelling — links resolved — as it is in production.
+        let walked = real.canonicalize().unwrap().join("scripts/loose.bsl");
+        let walked = walked.to_str().unwrap().to_owned();
+
+        let a = workspace(&[(walked.as_str(), "Процедура Свободный() Экспорт КонецПроцедуры")]);
+        let db = a.database();
+        let graph = db.workspace_call_graph(ROOT);
+        let source_root = db.source_root_input(ROOT).root(db);
+        let file_set = source_root.file_set();
+        let modules: Vec<hir::ModuleId> = source_root
+            .iter()
+            .filter(|&f| hir::is_bsl_source(file_set, f))
+            .map(hir::ModuleId::new)
+            .collect();
+        let index = GraphIndex::build(db, &modules);
+        let paths: rustc_hash::FxHashMap<FileId, String> = source_root
+            .iter()
+            .filter_map(|f| {
+                file_set
+                    .path_for_file(&f)
+                    .and_then(|p| p.as_path().to_str().map(|s| (f, s.to_string())))
+            })
+            .collect();
+
+        let no_objects = hir::graph_index::MdoFiles::default();
+        let strip_root = StripRoot::resolve(&linked);
+        let encoder =
+            GraphRowEncoder::new(&index, &paths, Some(strip_root.resolved()), &no_objects);
+        let ctx = GraphCtx::new(db, ROOT, Some(&strip_root));
+        let mut seen = 0;
+        for node in graph.nodes() {
+            let (build_id, build_addr) = encoder.encode(&node);
+            let (serve_id, serve_addr) = ctx.encode_node(&node);
+            assert_eq!(build_id, serve_id, "id mismatch through the link for {node:?}");
+            assert_eq!(build_addr, serve_addr, "addressable mismatch for {node:?}");
+            if build_id.starts_with("method/") {
+                assert_eq!(
+                    build_id, "method/file/scripts/loose.bsl::Свободный",
+                    "and the id is the rel form, not the basename a declared link would yield",
+                );
+                assert!(build_addr, "which is the addressable one");
+                seen += 1;
+            }
+        }
+        assert!(seen >= 1, "the loose-path method must surface as a node");
+    }
+
     /// Parity for the path-fallback id forms: a file outside the recognised module
     /// layout (`module_key_for_path` → None) encodes to `method/file/<rel>::name`
     /// with a workspace root, or `method/file/<basename>::name` (addressable=false)
     /// without one. Build-time and serve-time encoders must agree in both.
+    ///
+    /// Its root is stated, not staged, so declared and canonical coincide — the case where
+    /// they come apart is [`build_time_encoder_matches_serve_time_through_a_linked_root`].
     #[test]
     fn build_time_encoder_matches_serve_time_path_fallback() {
         use hir::graph_index::{GraphIndex, GraphRowEncoder};
@@ -3475,8 +3653,9 @@ mod tests {
         // fallback (not addressable). Both must match the serve-time encoder.
         for workspace_root in [Some(Path::new("/ws/proj")), None] {
             let no_objects = hir::graph_index::MdoFiles::default();
+            let strip_root = workspace_root.map(StripRoot::resolve);
             let encoder = GraphRowEncoder::new(&index, &paths, workspace_root, &no_objects);
-            let ctx = GraphCtx::new(db, ROOT, workspace_root);
+            let ctx = GraphCtx::new(db, ROOT, strip_root.as_ref());
             let mut seen = 0;
             for node in graph.nodes() {
                 let (build_id, build_addr) = encoder.encode(&node);
@@ -3505,11 +3684,12 @@ mod tests {
             "Процедура Свободный() Экспорт КонецПроцедуры",
         )]);
         let root = Path::new("/ws/proj");
+        let strip_root = StripRoot::resolve(root);
 
         // The durable id the encoder stores for the loose method.
         let db = a.database();
         let graph = db.workspace_call_graph(ROOT);
-        let ctx = GraphCtx::new(db, ROOT, Some(root));
+        let ctx = GraphCtx::new(db, ROOT, Some(&strip_root));
         let encoder_id = graph
             .nodes()
             .find(|n| matches!(n, GraphNode::Method(_)))
@@ -3519,7 +3699,8 @@ mod tests {
 
         // Absolute path → stripped by the root to the encoder's rel.
         assert_eq!(
-            method_graph_id("/ws/proj/scripts/loose.bsl", "Свободный", Some(root)).as_deref(),
+            method_graph_id("/ws/proj/scripts/loose.bsl", "Свободный", Some(&strip_root))
+                .as_deref(),
             Some(encoder_id.as_str()),
         );
         // Already-relative path (search-overlay form) → used directly; root unused.
@@ -3529,7 +3710,7 @@ mod tests {
         );
         // The minted id resolves back to the node (round-trip, not just a string match).
         assert!(
-            a.graph_node(ROOT, Some(root), &encoder_id, GraphDetail::Names).is_ok(),
+            a.graph_node(ROOT, Some(&strip_root), &encoder_id, GraphDetail::Names).is_ok(),
             "minted path-fallback id must resolve"
         );
     }
@@ -3545,7 +3726,8 @@ mod tests {
         ] {
             for root in [Some(Path::new("/ws")), None] {
                 assert_eq!(
-                    method_graph_id(path, "Сложить", root).as_deref(),
+                    method_graph_id(path, "Сложить", root.map(StripRoot::resolve).as_ref())
+                        .as_deref(),
                     Some("method/common/Утилиты/Сложить"),
                 );
             }
@@ -3559,13 +3741,18 @@ mod tests {
 
         // Absolute path under the root → rel form.
         assert_eq!(
-            method_graph_id("/ws/proj/a/b/Module.bsl", "M", Some(root)).as_deref(),
+            method_graph_id("/ws/proj/a/b/Module.bsl", "M", Some(&StripRoot::resolve(root)))
+                .as_deref(),
             Some("method/file/a/b/Module.bsl::M"),
         );
         // Trailing slash on the root is tolerated (matches the encoder's rel).
         assert_eq!(
-            method_graph_id("/ws/proj/a/b/Module.bsl", "M", Some(Path::new("/ws/proj/")))
-                .as_deref(),
+            method_graph_id(
+                "/ws/proj/a/b/Module.bsl",
+                "M",
+                Some(&StripRoot::resolve(Path::new("/ws/proj/"))),
+            )
+            .as_deref(),
             Some("method/file/a/b/Module.bsl::M"),
         );
         // Backslash path is normalised to forward slashes.
@@ -3574,9 +3761,15 @@ mod tests {
             Some("method/file/a/b/Module.bsl::M"),
         );
         // Absolute path NOT under the root → None (never emit a non-resolving id).
-        assert_eq!(method_graph_id("/elsewhere/Module.bsl", "M", Some(root)), None);
+        assert_eq!(
+            method_graph_id("/elsewhere/Module.bsl", "M", Some(&StripRoot::resolve(root))),
+            None
+        );
         // A longer-named sibling that merely shares the prefix string is NOT under the root.
-        assert_eq!(method_graph_id("/ws/project/a/Module.bsl", "M", Some(root)), None);
+        assert_eq!(
+            method_graph_id("/ws/project/a/Module.bsl", "M", Some(&StripRoot::resolve(root))),
+            None
+        );
         // Absolute path with no root → None.
         assert_eq!(method_graph_id("/ws/proj/a/Module.bsl", "M", None), None);
     }
@@ -3597,6 +3790,96 @@ mod tests {
         assert_eq!(workspace_rel_path("/ws/project/a.bsl", Path::new("/ws/proj")), None);
         // The root itself (no rel remainder) → None.
         assert_eq!(workspace_rel_path("/ws/proj", Path::new("/ws/proj")), None);
+    }
+
+    /// A root reached through a link mints the id its canonical spelling mints.
+    ///
+    /// The rel in a path-fallback id is stripped off the walk's own path, which has every link
+    /// resolved. A root declared through a link is therefore a prefix of nothing, the strip
+    /// finds no rel, and the id disappears — leaving a form handler addressable or not
+    /// depending on how the workspace happened to be spelled when the server was started. One
+    /// workspace, one id, whichever spelling names it.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_declared_through_a_link_mints_the_id_its_real_path_mints() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("ws");
+        std::fs::create_dir_all(real.join("Documents/Д/Forms/Ф/Ext/Form")).unwrap();
+        let linked = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+
+        // The path side is never in doubt: it is the walk's spelling, links already resolved.
+        let root = real.canonicalize().expect("the workspace exists");
+        let module =
+            root.join("Documents/Д/Forms/Ф/Ext/Form/Module.bsl").to_string_lossy().into_owned();
+
+        let direct = method_graph_id(&module, "ПриЗаписи", Some(&StripRoot::resolve(&root)));
+        assert_eq!(
+            direct.as_deref(),
+            Some("method/file/Documents/Д/Forms/Ф/Ext/Form/Module.bsl::ПриЗаписи"),
+            "control: the real path has always minted the fallback id",
+        );
+        assert_eq!(
+            method_graph_id(&module, "ПриЗаписи", Some(&StripRoot::resolve(&linked))),
+            direct,
+            "and the link names the same workspace, so it names the same method",
+        );
+    }
+
+    /// One file, two ways to spell it, one id — including when a link lies INSIDE the root.
+    ///
+    /// A `source.root` may itself be a link (`ws/src -> ws/actual`), and then the two spellings
+    /// of one file diverge below the root, not at it: the walk records `actual/…` while the
+    /// search overlay hands back the declared `src/…`. Stripping each against the root it looks
+    /// like a prefix of yields two rels for one file, and the graph holds a node under only one
+    /// of them — so the other is a well-formed id that resolves to nothing, which is worse than
+    /// no id at all.
+    #[cfg(unix)]
+    #[test]
+    fn one_file_reached_by_two_spellings_has_one_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let form = "Documents/Д/Forms/Ф/Ext/Form/Module.bsl";
+        std::fs::create_dir_all(real.join("actual/Documents/Д/Forms/Ф/Ext/Form")).unwrap();
+        std::fs::write(real.join("actual").join(form), "").unwrap();
+        // A link at the root AND a link inside it: `source.root = "src"` is how the second
+        // arrives in a real project.
+        std::os::unix::fs::symlink(real.join("actual"), real.join("src")).unwrap();
+        let ws = dir.path().join("ws");
+        std::os::unix::fs::symlink(&real, &ws).unwrap();
+
+        let root = StripRoot::resolve(&ws);
+        // What the walk records, and therefore what the encoder minted its rel from.
+        let walked = real.canonicalize().unwrap().join("actual").join(form);
+        // What the search overlay resolves a stored key to: the DECLARED spelling.
+        let declared = ws.join("src").join(form);
+
+        let from_walk = method_graph_id(walked.to_str().unwrap(), "ПриЗаписи", Some(&root));
+        assert_eq!(
+            from_walk.as_deref(),
+            Some("method/file/actual/Documents/Д/Forms/Ф/Ext/Form/Module.bsl::ПриЗаписи"),
+            "control: the walked spelling mints the rel the graph holds a node under",
+        );
+        assert_eq!(
+            method_graph_id(declared.to_str().unwrap(), "ПриЗаписи", Some(&root)),
+            from_walk,
+            "and the declared spelling of the same file must name that same node",
+        );
+
+        // A root spelled without a link of its OWN is the case a string strip appears to
+        // handle: `real/src/…` is then lexically under the root, so the strip places it —
+        // under `src/`, where the graph holds nothing. The link that makes the two spellings
+        // differ sits inside the root, and it sits there however the root is spelled.
+        let plain = real.canonicalize().expect("the workspace exists");
+        assert_eq!(
+            method_graph_id(
+                plain.join("src").join(form).to_str().unwrap(),
+                "ПриЗаписи",
+                Some(&StripRoot::resolve(&plain)),
+            ),
+            from_walk,
+            "the link inside the root does not stop being one when the root is spelled plainly",
+        );
     }
 
     #[test]

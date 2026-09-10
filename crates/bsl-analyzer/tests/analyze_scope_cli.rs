@@ -103,6 +103,9 @@ fn git_diff_scope_reports_only_files_changed_from_vendor() {
 fn changed_files_scope_reports_only_the_listed_files() {
     let temp = setup_repo();
 
+    // Named as the caller would: a temporary directory is reached through a symlink on
+    // macOS, and the flag must accept that spelling. Resolving it here would only hide
+    // whether the run does.
     let changed_path = temp.path().join("Changed.bsl");
     let (ok, sarif) = run_analyze(
         temp.path(),

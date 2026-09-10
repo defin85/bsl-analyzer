@@ -266,10 +266,26 @@ fn build_scope(
     }
 
     if let Some(files) = &args.changed_files {
-        return Ok(Some(Arc::new(AnalysisScope::from_whole_files(
-            "changed-files",
-            files.iter().cloned(),
-        ))));
+        // The scope matches by suffix, so a spelling the walk never produces matches
+        // nothing. An absolute path written through a symlinked ancestor is one such
+        // spelling (`/tmp` and `$TMPDIR` on macOS, a linked checkout in CI): the walk
+        // reports the resolved path, and an incremental run would otherwise report
+        // success over a file it never analyzed.
+        //
+        // The resolved spelling is ADDED, not substituted. Resolving in place anchors a
+        // relative entry — the ordinary form, and what `git diff --name-only` prints — at
+        // the process directory, which is not where the file being analyzed usually is;
+        // that entry would then match nothing at all. Both spellings name the same file,
+        // and the run counts walked files in scope rather than scope entries.
+        let mut scope_paths = Vec::with_capacity(files.len());
+        for path in files {
+            scope_paths.push(path.clone());
+            match path.canonicalize() {
+                Ok(resolved) if resolved != *path => scope_paths.push(resolved),
+                _ => {}
+            }
+        }
+        return Ok(Some(Arc::new(AnalysisScope::from_whole_files("changed-files", scope_paths))));
     }
 
     if let Some(base) = config_diff_base {

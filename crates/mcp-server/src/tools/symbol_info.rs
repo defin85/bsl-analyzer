@@ -309,6 +309,26 @@ pub(crate) fn filter_members(
     });
 }
 
+/// Whether this answer is worth one forced rescan and a retry.
+///
+/// The decision is read off the anchor the caller used and the card it produced, and
+/// nowhere else. A request made BY NAME that resolved nothing carries evidence a second
+/// look can check: something on disk may declare that name since the last walk. A
+/// POSITIONAL request carries none — it says only "no symbol stands at these coordinates",
+/// and re-reading the same coordinates says it again. An error is not a miss at all: no
+/// walk turns a malformed request into a card.
+///
+/// Beside the card rather than in the handler, for the same reason as its `references`
+/// namesake: `read()` polls for drift before it computes anything, so an end-to-end answer
+/// may already be a hit with no rescan behind it, and a rule kept where nothing can observe
+/// it is a rule that drifts.
+pub(crate) fn warrants_rescan(
+    symbol: Option<&str>,
+    card: Result<Option<&SymbolInfoCard>, &McpError>,
+) -> bool {
+    symbol.is_some() && matches!(card, Ok(None))
+}
+
 /// Resolve the semantic card on the resident host. Runs inside the resident read lock.
 /// `Ok(None)` means the resident could not resolve the request — the caller then offers graph
 /// candidates rather than a hard error. A malformed positional request is a param error.
@@ -391,7 +411,12 @@ pub(crate) fn resolve_card(
         sections,
         // The graph was built against the resident's workspace root; a form handler's path-fallback
         // graph id must be encoded relative to it (NOT the config root) to resolve its usages.
-        workspace_root: Some(resident.workspace_root().to_path_buf()),
+        // Taken from the resident's own root table, so a card names a method exactly as a finding
+        // about that method does: one generation, one base, whatever the workspace is spelled
+        // through by the time the two requests arrive.
+        workspace_root: Some(ide::StripRoot::pinned(
+            resident.workspace_roots().workspace_canonical(),
+        )),
     };
     Ok(ide::symbol_info(db, &req))
 }
@@ -871,6 +896,45 @@ mod tests {
         }
     }
 
+    /// Which answers earn one forced rescan is decided by the anchor and the card, and the
+    /// list is exhaustive over what this surface serves.
+    ///
+    /// The cell that matters is the positional miss. `Ok(None)` is common to both anchor
+    /// forms, so a predicate written as "any miss" would switch a rescan on for
+    /// `path`+`line`, where a second look at the same coordinates can only repeat the first
+    /// — at the price of a walk of the whole tree.
+    #[test]
+    fn a_rescan_is_earned_by_a_named_miss_and_by_no_other_answer() {
+        let card = method_card();
+        let refused = McpError::invalid_params("'line' is required with 'path'", None);
+
+        assert!(
+            warrants_rescan(Some("МойМодуль.Сложить"), Ok(None)),
+            "a name nothing declares may be a name declared since the last scan",
+        );
+        assert!(
+            !warrants_rescan(None, Ok(None)),
+            "a positional miss says only that no symbol stands at those coordinates, and a \
+             second look at the same coordinates says it again",
+        );
+        assert!(
+            !warrants_rescan(Some("МойМодуль.Сложить"), Ok(Some(&card))),
+            "a card is an answer, not a miss",
+        );
+        assert!(
+            !warrants_rescan(Some("МойМодуль.Сложить"), Err(&refused)),
+            "a refused request is not a resident that fell behind the disk",
+        );
+        assert!(
+            !warrants_rescan(None, Ok(Some(&card))),
+            "a positional request that resolved is an answer too",
+        );
+        assert!(
+            !warrants_rescan(None, Err(&refused)),
+            "and a refused positional request is neither an answer nor a miss",
+        );
+    }
+
     /// The positional request is the one place `symbol_info` takes a path, and a path from a
     /// `search` hit is spelled against the root that owns it. Answered without the root, this
     /// lands on the configuration's module of the same name and describes a symbol the caller
@@ -1293,6 +1357,74 @@ mod tests {
         // silently ship without an envelope.
         assert_eq!(body["freshness"]["source"], "resident");
         assert_eq!(body["freshness"]["completeness"]["reasons"][0]["code"], "index_building");
+    }
+
+    /// И16 where the graph's verdict is an INPUT: a resident miss is answered by the
+    /// platform while the graph has not answered.
+    ///
+    /// The claim used to be gated end to end, by waiting for the resident and hoping the
+    /// graph's own background build had not published yet — two builds racing, and the
+    /// answer decided by how fast the machine was. Here the one thing the claim is ABOUT is
+    /// stated, exactly as the handler states it: whether the graph can answer is the host's
+    /// fact, so it hands `lookup_names` a source that says so. Everything else is live —
+    /// the platform candidate below comes from the real dictionary run over a real
+    /// database, not from a value put there by this test.
+    ///
+    /// Its neighbour above renders a lookup assembled by hand and so pins the ENVELOPE; this
+    /// one pins that the platform still answers when the graph does not, which is the
+    /// regression И16 was written for: `symbol_info` used to answer a resident miss from the
+    /// graph alone and returned an empty list for a platform member the graph never held.
+    #[test]
+    fn a_resident_miss_is_answered_by_the_platform_while_the_graph_is_not_ready() {
+        let roots = stand_roots();
+        // A real workspace behind a real database: the dictionary runs its module and
+        // metadata sources over it, so the platform's answer below is one it had to compete
+        // for rather than the only one on offer.
+        let dir = tempfile::tempdir().unwrap();
+        crate::graph::test_support::sample_workspace(dir.path());
+        let project = crate::graph::ProjectSnapshot::load(dir.path());
+        let files = crate::graph::input::enumerate_bsl_files(&project);
+        let source_root = crate::graph::build_source_root(&files);
+        let loaded = crate::graph::db_for_files(&source_root, &files, &project.configs, None);
+        let analysis = ide::Analysis::from_database(loaded.db);
+        let db = analysis.database();
+
+        // One letter short of `СтрНайти`: a name the platform answers by prefix and nothing
+        // else can hold, so an empty list would mean the platform was not consulted.
+        let source = crate::graph_query::GraphNameSource::absent(ide::ProviderState::NotReady);
+        let query = ide::NameQuery::new("СтрНайт", DEFAULT_CANDIDATE_LIMIT);
+        let found = ide::lookup_names(db, &query, &[&source]);
+        let answer = crate::tools::name_answer::NameAnswer::render(db, Some(&roots), &found);
+        let body = render_not_found("СтрНайт", answer, &stamp(&roots)).structured_content.unwrap();
+
+        assert_eq!(body["resolved"], false, "{body}");
+        let categories: Vec<&str> = body["candidates"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the miss carries candidates: {body}"))
+            .iter()
+            .filter_map(|c| c["category"].as_str())
+            .collect();
+        assert!(
+            categories.contains(&"platform_member"),
+            "the platform answered nothing on a miss: {body}",
+        );
+
+        let graph = body["providers"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the miss names its providers: {body}"))
+            .iter()
+            .find(|p| p["provider"] == "graph")
+            .unwrap_or_else(|| panic!("`graph` is named: {body}"))
+            .clone();
+        assert_eq!(graph["state"], "not_ready", "{body}");
+        let reasons: Vec<&str> = body["freshness"]["completeness"]["reasons"]
+            .as_array()
+            .map(|r| r.iter().filter_map(|r| r["code"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            reasons.contains(&"index_building"),
+            "an unconsulted source makes the emptiness incomplete: {body}",
+        );
     }
 
     #[test]

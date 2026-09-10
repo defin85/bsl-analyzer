@@ -103,9 +103,9 @@ fn partitioned_baseline_reload_reuses_unchanged_arcs_and_observes_every_object()
         broken,
         ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::Error { .. }
     ));
-    let broken_observation = broken.observation();
+    assert!(!broken.moved_since_load(&project), "an untouched set reads the same");
     fs::write(extension_path, valid).unwrap();
-    assert_ne!(broken_observation, broken.observation());
+    assert!(broken.moved_since_load(&project), "the repair has to reach the host");
     assert!(ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::load_reusing(
         &project, &broken,
     )

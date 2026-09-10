@@ -25,12 +25,67 @@ if is_version_only_commit; then
     exit 0
 fi
 
+# Проверяется КОММИТИРУЕМОЕ дерево, а не рабочее: незастейдженные правки снимаются
+# на время проверок, поэтому зелёный хук говорит о том, что уйдёт в историю, а не о
+# том, что сейчас лежит на диске.
+#
+# Снимаются они патчем, а не `git stash pop`: pop сливает три стороны и на правке той
+# же строки, что застейджена, оставляет в дереве маркеры конфликта. Здесь дерево к
+# моменту возврата побайтово равно индексу — тому самому состоянию, из которого патч
+# и был снят, — поэтому наложение не может не примениться.
+#
+# Патч лежит в .git и переживает падение процесса: следующий запуск его найдёт и
+# откажется работать, вместо того чтобы затереть неприменённые правки.
+WORKTREE_PATCH="$(git rev-parse --git-dir)/pre-commit-worktree.patch"
+
+if [ -s "$WORKTREE_PATCH" ]; then
+    echo -e "${RED}❌ Остался неналоженный патч рабочего дерева от прошлого запуска${NC}"
+    echo -e "${YELLOW}Верните правки и удалите файл:${NC}"
+    echo -e "  git apply $WORKTREE_PATCH && rm $WORKTREE_PATCH\n"
+    exit 1
+fi
+
+restore_worktree() {
+    local status=$?
+    if [ -s "$WORKTREE_PATCH" ]; then
+        if git apply --whitespace=nowarn "$WORKTREE_PATCH"; then
+            rm -f "$WORKTREE_PATCH"
+        else
+            echo -e "\n${RED}❌ Рабочее дерево не восстановлено автоматически${NC}"
+            echo -e "${YELLOW}Правки целы в файле, наложите их вручную:${NC}"
+            echo -e "  git apply $WORKTREE_PATCH && rm $WORKTREE_PATCH\n"
+            # Потеря правок важнее исхода проверок: отдать 0 значило бы закоммитить и
+            # оставить пользователя без того, что он не коммитил.
+            exit 1
+        fi
+    else
+        rm -f "$WORKTREE_PATCH"
+    fi
+    exit $status
+}
+trap restore_worktree EXIT
+
+# Только отслеживаемые дорожки: неотслеживаемый файл в коммит не входит, но и трогать
+# его нельзя — он может быть нужен сборке. Это осознанный остаток: проверка видит его
+# наравне с закоммиченным.
+if ! git diff --quiet; then
+    echo -e "${YELLOW}Снимаю незастейдженные правки на время проверок...${NC}"
+    git diff --binary > "$WORKTREE_PATCH"
+    git checkout -- .
+    echo -e "${GREEN}✓ Проверяется то, что будет закоммичено${NC}\n"
+fi
+
 echo -e "${YELLOW}Running pre-commit checks...${NC}\n"
 
-echo -e "${YELLOW}[1/3] Auto-formatting code...${NC}"
-cargo fmt --all
-git add -u
-echo -e "${GREEN}✓ Code formatted and staged${NC}\n"
+# Проверка, а не автоформат: `git add -u` затягивал в коммит каждую изменённую
+# дорожку дерева, из-за чего разбить работу на связные коммиты было нельзя вовсе.
+echo -e "${YELLOW}[1/3] Checking formatting...${NC}"
+if ! cargo fmt --all -- --check; then
+    echo -e "\n${RED}❌ Formatting differs!${NC}"
+    echo -e "${YELLOW}Run: cargo fmt --all — then stage the files you mean to commit${NC}\n"
+    exit 1
+fi
+echo -e "${GREEN}✓ Formatting OK${NC}\n"
 
 echo -e "${YELLOW}[2/3] Running clippy...${NC}"
 if ! cargo clippy --all-targets --all-features -- -D warnings; then

@@ -517,6 +517,117 @@ mod tests {
         }
     }
 
+    /// Build a real database over a staged workspace, so a dictionary answer below is one
+    /// the sources had to compete for rather than the only one on offer.
+    fn dictionary_db(root: &std::path::Path) -> ide::Analysis {
+        let project = crate::graph::ProjectSnapshot::load(root);
+        let files = crate::graph::input::enumerate_bsl_files(&project);
+        let source_root = crate::graph::build_source_root(&files);
+        let loaded = crate::graph::db_for_files(&source_root, &files, &project.configs, None);
+        ide::Analysis::from_database(loaded.db)
+    }
+
+    fn provider_state(body: &Value, provider: &str) -> String {
+        body["providers"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the answer names its providers: {body}"))
+            .iter()
+            .find(|p| p["provider"] == provider)
+            .unwrap_or_else(|| panic!("`{provider}` is named among the sources: {body}"))["state"]
+            .as_str()
+            .unwrap_or_else(|| panic!("`{provider}` carries a state: {body}"))
+            .to_owned()
+    }
+
+    /// И3 where the graph's verdict is an INPUT: a source that could not be consulted is
+    /// named, and the answer says it is partial.
+    ///
+    /// An empty or short list is worth nothing to a consumer who cannot tell a proven zero
+    /// from an index that was still building, so the distinction is the whole claim — and
+    /// gating it on which background build won would be deciding it by how fast the machine
+    /// is. `СтрНайти` is a platform member, which needs no index at all, so the answer is
+    /// non-empty while the graph is absent.
+    #[test]
+    fn an_unconsulted_source_is_named_not_merely_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::graph::test_support::sample_workspace(dir.path());
+        let analysis = dictionary_db(dir.path());
+        let source = crate::graph_query::GraphNameSource::absent(ide::ProviderState::NotReady);
+
+        let (body, completeness) = resolve(
+            analysis.database(),
+            ide::ProviderState::Answered,
+            &source,
+            None,
+            "СтрНайти",
+            DEFAULT_RESOLVE_LIMIT,
+        );
+
+        assert!(
+            !body["candidates"].as_array().is_none_or(Vec::is_empty),
+            "the platform answers without any index: {body}",
+        );
+        assert_eq!(provider_state(&body, "graph"), "not_ready", "{body}");
+        assert_eq!(provider_state(&body, "platform"), "answered", "{body}");
+
+        let reasons = completeness.to_value();
+        let codes: Vec<&str> = reasons["reasons"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a partial answer carries reasons: {reasons}"))
+            .iter()
+            .filter_map(|r| r["code"].as_str())
+            .collect();
+        assert!(
+            codes.contains(&"index_building"),
+            "the answer does not admit it is partial: {reasons}",
+        );
+    }
+
+    /// И4 where the graph's verdict is an INPUT: an empty list is a proven zero only once
+    /// every source has answered.
+    ///
+    /// The same emptiness carries two opposite meanings — "nothing holds this name" and "the
+    /// one store that might have held it was never consulted" — and only the reasons tell
+    /// them apart. A consumer that cannot tell them apart stops looking. The distinction
+    /// cannot be gated on a live server before its graph publishes: waiting for one
+    /// background build and asserting a second has not finished is a bet on which of them is
+    /// faster, not a precondition. Here the graph's verdict is stated by the same call the
+    /// handler makes.
+    #[test]
+    fn an_empty_list_while_a_source_is_unconsulted_is_not_a_proven_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::graph::test_support::sample_workspace(dir.path());
+        let analysis = dictionary_db(dir.path());
+        let source = crate::graph_query::GraphNameSource::absent(ide::ProviderState::NotReady);
+
+        let (body, completeness) = resolve(
+            analysis.database(),
+            ide::ProviderState::Answered,
+            &source,
+            None,
+            "ЗаведомоНесуществующееИмяСимвола",
+            DEFAULT_RESOLVE_LIMIT,
+        );
+
+        let candidates = body["candidates"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the answer carries a candidate list: {body}"));
+        assert!(candidates.is_empty(), "no source holds this name: {body}");
+        assert_eq!(provider_state(&body, "graph"), "not_ready", "{body}");
+
+        let reasons = completeness.to_value();
+        let codes: Vec<&str> = reasons["reasons"]
+            .as_array()
+            .unwrap_or_else(|| panic!("an unconsulted source leaves reasons: {reasons}"))
+            .iter()
+            .filter_map(|r| r["code"].as_str())
+            .collect();
+        assert!(
+            codes.contains(&"index_building"),
+            "an empty list while a source is unconsulted must not read as complete: {reasons}",
+        );
+    }
+
     #[test]
     fn clamp_to_budget_signals_truncation_and_drop() {
         // Fits: untouched, no truncation, budget decremented.

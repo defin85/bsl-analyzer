@@ -69,6 +69,26 @@ impl IndexProgress {
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::Relaxed)
     }
+
+    /// Mark a pass running until the returned guard drops.
+    pub fn begin_pass(self: &Arc<Self>) -> ActivePass {
+        self.active.store(true, Ordering::Relaxed);
+        ActivePass(Arc::clone(self))
+    }
+}
+
+/// Lowers [`IndexProgress::active`] on every way out of an indexing pass.
+///
+/// The flag outgrew its status line: an MCP broker backend stays alive while it is raised,
+/// so a pass that leaves it up on a fence refusal, a store error or a panic pins a
+/// multi-gigabyte resident process for good. A hand-written `store(false)` covers only the
+/// exits somebody remembered; the guard covers the rest.
+pub struct ActivePass(Arc<IndexProgress>);
+
+impl Drop for ActivePass {
+    fn drop(&mut self) {
+        self.0.active.store(false, Ordering::Relaxed);
+    }
 }
 
 #[derive(Default)]
@@ -1196,8 +1216,8 @@ impl SearchEngine {
         let batch_size = self.batch_size;
         let total_batches: usize = tasks.iter().map(|t| t.texts.len().div_ceil(batch_size)).sum();
 
+        let _pass = progress.map(IndexProgress::begin_pass);
         if let Some(p) = &progress {
-            p.active.store(true, Ordering::Relaxed);
             p.total_files.store(tasks.len(), Ordering::Relaxed);
             p.total_chunks.store(total_chunks, Ordering::Relaxed);
             p.total_batches.store(total_batches, Ordering::Relaxed);
@@ -1629,8 +1649,8 @@ impl SearchEngine {
         let total = items.len();
 
         let total_batches = total.div_ceil(batch_size);
+        let _pass = progress.map(IndexProgress::begin_pass);
         if let Some(p) = &progress {
-            p.active.store(true, Ordering::Relaxed);
             p.total_files.store(0, Ordering::Relaxed);
             p.total_chunks.store(total, Ordering::Relaxed);
             p.total_batches.store(total_batches, Ordering::Relaxed);
@@ -2344,8 +2364,8 @@ impl SearchEngine {
         let batch_size = self.batch_size;
         let total_batches = texts.len().div_ceil(batch_size);
 
+        let _pass = progress.map(IndexProgress::begin_pass);
         if let Some(p) = progress {
-            p.active.store(true, Ordering::Relaxed);
             p.total_files.store(1, Ordering::Relaxed);
             p.total_chunks.store(texts.len(), Ordering::Relaxed);
             p.total_batches.store(total_batches, Ordering::Relaxed);
@@ -4500,8 +4520,8 @@ impl SearchEngine {
         }
 
         let total_chunks = documents.len();
+        let _pass = progress.map(IndexProgress::begin_pass);
         if let Some(p) = progress {
-            p.active.store(true, Ordering::Relaxed);
             p.total_files.store(grouped.len(), Ordering::Relaxed);
             p.total_chunks.store(total_chunks, Ordering::Relaxed);
             p.total_batches.store(total_chunks.div_ceil(self.batch_size.max(1)), Ordering::Relaxed);
@@ -4731,10 +4751,43 @@ mod walk_ownership {
 }
 
 #[cfg(test)]
+mod index_progress_ownership {
+    /// `IndexProgress::active` is a process-lifetime signal, not just a status line: the MCP
+    /// broker holds a backend alive while it is raised. A pass that raises it by hand leaks
+    /// that backend the first time it returns early, so the flag goes up only through
+    /// `begin_pass`, whose guard lowers it on every exit — `?`, early `return`, panic.
+    ///
+    /// Counted rather than enumerated, so a pass added later fails here instead of in the
+    /// field. The needle is assembled at run time: spelled out, this gate would match its
+    /// own source and pass for the wrong reason.
+    #[test]
+    fn only_the_guard_raises_the_active_flag() {
+        let source = include_str!("engine.rs");
+        // Test code may drive the flag directly, so the ban covers production only. The cut is
+        // asserted by COUNTING the marker, not by checking what the split returned: `split`
+        // always yields at least one piece, so a renamed or moved marker would silently hand
+        // this gate the whole file — tests included — and it would pass for the wrong reason.
+        let cut = ["\n#[cfg(test)]\n", "mod tests {"].concat();
+        assert_eq!(
+            source.matches(&cut).count(),
+            1,
+            "the production/test cut moved; this gate scans only what it can prove it scanned"
+        );
+        let production = source.split(&cut).next().unwrap_or(source);
+        let raised_by_hand = ["active", ".store(true"].concat();
+        assert_eq!(
+            production.matches(&raised_by_hand).count(),
+            1,
+            "raise IndexProgress::active through begin_pass, so every exit lowers it again"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
-        FenceOutcome, SearchEngine, CONSTRUCTOR_APPLY_ACTIVE, FORCE_VECTOR_REMOVE_ERROR,
-        WORKSPACE_APPLY_BATCH_ROWS,
+        FenceOutcome, IndexProgress, SearchEngine, CONSTRUCTOR_APPLY_ACTIVE,
+        FORCE_VECTOR_REMOVE_ERROR, WORKSPACE_APPLY_BATCH_ROWS,
     };
     use crate::key_carriers::KeyCarrier;
     use crate::ports::{SnapshotCatalog, SnapshotContentStore};
@@ -5345,13 +5398,19 @@ mod tests {
         let refused_batch = dir.path().join("refused-batch.db");
         seed(&refused_batch, 4);
         let mut calls = 0;
+        // The progress flag outlives its status line: a broker backend stays alive while it
+        // is raised, so a refused batch has to lower it again. `raised` is the positive
+        // control — without it "lowered afterwards" would hold on a flag nobody ever raised.
+        let progress = IndexProgress::new();
+        let mut raised = false;
         let result = SearchEngine::embed_pending_chunks_fenced(
             &refused_batch,
             &config,
-            None,
+            Some(&progress),
             None,
             |operation| {
                 calls += 1;
+                raised |= progress.is_active();
                 if calls == 1 {
                     FenceOutcome::Applied(operation())
                 } else {
@@ -5362,6 +5421,8 @@ mod tests {
         .unwrap();
         assert!(matches!(result, FenceOutcome::TransientRefusal));
         assert_eq!(calls, 2);
+        assert!(raised, "the pass never marked itself active; the check below proves nothing");
+        assert!(!progress.is_active(), "a refused batch left the pass marked active");
         assert_eq!(
             Store::open_existing(&refused_batch)
                 .unwrap()

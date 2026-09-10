@@ -98,6 +98,16 @@ pub struct WorkspaceRoots {
     /// resident host) mean this and not the configuration root, which may sit in
     /// a subdirectory.
     workspace: PathBuf,
+    /// The workspace's own spelling with every link resolved, read off the disk ONCE
+    /// when this table was built.
+    ///
+    /// It is what a durable path-keyed id is stripped against: the file universe of the
+    /// generation this table describes is enumerated canonically, so only the canonical
+    /// workspace is a prefix of those paths. Kept here rather than re-read per use
+    /// because it is a fact about THIS generation — a root reached through a link that
+    /// is later retargeted names a different directory, and a base read at answer time
+    /// would then decode ids the generation never minted.
+    workspace_canonical: PathBuf,
     roots: Vec<Root>,
     /// Subtrees inside the roots that a scan must not descend into.
     ///
@@ -119,9 +129,19 @@ pub struct WorkspaceRoots {
 /// drop it". A derived `PartialEq` puts the cache path on both of those, so the same
 /// unrelated difference would force a full root transition in one place and discard a
 /// valid transition in another.
+///
+/// `workspace_canonical` is compared, and it cannot be derived from what already is: a root
+/// is allowed to lie OUTSIDE the workspace and be identified by its absolute spelling
+/// ([`root_id_for`]), so a workspace whose link is retargeted while every registered root
+/// stays put moves no other field here. Two tables that strip their ids against different
+/// directories are not one registration, whatever their roots are spelled like — leaving it
+/// out would let such a pair pass as "the roots did not move" and keep serving a base the
+/// next build would not mint against.
 impl PartialEq for WorkspaceRoots {
     fn eq(&self, other: &Self) -> bool {
-        self.workspace == other.workspace && self.roots == other.roots
+        self.workspace == other.workspace
+            && self.workspace_canonical == other.workspace_canonical
+            && self.roots == other.roots
     }
 }
 
@@ -197,7 +217,15 @@ impl WorkspaceRoots {
             roots.push(Root { id, declared: extension.clone(), canonical });
         }
 
-        (Self { workspace: workspace_root.to_path_buf(), roots, excluded: Vec::new() }, rejected)
+        (
+            Self {
+                workspace: workspace_root.to_path_buf(),
+                workspace_canonical,
+                roots,
+                excluded: Vec::new(),
+            },
+            rejected,
+        )
     }
 
     /// The root a file belongs to and the key it is stored under, or `None` when
@@ -283,8 +311,26 @@ impl WorkspaceRoots {
         Some(root.declared.join(&key.path))
     }
 
+    /// The file a stored key points at, spelled as the WALK reached it.
+    ///
+    /// [`Self::resolve`] is for opening the file, and the declared spelling is what a reader
+    /// opens. This one is for naming it: a durable path-keyed id is the walk's spelling minus
+    /// the workspace, and the walk descended from the canonical roots this table fixed when it
+    /// was built. Asking the disk for the same answer at use time would resolve the DECLARED
+    /// spelling through whatever the links point at now, which is a different file whenever one
+    /// of them has been retargeted — and then the id names a node this generation never held.
+    pub fn resolve_walked(&self, key: &FileKey) -> Option<PathBuf> {
+        let root = self.roots.iter().find(|root| root.id == key.root_id)?;
+        Some(root.canonical.join(&key.path))
+    }
+
     pub fn workspace(&self) -> &Path {
         &self.workspace
+    }
+
+    /// The workspace spelling a durable path-keyed id is stripped against — see the field.
+    pub fn workspace_canonical(&self) -> &Path {
+        &self.workspace_canonical
     }
 
     /// The declared spelling of the configuration root.
@@ -453,6 +499,67 @@ mod tests {
                 path
             })
             .collect()
+    }
+
+    /// The fixture root, spelled canonically.
+    ///
+    /// A temporary directory may itself be reached through a link (`/var` is one to
+    /// `/private/var` on macOS). A fixture that mixes directories that exist with names
+    /// no filesystem can hold would then carry two spellings of one directory: `build`
+    /// canonicalizes what it can reach and keeps the declared spelling of the rest.
+    #[cfg(unix)]
+    fn canonical_root(dir: &tempfile::TempDir) -> PathBuf {
+        std::fs::canonicalize(dir.path()).unwrap()
+    }
+
+    /// Two tables that strip their ids against different directories are not one
+    /// registration, even when every root path is spelled identically in both.
+    ///
+    /// A root may lie outside the workspace and be identified by its absolute spelling, and
+    /// then a workspace link retargeted onto another directory moves nothing else here. What
+    /// it does move is the base every path-keyed id is stripped against, so a comparison that
+    /// missed it would report "the roots did not move" and keep serving a base the next build
+    /// would not mint against.
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_that_resolves_elsewhere_is_another_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let configuration = dirs(&root, &["a/sub/cf"]).remove(0);
+        let workspace = root.join("workspace");
+        std::os::unix::fs::symlink(root.join("a"), &workspace).unwrap();
+        let (before, _) = WorkspaceRoots::build(&workspace, &configuration, &[]);
+
+        std::fs::remove_file(&workspace).unwrap();
+        std::os::unix::fs::symlink(root.join("a/sub"), &workspace).unwrap();
+        let (after, _) = WorkspaceRoots::build(&workspace, &configuration, &[]);
+
+        assert_eq!(
+            before.workspace(),
+            after.workspace(),
+            "control: the workspace is declared by the same path in both",
+        );
+        assert_ne!(
+            before.workspace_canonical(),
+            after.workspace_canonical(),
+            "control: and the link makes that one path name two directories",
+        );
+        assert_ne!(before, after, "so the two tables are not the same registration");
+    }
+
+    /// A directory named by bytes no `str` can hold, created where the filesystem takes
+    /// such a name.
+    ///
+    /// APFS keeps names in valid UTF-8 and refuses anything else with `EILSEQ`, so on
+    /// macOS this directory cannot exist and the path is all there is of it. Attribution
+    /// answers the same either way: `build` falls back to the declared spelling of a path
+    /// it cannot canonicalize, and under a canonical root that spelling IS the canonical
+    /// one.
+    #[cfg(unix)]
+    fn unrepresentable_dir(path: PathBuf) -> PathBuf {
+        assert!(path.to_str().is_none(), "the fixture is about bytes no `str` can carry");
+        let _ = std::fs::create_dir_all(&path);
+        path
     }
 
     /// The attribution of a file that exists only as a path: both spellings are
@@ -661,14 +768,13 @@ mod tests {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
         let dir = tempfile::tempdir().unwrap();
-        let made = dirs(dir.path(), &["cf"]);
-        let first = dir.path().join(OsString::from_vec(vec![b'a', 0x80]));
-        let second = dir.path().join(OsString::from_vec(vec![b'a', 0x81]));
-        std::fs::create_dir(&first).unwrap();
-        std::fs::create_dir(&second).unwrap();
+        let workspace = canonical_root(&dir);
+        let made = dirs(&workspace, &["cf"]);
+        let first = unrepresentable_dir(workspace.join(OsString::from_vec(vec![b'a', 0x80])));
+        let second = unrepresentable_dir(workspace.join(OsString::from_vec(vec![b'a', 0x81])));
 
         let (roots, rejected) =
-            WorkspaceRoots::build(dir.path(), &made[0], &[first.clone(), second.clone()]);
+            WorkspaceRoots::build(&workspace, &made[0], &[first.clone(), second.clone()]);
 
         let ids: Vec<&str> = roots.ids().collect();
         assert_eq!(ids.len(), 2, "the configuration and exactly one of the two: {ids:?}");
@@ -721,7 +827,11 @@ mod tests {
                 WorkspaceRoots::build(dir.path(), &made[0], &[made[1].clone(), made[2].clone()]);
 
             let walked = made[1].join("Linked").join(MODULE);
-            let canonical = made[2].join(MODULE);
+            // Read off the filesystem, as the enumerator reads it: joining onto the
+            // DECLARED root would carry over whatever links lead to the fixture itself
+            // (`/var` → `/private/var` on macOS) and hand `root_of` a spelling that is
+            // not canonical at all, which is the one question this test does not ask.
+            let canonical = std::fs::canonicalize(&made[2]).unwrap().join(MODULE);
             assert_eq!(
                 roots.root_of(&walked, &canonical),
                 Some(FileKey::new("cfe/two", MODULE.to_owned())),
@@ -834,6 +944,17 @@ mod tests {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
+        /// A workspace whose OWN name holds bytes no `str` can carry, holding a
+        /// configuration root and one extension.
+        fn workspace_named_by_bytes(dir: &tempfile::TempDir) -> (PathBuf, Vec<PathBuf>) {
+            let workspace = unrepresentable_dir(
+                canonical_root(dir).join(OsString::from_vec(b"ws\xff".to_vec())),
+            );
+            let made =
+                ["cf", "cfe"].iter().map(|rel| unrepresentable_dir(workspace.join(rel))).collect();
+            (workspace, made)
+        }
+
         /// Below the root the rendering costs nothing, because the stored key is a rendering
         /// too: `key_of` puts the relative path through the same conversion, so the real
         /// bytes and what came back from a string-keyed store name ONE key — the one the row
@@ -865,11 +986,12 @@ mod tests {
         #[test]
         fn a_rendering_inside_a_nested_roots_name_lands_on_the_ancestor() {
             let dir = tempfile::tempdir().unwrap();
-            let made = dirs(dir.path(), &["cf", "ext"]);
-            let inner = made[1].join(OsString::from_vec(b"d\xff".to_vec())).join("e");
-            std::fs::create_dir_all(&inner).unwrap();
+            let workspace = canonical_root(&dir);
+            let made = dirs(&workspace, &["cf", "ext"]);
+            let inner =
+                unrepresentable_dir(made[1].join(OsString::from_vec(b"d\xff".to_vec())).join("e"));
             let (roots, rejected) =
-                WorkspaceRoots::build(dir.path(), &made[0], &[made[1].clone(), inner.clone()]);
+                WorkspaceRoots::build(&workspace, &made[0], &[made[1].clone(), inner.clone()]);
             assert!(rejected.is_empty(), "an extension inside an extension is a root of its own");
 
             let file = inner.join(MODULE);
@@ -895,8 +1017,7 @@ mod tests {
         #[test]
         fn a_path_that_arrives_rendered_belongs_to_no_root() {
             let dir = tempfile::tempdir().unwrap();
-            let workspace = dir.path().join(OsString::from_vec(b"ws\xff".to_vec()));
-            let made = dirs(&workspace, &["cf", "cfe"]);
+            let (workspace, made) = workspace_named_by_bytes(&dir);
             let (roots, _) = WorkspaceRoots::build(&workspace, &made[0], &[made[1].clone()]);
 
             let file = made[1].join(MODULE);
@@ -915,8 +1036,7 @@ mod tests {
         #[test]
         fn the_identifier_of_an_unrepresentable_root_is_still_usable() {
             let dir = tempfile::tempdir().unwrap();
-            let workspace = dir.path().join(OsString::from_vec(b"ws\xff".to_vec()));
-            let made = dirs(&workspace, &["cf", "cfe"]);
+            let (workspace, made) = workspace_named_by_bytes(&dir);
             let (roots, _) = WorkspaceRoots::build(&workspace, &made[0], &[made[1].clone()]);
 
             let key = owner(&roots, &made[1].join(MODULE)).unwrap();

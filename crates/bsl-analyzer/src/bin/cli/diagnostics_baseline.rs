@@ -1635,10 +1635,14 @@ mod tests {
     #[test]
     fn analyze_baseline_partial_scope_resolves_only_completed_files() {
         let dir = tempfile::tempdir().unwrap();
-        let project = project(dir.path(), true);
-        let first = file(dir.path());
+        // The project resolves its root through the filesystem, so a root reached by a symlink
+        // — every temporary directory on macOS — has to be resolved here too, or the relative
+        // paths below are cut against a prefix the project never holds.
+        let root = dir.path().canonicalize().unwrap();
+        let project = project(&root, true);
+        let first = file(&root);
         let mut second = first.clone();
-        second.path = dir.path().join("second.bsl");
+        second.path = root.join("second.bsl");
         second.relative_path = PathBuf::from("second.bsl");
         std::fs::write(&second.path, "x = 1;\n").unwrap();
         apply(

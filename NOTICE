@@ -45,15 +45,20 @@ the working reference:
   * crates/parser/src/grammar/sdbl/  (SDBL grammar)
   * crates/parser/src/grammar/    (BSL grammar layer)
   * crates/lexer/src/lib.rs       (BSL token inventory)
-  * crates/ide-diagnostics/src/utils/preprocessor_symbols.rs
-                                  (preprocessor symbol list; its file
-                                  header named the PREPROC_*_SYMBOL tokens
-                                  of BSLLexer.g4 as the source)
+  * crates/syntax/src/preproc_symbols.rs
+                                  (preprocessor symbol list; the file it
+                                  succeeds,
+                                  crates/ide-diagnostics/src/utils/preprocessor_symbols.rs,
+                                  carried a header naming the
+                                  PREPROC_*_SYMBOL tokens of BSLLexer.g4 as
+                                  the source)
 
 The last path lies outside the parser and lexer crates and was missing
-from this list until 2026-08-21. It is added here because the omission
-was in the record, not in the licensing: ide-diagnostics is a Tier B
-crate for an unrelated reason.
+from this list until 2026-08-21. It is kept here because the omission was
+in the record, not in the licensing. The list itself moved to
+crates/syntax on 2026-09-04, when the four diverging copies of it were
+merged into one registry; the material and its 4.8.1.2 attestation moved
+with it, out of the Tier B crate it used to live in.
 
 Test material is a provenance class of its own. The commit that
 introduced the diagnostic for unknown preprocessor symbols also recorded

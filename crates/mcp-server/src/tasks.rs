@@ -487,10 +487,7 @@ mod tests {
         // that needs the branch switched on at all — and it puts the process back the way
         // it found it: the flag is read per call, and a stray "1" left behind would arm the
         // branch for every later test in this binary regardless of how cargo was run.
-        let _lock = crate::state::test_support::ENV_LOCK
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::state::test_support::env_lock();
         let _flag = crate::state::test_support::EnvVarGuard::set("BSL_MCP_TASKS", "1");
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)

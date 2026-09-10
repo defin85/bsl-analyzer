@@ -59,6 +59,7 @@
 | Клиент                             | Client                         |
 | МобильноеПриложениеКлиент          | MobileAppClient                |
 | МобильноеПриложениеСервер          | MobileAppServer                |
+| МобильныйАвтономныйСервер          | MobileStandaloneServer         |
 | МобильныйКлиент                    | MobileClient                   |
 | НаКлиенте                          | AtClient                       |
 | НаСервере                          | AtServer                       |

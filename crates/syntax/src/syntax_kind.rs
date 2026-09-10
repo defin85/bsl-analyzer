@@ -347,6 +347,13 @@ impl SyntaxKind {
         matches!(self, SyntaxKind::KW_TRUE | SyntaxKind::KW_FALSE)
     }
 
+    /// Вид — инструкция препроцессора.
+    ///
+    /// Разряд закрыт: перечислены все инструкции, включая четыре, законные
+    /// только в расширениях конфигурации. Неучтённый вид не выпадает в другой
+    /// предикат, а остаётся неклассифицированным, и единственный потребитель
+    /// разряда — подсветка — на нём просто ничего не возвращает. Полноту
+    /// держит перебором `the_preprocessor_predicate_covers_every_instruction_kind`.
     pub fn is_preprocessor(self) -> bool {
         matches!(
             self,
@@ -356,6 +363,10 @@ impl SyntaxKind {
                 | SyntaxKind::PRE_END_IF
                 | SyntaxKind::PRE_REGION
                 | SyntaxKind::PRE_END_REGION
+                | SyntaxKind::PRE_INSERT
+                | SyntaxKind::PRE_END_INSERT
+                | SyntaxKind::PRE_DELETE
+                | SyntaxKind::PRE_END_DELETE
         )
     }
 
