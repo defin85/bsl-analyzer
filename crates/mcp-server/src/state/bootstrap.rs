@@ -140,26 +140,44 @@ impl ReferenceSearchState {
                 if state.stopped.load(Ordering::Acquire) {
                     return;
                 }
-                let mut lifecycle =
-                    state.lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 match initialization {
                     Ok(engine) => {
                         let status = SharedState::semantic_runtime_status_for_mode(
                             &engine,
                             &WorkspaceSearchMode::SqliteLocal,
                         );
-                        if let Ok(mut slot) = state.engine.lock() {
-                            *slot = Some(engine);
+                        match state.engine.lock() {
+                            Ok(mut slot) => {
+                                let mut lifecycle = state
+                                    .lifecycle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                *slot = Some(engine);
+                                SharedState::set_semantic_runtime_status(
+                                    &state.semantic_runtime,
+                                    status,
+                                );
+                                *lifecycle = ReferenceSearchLifecycle::Ready;
+                            }
+                            Err(_) => {
+                                *state
+                                    .lifecycle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    ReferenceSearchLifecycle::Failed {
+                                        message: "reference engine publication failed".to_owned(),
+                                        reason_code: "publication_failed".to_owned(),
+                                    };
+                            }
                         }
-                        SharedState::set_semantic_runtime_status(&state.semantic_runtime, status);
-                        *lifecycle = ReferenceSearchLifecycle::Ready;
                     }
                     Err((message, reason_code)) => {
                         SharedState::set_semantic_runtime_status(
                             &state.semantic_runtime,
                             SemanticRuntimeStatus::Failed(message.clone()),
                         );
-                        *lifecycle = ReferenceSearchLifecycle::Failed { message, reason_code };
+                        *state.lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            ReferenceSearchLifecycle::Failed { message, reason_code };
                     }
                 }
             },
@@ -174,6 +192,26 @@ impl ReferenceSearchState {
                         message: error.to_string(),
                         reason_code: "worker_spawn_failed".to_owned(),
                     };
+            }
+        }
+    }
+
+    pub(crate) fn indexing_snapshot(&self) -> crate::indexing::Target {
+        use crate::indexing::{Kind, Reason, State, Target};
+        if self.stopped.load(Ordering::Acquire) {
+            return Target::new(Kind::Reference, State::Cancelled, Some(Reason::Cancelled));
+        }
+        let Ok(lifecycle) = self.lifecycle.try_lock() else {
+            return Target::unknown(Kind::Reference);
+        };
+        match &*lifecycle {
+            ReferenceSearchLifecycle::Uninitialized => {
+                Target::new(Kind::Reference, State::Waiting, Some(Reason::Initializing))
+            }
+            ReferenceSearchLifecycle::Loading => Target::new(Kind::Reference, State::Running, None),
+            ReferenceSearchLifecycle::Ready => Target::new(Kind::Reference, State::Ready, None),
+            ReferenceSearchLifecycle::Failed { .. } => {
+                Target::new(Kind::Reference, State::Failed, Some(Reason::NativeFailure))
             }
         }
     }
@@ -1517,8 +1555,14 @@ impl SharedState {
 
             // Schedule the background pass only when chunks actually lack vectors. A warm
             // restart has none pending, so it stays `Ready` with no transient downgrade.
-            let code_chunks = engine.chunk_count().unwrap_or(0);
-            let code_embeddings = engine.embedding_count_by_collection("code").unwrap_or(0);
+            let chunks_result = engine.chunk_count();
+            let embeddings_result = engine.embedding_count_by_collection("code");
+            engine.observe_semantic_boot_coverage(
+                chunks_result.as_ref().ok().copied(),
+                embeddings_result.as_ref().ok().copied(),
+            );
+            let code_chunks = chunks_result.unwrap_or(0);
+            let code_embeddings = embeddings_result.unwrap_or(0);
             let pending_embed = (code_chunks > code_embeddings)
                 .then(Self::embedding_config)
                 .flatten()
@@ -2914,6 +2958,33 @@ mod tests {
         state.shutdown();
         assert!(state.worker.lock().unwrap().is_none());
         assert!(state.engine.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn indexing_owner_lifecycles_reference_publication_failure() {
+        let _env = env_lock();
+        let dir = tempdir().unwrap();
+        let _cache = EnvVarGuard::set("XDG_CACHE_HOME", dir.path().to_str().unwrap());
+        let _url = EnvVarGuard::unset("EMBEDDING_URL");
+        let _model = EnvVarGuard::unset("EMBEDDING_MODEL");
+        let state = super::ReferenceSearchState::new(None);
+        let engine = state.engine.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = engine.lock().unwrap();
+            panic!("refuse engine publication");
+        })
+        .join();
+        state.ensure_loading();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while state.loading() {
+            assert!(std::time::Instant::now() < deadline, "reference publication deadline");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            matches!(state.lifecycle(), super::ReferenceSearchLifecycle::Failed { reason_code, .. } if reason_code == "publication_failed")
+        );
+        assert_eq!(state.indexing_snapshot().state, crate::indexing::State::Failed);
+        state.shutdown();
     }
 
     #[test]

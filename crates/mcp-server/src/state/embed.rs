@@ -79,11 +79,18 @@ impl EmbedFlight {
 
     /// End of a pass iteration. `true` = a rerun was requested (keep the claim, loop again);
     /// `false` = none, so the claim is released under the same lock (no wakeup can be lost).
+    #[cfg(test)]
     fn finish_pass(&self) -> bool {
+        self.finish_pass_with(|| {})
+    }
+
+    fn finish_pass_with(&self, publish: impl FnOnce()) -> bool {
         let mut st = self.lock();
         if st.rerun_pending {
             true
         } else {
+            // Publish before releasing the claim: a new owner must never be overwritten.
+            publish();
             self.set_in_flight(&mut st, false);
             false
         }
@@ -1083,6 +1090,7 @@ impl SharedState {
             return;
         }
 
+        let progress_pass = index_progress.begin_pass();
         Self::set_semantic_runtime_status(&semantic_runtime, SemanticRuntimeStatus::Indexing);
         // Clone the handles the thread owns; the originals stay behind for the spawn-error path.
         let engine = Arc::clone(&engine);
@@ -1109,6 +1117,7 @@ impl SharedState {
                     // Restore the flight claim on any abnormal exit; a clean release calls
                     // `disarm()` first so this never stomps a later owner that already re-claimed.
                     let mut claim_guard = EmbedClaimGuard::new(Arc::clone(&flight));
+                    let mut progress_pass = progress_pass;
                     // Restore the runtime status on any abnormal exit so it never sticks `Indexing`.
                     let mut status_guard = EmbedStatusGuard::new(Arc::clone(&runtime), worker_record);
                     #[cfg(test)]
@@ -1135,11 +1144,12 @@ impl SharedState {
                         if FORCE_EMBED_PASS_PANIC.load(Ordering::SeqCst) {
                             panic!("forced embedding pass panic");
                         }
+                        let publication_epoch = engine.lock().ok().and_then(|guard| guard.as_ref().map(|engine| engine.semantic_index_qualification().epoch));
                         let mut retry_refusal = false;
-                        match SearchEngine::embed_pending_chunks_fenced_retrying(
+                        match SearchEngine::embed_pending_chunks_fenced_retrying_owned(
                             &db_path,
                             &config,
-                            Some(&index_progress),
+                            Some(&progress_pass.token()),
                             Some(&keep_running),
                             |operation| {
                                 #[cfg(test)]
@@ -1200,6 +1210,9 @@ impl SharedState {
                                                 engine.set_vector_index(
                                                     prepared.take().expect("prepared index exists"),
                                                 );
+                                                if index_progress.snapshot().is_some_and(|sample| sample.state == bsl_search::IndexPassState::Running) {
+                                                    if let Some(epoch) = publication_epoch { engine.observe_semantic_publication(epoch); }
+                                                }
                                                 Ok::<_, std::convert::Infallible>(())
                                             },
                                         ),
@@ -1242,8 +1255,9 @@ impl SharedState {
                                     crate::workspace_lease::LeaseOperationOutcome::TransientRefusal => {
                                         retry_refusal = true;
                                     }
-                                    crate::workspace_lease::LeaseOperationOutcome::Superseded
-                                    | crate::workspace_lease::LeaseOperationOutcome::Released => {
+                                    outcome @ (crate::workspace_lease::LeaseOperationOutcome::Superseded
+                                    | crate::workspace_lease::LeaseOperationOutcome::Released) => {
+                                        progress_pass.finish(if matches!(outcome, crate::workspace_lease::LeaseOperationOutcome::Superseded) { bsl_search::IndexPassState::Superseded } else { bsl_search::IndexPassState::Cancelled });
                                         Self::set_semantic_runtime_status(
                                             &runtime,
                                             SemanticRuntimeStatus::Failed(
@@ -1271,10 +1285,9 @@ impl SharedState {
                             Ok(bsl_search::FenceOutcome::TransientRefusal) => {
                                 retry_refusal = true;
                             }
-                            Ok(
-                                bsl_search::FenceOutcome::Superseded
-                                | bsl_search::FenceOutcome::Released,
-                            ) => {
+                            Ok(outcome @ (bsl_search::FenceOutcome::Superseded
+                                | bsl_search::FenceOutcome::Released)) => {
+                                progress_pass.finish(if matches!(outcome, bsl_search::FenceOutcome::Superseded) { bsl_search::IndexPassState::Superseded } else { bsl_search::IndexPassState::Cancelled });
                                 Self::set_semantic_runtime_status(
                                     &runtime,
                                     SemanticRuntimeStatus::Failed(
@@ -1319,14 +1332,19 @@ impl SharedState {
                             publish_retry.complete();
                             None
                         };
-                        if !flight.finish_pass() {
+                        if !flight.finish_pass_with(|| {
+                            progress_pass.finish(bsl_search::IndexPassState::Ready);
+                            Self::set_semantic_runtime_status(&runtime, SemanticRuntimeStatus::Ready);
+                        }) {
                             // No rerun requested → the claim was released under the flight lock.
                             claim_guard.disarm();
-                            Self::set_semantic_runtime_status(&runtime, SemanticRuntimeStatus::Ready);
                             status_guard.finish(LifecycleOutcome::Completed);
                             tracing::info!("background embedding pass complete; semantic index live");
                             return;
                         }
+                        // A rerun has a new attempt identity; prior counters cannot restart in-place.
+                        progress_pass.finish(bsl_search::IndexPassState::Waiting);
+                        progress_pass = index_progress.begin_pass();
                         // A rerun was requested during the pass; loop again for its NULL chunks.
                         if let Some(delay) = retry_wait {
                             std::thread::sleep(delay);
@@ -1353,6 +1371,8 @@ impl SharedState {
 
 #[cfg(test)]
 mod flight_mirror_ownership {
+    use super::EmbedFlight;
+    use bsl_search::IndexProgress;
     /// The mirror exists so the broker can read the claim without waiting, and it is only
     /// trustworthy while it is written under the same lock as the field. `set_in_flight` is
     /// the one place that can do that safely, so a second hand-written store is a defect by
@@ -1360,6 +1380,28 @@ mod flight_mirror_ownership {
     ///
     /// The needle is assembled at run time: spelled out, it would match this gate's own
     /// source and pass for the wrong reason.
+    #[test]
+    fn indexing_pass_publication_precedes_claim_release() {
+        let flight = EmbedFlight::new();
+        let progress = IndexProgress::new();
+        assert!(flight.claim());
+        flight.begin_pass();
+        let mut pass = progress.begin_pass();
+        pass.token().phase(bsl_search::IndexPhase::Persisting);
+        assert!(!flight.finish_pass_with(|| {
+            assert!(flight.is_in_flight());
+            assert!(progress.is_active());
+            pass.finish(bsl_search::IndexPassState::Ready);
+        }));
+        assert!(!flight.is_in_flight());
+        assert_eq!(progress.snapshot().unwrap().state, bsl_search::IndexPassState::Ready);
+        assert!(flight.claim());
+        flight.begin_pass();
+        assert!(!flight.claim());
+        assert!(flight.finish_pass_with(|| panic!("rerun cannot publish ready")));
+        flight.release();
+    }
+
     #[test]
     fn only_one_writer_publishes_the_claim_mirror() {
         let source = include_str!("embed.rs");

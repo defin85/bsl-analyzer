@@ -44,9 +44,10 @@ pub use domain::{
 pub use embedder::{Embedder, EmbedderConfig};
 pub use engine::{
     FenceOutcome, FtsIngest, IndexProgress, OverlayRetrySignals, ReferenceCollectionReplaceOutcome,
-    SearchConfig, SearchEngine, SearchHit, ValidatedWorkspaceOverlayPublication,
-    ValidatedWorkspaceRootsTransitionPlan, WorkspaceRootsTransitionOutcome,
-    WorkspaceRootsTransitionPlan, WorkspaceRootsTransitionSeed, WORKSPACE_APPLY_BATCH_ROWS,
+    SearchConfig, SearchEngine, SearchHit, SemanticIndexQualification,
+    ValidatedWorkspaceOverlayPublication, ValidatedWorkspaceRootsTransitionPlan,
+    WorkspaceRootsTransitionOutcome, WorkspaceRootsTransitionPlan, WorkspaceRootsTransitionSeed,
+    WORKSPACE_APPLY_BATCH_ROWS,
 };
 pub use error::SearchError;
 pub use error::SCHEMA_VERSION_CURRENT;
@@ -55,8 +56,8 @@ pub use external_baseline::ExternalBaselineAdapter;
 pub use external_baseline::{
     BaselineCollectionRecord, BaselineEmbeddingCoverageRecord, BaselineEmbeddingModelRecord,
     BaselineFileObjectDetails, BaselineFileObjectRecord, BaselineFileObjectReference,
-    BaselineGcReport, BaselineSnapshotDetails, BaselineSnapshotRecord, SemanticPublishPhase,
-    SemanticPublishProgress,
+    BaselineGcReport, BaselineSemanticPublication, BaselineSnapshotDetails, BaselineSnapshotRecord,
+    SemanticPublishPhase, SemanticPublishProgress,
 };
 pub use fingerprint::{fingerprint_documents, fingerprint_indexed_documents};
 pub use hybrid::{fuse_smart, FusedHit, Modality};
@@ -85,4 +86,9 @@ pub use workspace_overlay::{
 };
 pub use workspace_roots::{
     FileKey, RejectedRoot, Rejection, WorkspaceRoots, CONFIGURATION_ROOT_ID,
+};
+
+mod progress;
+pub use progress::{
+    ActivePass, IndexCounters, IndexPassState, IndexPassToken, IndexPhase, IndexProgressSnapshot,
 };

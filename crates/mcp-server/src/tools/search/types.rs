@@ -25,7 +25,7 @@ pub(super) const HYBRID_FETCH_MULTIPLIER: usize = 2;
 /// per code hit and, for `search_code`, a `freshness` envelope. The legacy 1-based
 /// `line_start`/`line_end` are untouched. The number is shared with the `reference` profile's
 /// documentation actions, whose own shape did not change.
-pub(super) const SEARCH_SCHEMA_VERSION: &str = "4";
+pub(super) const SEARCH_SCHEMA_VERSION: &str = "5";
 
 #[derive(JsonSchema, Serialize)]
 #[serde(untagged)]
@@ -51,6 +51,7 @@ enum SearchOutput {
         schema_version: StatusSchemaVersion,
         profile: SearchProfile,
         state: SearchState,
+        indexing: crate::indexing::Indexing,
     },
 }
 
@@ -58,6 +59,7 @@ enum SearchOutput {
 struct SearchHits<A> {
     action: A,
     schema_version: SearchSchemaVersion,
+    indexing: crate::indexing::Indexing,
     hits: Vec<Value>,
     shown: usize,
     total: usize,
@@ -71,6 +73,7 @@ struct SearchHits<A> {
 struct SearchNotReady<A> {
     action: A,
     schema_version: SearchSchemaVersion,
+    indexing: crate::indexing::Indexing,
     status: NotReadyStatus,
     retry_after_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -95,9 +98,9 @@ const_enum!(FindDocsAction, FindDocs, "find_docs");
 const_enum!(SearchDocsAction, SearchDocs, "search_docs");
 const_enum!(ListPlatformAction, ListPlatform, "list_platform");
 const_enum!(StatusAction, Status, "status");
-const_enum!(SearchSchemaVersion, V4, "4");
+const_enum!(SearchSchemaVersion, V5, "5");
 const_enum!(ListPlatformSchemaVersion, V1, "1");
-const_enum!(StatusSchemaVersion, V1, "1");
+const_enum!(StatusSchemaVersion, V2, "2");
 const_enum!(NotReadyStatus, NotReady, "not_ready");
 
 #[derive(JsonSchema, Serialize)]
