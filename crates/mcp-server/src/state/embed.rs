@@ -1420,7 +1420,7 @@ mod tests {
                 }
             }
         }
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let mock = spawn_mock_embedding_server(vec![1.0, 0.0, 0.0]);
         let _env = mock_embedding_env(&mock);
         let records = Arc::new(Mutex::new(Vec::new()));
@@ -3521,7 +3521,7 @@ mod tests {
 
     #[test]
     fn failed_typed_preflight_makes_zero_network_calls() {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let _reset = ResetEmbeddingRefusals;
         let (server, calls) = spawn_counting_embedding_server();
         let dir = tempdir().unwrap();
@@ -3541,7 +3541,7 @@ mod tests {
 
     #[test]
     fn prepared_vectors_survive_transient_publish_without_second_call() {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let _reset = ResetEmbeddingRefusals;
         let (server, calls) = spawn_counting_embedding_server();
         let dir = tempdir().unwrap();
@@ -3563,7 +3563,7 @@ mod tests {
 
     #[test]
     fn publication_deadline_moves_runtime_to_failed() {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let _reset = ResetEmbeddingRefusals;
         let (server, _) = spawn_counting_embedding_server();
         let dir = tempdir().unwrap();
