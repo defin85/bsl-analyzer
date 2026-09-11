@@ -190,3 +190,19 @@ CI for this follow-up remain pending.
   withheld; the two positive controls release the lock and still require `answered` afterward.
   All six `name_dictionary` transport tests passed with the deterministic fixture. Production
   behavior is unchanged. Windows CI explicitly runs this suite to verify its lock behavior too.
+
+## 2026-09-11 Maintainer Rebase
+
+The user approved rebasing and updating PR #119 onto current `upstream/develop`.
+The original head `03fcb358f591ffdc8b791550de245f5966b508de` is retained at
+`backup/pr119-before-rebase-20260911`; the new base is
+`7133432d276d7fb1f5e21168e0cc59ff7f8b861e` (v0.2.79).
+Work takes place in a separate worktree, preserving PR #142 and unrelated local changes.
+
+The name-dictionary conflict keeps upstream provider-identity assertions and the
+held-lease fixture, including both publication-after-release controls. Four embedding
+tests use upstream's existing `env_lock()` helper. Three diagnostics helpers have the
+same Unix gate as their only caller. The selective baseline LSP fixture publishes
+complete snapshots atomically, avoiding the intermediate empty-file error epoch already
+reproduced and fixed during PR #142 verification. Production scope is unchanged.
+Validation of this rebased tree follows; previous dated results are historical evidence.

@@ -3392,7 +3392,7 @@ mod tests {
 
     #[test]
     fn failed_typed_preflight_makes_zero_network_calls() {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let _reset = ResetEmbeddingRefusals;
         let (server, calls) = spawn_counting_embedding_server();
         let dir = tempdir().unwrap();
@@ -3412,7 +3412,7 @@ mod tests {
 
     #[test]
     fn prepared_vectors_survive_transient_publish_without_second_call() {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let _reset = ResetEmbeddingRefusals;
         let (server, calls) = spawn_counting_embedding_server();
         let dir = tempdir().unwrap();
@@ -3436,7 +3436,7 @@ mod tests {
     fn prepared_index_survives_transient_swap_without_rebuild() {
         use super::EmbedFencePoint;
 
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         for request_rerun in [false, true] {
             let _reset = ResetEmbeddingRefusals;
             let (server, calls) = spawn_counting_embedding_server();
@@ -3512,7 +3512,7 @@ mod tests {
 
     #[test]
     fn publication_deadline_moves_runtime_to_failed() {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = env_lock();
         let _reset = ResetEmbeddingRefusals;
         let (server, _) = spawn_counting_embedding_server();
         let dir = tempdir().unwrap();
