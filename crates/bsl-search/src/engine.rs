@@ -117,6 +117,7 @@ pub struct SearchHit {
 pub struct ReferenceCollectionReplaceOutcome {
     pub committed_fingerprint: String,
     pub written: bool,
+    pub embedding_failure: Option<crate::EmbeddingFailure>,
 }
 
 /// Host-neutral outcome of admitting one shared-store mutation through an ownership fence.
@@ -567,6 +568,7 @@ impl SearchEngine {
         ) -> FenceOutcome<Result<(), SearchError>>,
     {
         let SearchConfig { embedder: embedder_config, execution } = config;
+        embedder_config.validate()?;
         let store = match Self::open_store_fenced(db_path, "semantic", &mut apply)? {
             FenceOutcome::Applied(store) => store,
             FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
@@ -1034,6 +1036,7 @@ impl SearchEngine {
         ) -> FenceOutcome<Result<(), SearchError>>,
     {
         let SearchConfig { embedder: embedder_config, execution } = config;
+        embedder_config.validate()?;
         let store = match Self::open_store_fenced(db_path, "semantic_overlay", &mut apply)? {
             FenceOutcome::Applied(store) => store,
             FenceOutcome::TransientRefusal => return Ok(FenceOutcome::TransientRefusal),
@@ -1239,6 +1242,8 @@ impl SearchEngine {
             let graph_contexts: Vec<Option<String>> =
                 docs.iter().map(|d| d.graph_context.clone()).collect();
 
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            let ranges = embedder.batch_ranges(&refs, self.batch_size)?;
             total_chunks += chunks.len();
             tasks.push(FileTask {
                 key: key.clone(),
@@ -1246,6 +1251,7 @@ impl SearchEngine {
                 hash: hash.as_bytes().to_vec(),
                 chunks,
                 texts,
+                ranges,
                 graph_contexts,
             });
         }
@@ -1255,8 +1261,7 @@ impl SearchEngine {
             return Ok(0);
         }
 
-        let batch_size = self.batch_size;
-        let total_batches: usize = tasks.iter().map(|t| t.texts.len().div_ceil(batch_size)).sum();
+        let total_batches: usize = tasks.iter().map(|t| t.ranges.len()).sum();
 
         let _pass = progress.map(IndexProgress::begin_pass);
         if let Some(p) = &progress {
@@ -1284,7 +1289,6 @@ impl SearchEngine {
                 let rx = task_rx.clone();
                 let tx = result_tx.clone();
                 let emb = embedder.clone();
-                let bs = batch_size;
                 let prog = progress.cloned();
 
                 let context = lifecycle_batch.context();
@@ -1293,7 +1297,8 @@ impl SearchEngine {
                         let mut embeddings = Vec::with_capacity(task.texts.len());
                         let mut error = None;
 
-                        for batch in task.texts.chunks(bs) {
+                        for range in &task.ranges {
+                            let batch = &task.texts[range.clone()];
                             let refs: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
                             match emb.embed_batch(&refs) {
                                 Ok(embs) => {
@@ -1338,50 +1343,49 @@ impl SearchEngine {
         });
 
         let mut indexed = 0usize;
-        let mut errors = 0usize;
+        let mut first_error = None;
         while let Ok(result) = result_rx.recv() {
             match result.embeddings {
                 Ok(embeddings) => {
-                    lifecycle::with_reason(result.reason, || self.store.reindex_file_with_context(
+                    if let Err(error) = lifecycle::with_reason(result.reason, || self.store.reindex_file_with_context(
                         &result.key.root_id,
                         &result.key.path,
                         &result.hash,
                         &result.chunks,
                         Some(&embeddings),
                         Some(&result.graph_contexts),
-                    ))?;
+                    )) {
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
                     indexed += 1;
                     debug!(file = %result.key.path, chunks = result.chunks.len(), "file indexed");
                 }
                 Err(e) => {
-                    warn!(file = %result.key.path, "embedding failed after retries, skipping: {e}");
-                    errors += 1;
+                    warn!(file = %result.key.path, "embedding failed after retries: {e}");
+                    first_error.get_or_insert(e);
                 }
             }
         }
 
-        let _ = producer.join();
+        if producer.join().is_err() {
+            first_error.get_or_insert_with(|| crate::EmbeddingFailure::new(crate::EmbeddingFailureCode::EmbeddingFailed).into());
+        }
         for w in workers {
-            let _ = w.join();
+            if w.join().is_err() {
+                first_error.get_or_insert_with(|| crate::EmbeddingFailure::new(crate::EmbeddingFailureCode::EmbeddingFailed).into());
+            }
         }
 
         if let Some(p) = &progress {
             p.active.store(false, Ordering::Relaxed);
         }
 
+        if let Some(error) = first_error { return Err(error); }
         self.index = Self::build_persisted_index(&self.store, self.dim, self.embedder.as_ref())?;
         self.observe_live_index("live_index_replaced", Reason::ExplicitRebuild, Outcome::Completed);
 
-        if errors > 0 {
-            info!(
-                indexed,
-                errors,
-                total_vectors = self.index.len(),
-                "indexing complete with errors"
-            );
-        } else {
-            info!(indexed, total_vectors = self.index.len(), "indexing complete");
-        }
+        info!(indexed, total_vectors = self.index.len(), "indexing complete");
         Ok(indexed)
         });
         let lifecycle_outcome =
@@ -1567,7 +1571,7 @@ impl SearchEngine {
         store: &Store,
         embedder: &Embedder,
         dim: usize,
-        batch_size: usize,
+        ranges: &[std::ops::Range<usize>],
         items: &[(i64, String)],
         progress: Option<&Arc<IndexProgress>>,
         should_continue: Option<&(dyn Fn() -> bool + Sync)>,
@@ -1577,7 +1581,9 @@ impl SearchEngine {
         retry_transient: &mut dyn FnMut() -> bool,
     ) -> Result<(VectorIndex, FenceOutcome<()>), SearchError> {
         let mut embedded = 0usize;
-        for batch in items.chunks(batch_size) {
+        let mut first_error = None;
+        for range in ranges {
+            let batch = &items[range.clone()];
             if should_continue.is_some_and(|keep_going| !keep_going()) {
                 let (_, data) = store.load_all_embeddings_with_generation(dim)?;
                 return Ok((VectorIndex::build(dim, &data)?, FenceOutcome::Released));
@@ -1602,10 +1608,8 @@ impl SearchEngine {
             let embeddings = match embedder.embed_batch(&refs) {
                 Ok(embeddings) => embeddings,
                 Err(error) => {
-                    if let Some(progress) = progress {
-                        progress.active.store(false, Ordering::Relaxed);
-                    }
-                    return Err(error);
+                    first_error = Some(error);
+                    break;
                 }
             };
             if let Some(progress) = progress {
@@ -1639,6 +1643,17 @@ impl SearchEngine {
         }
         let (generation, data) = store.load_all_embeddings_with_generation(dim)?;
         let index = VectorIndex::build(dim, &data)?;
+        if should_continue.is_some_and(|keep_going| !keep_going()) {
+            return Ok((index, FenceOutcome::Released));
+        }
+        if let Some(error) = first_error {
+            let outcome = Self::fenced_value_retrying(apply, || Ok(()), retry_transient)?;
+            return if matches!(outcome, FenceOutcome::Applied(())) {
+                Err(error)
+            } else {
+                Ok((index, outcome))
+            };
+        }
         let persisted = if let Some(mut prepared) =
             Self::prepare_built(store, dim, Some(embedder), &index, generation)
         {
@@ -1682,9 +1697,9 @@ impl SearchEngine {
         mut retry_transient: Option<&mut dyn FnMut() -> bool>,
     ) -> Result<(VectorIndex, FenceOutcome<()>), SearchError> {
         let lifecycle_batch = Batch::new(store.db_path(), Reason::Embedding);
-        let mut embedding_failed = false;
         let mut embedding_skipped = false;
         let lifecycle_result = lifecycle_batch.context().in_scope(|| {
+            embedder.config().validate()?;
             let pending = store.load_pending_embedding_documents("code")?;
             lifecycle_batch.pending(pending.len() as u64);
             if pending.is_empty() {
@@ -1720,7 +1735,9 @@ impl SearchEngine {
                 .collect();
             let total = items.len();
 
-            let total_batches = total.div_ceil(batch_size);
+            let texts: Vec<&str> = items.iter().map(|(_, text)| text.as_str()).collect();
+            let ranges = embedder.batch_ranges(&texts, batch_size)?;
+            let total_batches = ranges.len();
             let _pass = progress.map(IndexProgress::begin_pass);
             if let Some(p) = &progress {
                 p.total_files.store(0, Ordering::Relaxed);
@@ -1738,7 +1755,7 @@ impl SearchEngine {
                     store,
                     embedder,
                     dim,
-                    batch_size,
+                    &ranges,
                     &items,
                     progress,
                     should_continue,
@@ -1792,11 +1809,9 @@ impl SearchEngine {
             drop(result_tx);
 
             let producer = {
-                let batches: Vec<Vec<(i64, String)>> =
-                    items.chunks(batch_size).map(<[(i64, String)]>::to_vec).collect();
                 std::thread::spawn(move || {
-                    for batch in batches {
-                        if task_tx.send(batch).is_err() {
+                    for range in ranges {
+                        if task_tx.send(items[range].to_vec()).is_err() {
                             break;
                         }
                     }
@@ -1805,6 +1820,7 @@ impl SearchEngine {
 
             let mut embedded = 0usize;
             let mut errors = 0usize;
+            let mut first_error = None;
             let mut stopped = None;
             while let Ok(result) = result_rx.recv() {
                 // Asked between batches, never inside one: a pass over a large configuration runs
@@ -1816,7 +1832,16 @@ impl SearchEngine {
                 match result {
                     Ok(pairs) => {
                         let batch_len = pairs.len();
-                        match Self::fenced_value(apply, || store.set_chunk_embeddings(&pairs))? {
+                        let outcome = match Self::fenced_value(apply, || {
+                            store.set_chunk_embeddings(&pairs)
+                        }) {
+                            Ok(outcome) => outcome,
+                            Err(error) => {
+                                first_error.get_or_insert(error);
+                                break;
+                            }
+                        };
+                        match outcome {
                             FenceOutcome::Applied(()) => {}
                             FenceOutcome::TransientRefusal => {
                                 stopped = Some(FenceOutcome::TransientRefusal);
@@ -1834,9 +1859,9 @@ impl SearchEngine {
                         embedded += batch_len;
                     }
                     Err(e) => {
-                        warn!("embedding batch failed after retries, skipping: {e}");
+                        warn!("embedding batch failed after retries: {e}");
                         errors += 1;
-                        embedding_failed = true;
+                        first_error.get_or_insert(e);
                     }
                 }
             }
@@ -1844,9 +1869,19 @@ impl SearchEngine {
             // nobody reads any more would never finish, and the stop path leaves exactly that.
             drop(result_rx);
 
-            let _ = producer.join();
+            if producer.join().is_err() {
+                first_error.get_or_insert_with(|| {
+                    crate::EmbeddingFailure::new(crate::EmbeddingFailureCode::EmbeddingFailed)
+                        .into()
+                });
+            }
             for w in workers {
-                let _ = w.join();
+                if w.join().is_err() {
+                    first_error.get_or_insert_with(|| {
+                        crate::EmbeddingFailure::new(crate::EmbeddingFailureCode::EmbeddingFailed)
+                            .into()
+                    });
+                }
             }
             if let Some(p) = &progress {
                 p.active.store(false, Ordering::Relaxed);
@@ -1869,6 +1904,14 @@ impl SearchEngine {
                 // what it has.
                 warn!(embedded, errors, "embedding pass stopped early; sidecar not persisted");
                 return Ok((index, outcome));
+            }
+            if let Some(error) = first_error {
+                let outcome = Self::fenced_value(apply, || Ok(()))?;
+                return if matches!(outcome, FenceOutcome::Applied(())) {
+                    Err(error)
+                } else {
+                    Ok((index, outcome))
+                };
             }
             let persisted = if let Some(mut prepared) =
                 Self::prepare_built(store, dim, Some(embedder), &index, generation)
@@ -1896,7 +1939,6 @@ impl SearchEngine {
             Ok((index, FenceOutcome::Applied(())))
         });
         let lifecycle_outcome = match &lifecycle_result {
-            Ok((_, FenceOutcome::Applied(()))) if embedding_failed => Outcome::Failed,
             Ok((_, FenceOutcome::Applied(()))) if embedding_skipped => Outcome::Skipped,
             Ok((_, FenceOutcome::Applied(()))) => Outcome::Completed,
             Ok((_, FenceOutcome::TransientRefusal)) => Outcome::Refused,
@@ -2506,6 +2548,7 @@ impl SearchEngine {
             return Ok(ReferenceCollectionReplaceOutcome {
                 committed_fingerprint: stamp,
                 written: false,
+                embedding_failure: None,
             });
         }
         // A corpus that could not be vectorised is still worth publishing lexically: refusing
@@ -2513,11 +2556,16 @@ impl SearchEngine {
         // the published corpus has no vectors — so a later boot with a reachable embedder sees
         // a stale stamp and embeds it then. Without that stamp this degradation would be
         // permanent, which is why it is safe only now.
-        let embeddings = match self.embed_documents(documents, progress) {
-            Ok(embeddings) => embeddings,
+        let (embeddings, embedding_failure) = match self.embed_documents(documents, progress) {
+            Ok(embeddings) => (embeddings, None),
             Err(error) => {
                 warn!(%error, collection, "reference corpus embedding failed, publishing lexical-only");
-                None
+                (
+                    None,
+                    Some(error.embedding_failure().unwrap_or_else(|| {
+                        crate::EmbeddingFailure::new(crate::EmbeddingFailureCode::EmbeddingFailed)
+                    })),
+                )
             }
         };
         let stamp = if embeddings.is_some() {
@@ -2548,6 +2596,7 @@ impl SearchEngine {
         Ok(ReferenceCollectionReplaceOutcome {
             committed_fingerprint: outcome.committed_fingerprint,
             written: outcome.written,
+            embedding_failure,
         })
     }
 
@@ -2558,8 +2607,9 @@ impl SearchEngine {
     ) -> Result<Option<Vec<Vec<f32>>>, SearchError> {
         let Some(embedder) = &self.embedder else { return Ok(None) };
         let texts: Vec<String> = documents.iter().map(|d| d.body.clone()).collect();
-        let batch_size = self.batch_size;
-        let total_batches = texts.len().div_ceil(batch_size);
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let ranges = embedder.batch_ranges(&refs, self.batch_size)?;
+        let total_batches = ranges.len();
 
         let _pass = progress.map(IndexProgress::begin_pass);
         if let Some(p) = progress {
@@ -2571,9 +2621,6 @@ impl SearchEngine {
         }
 
         let concurrency = self.concurrency.min(total_batches.max(1));
-
-        let indexed_batches: Vec<(usize, Vec<String>)> =
-            texts.chunks(batch_size).enumerate().map(|(i, b)| (i, b.to_vec())).collect();
 
         let (task_tx, task_rx) =
             crossbeam_channel::bounded::<(usize, Vec<String>)>(concurrency * 2);
@@ -2597,7 +2644,9 @@ impl SearchEngine {
                             p.done_chunks.fetch_add(batch.len(), Ordering::Relaxed);
                             p.done_batches.fetch_add(1, Ordering::Relaxed);
                         }
-                        let _ = tx.send((idx, result));
+                        if tx.send((idx, result)).is_err() {
+                            break;
+                        }
                     }
                 })
             })
@@ -2607,8 +2656,8 @@ impl SearchEngine {
         drop(result_tx);
 
         let producer = std::thread::spawn(move || {
-            for (idx, batch) in indexed_batches {
-                if task_tx.send((idx, batch)).is_err() {
+            for (idx, range) in ranges.into_iter().enumerate() {
+                if task_tx.send((idx, texts[range].to_vec())).is_err() {
                     break;
                 }
             }
@@ -2631,9 +2680,18 @@ impl SearchEngine {
         }
         drop(result_rx);
 
-        let _ = producer.join();
+        if producer.join().is_err() {
+            failure.get_or_insert_with(|| {
+                crate::EmbeddingFailure::new(crate::EmbeddingFailureCode::EmbeddingFailed).into()
+            });
+        }
         for w in workers {
-            let _ = w.join();
+            if w.join().is_err() {
+                failure.get_or_insert_with(|| {
+                    crate::EmbeddingFailure::new(crate::EmbeddingFailureCode::EmbeddingFailed)
+                        .into()
+                });
+            }
         }
 
         if let Some(p) = progress {
@@ -2644,6 +2702,11 @@ impl SearchEngine {
             return Err(error);
         }
 
+        if results.len() != total_batches {
+            return Err(
+                crate::EmbeddingFailure::new(crate::EmbeddingFailureCode::EmbeddingFailed).into()
+            );
+        }
         results.sort_by_key(|(i, _)| *i);
         let all_embeddings: Vec<Vec<f32>> =
             results.into_iter().flat_map(|(_, embs)| embs).collect();
@@ -4114,6 +4177,7 @@ impl SearchEngine {
         ) -> FenceOutcome<Result<(), SearchError>>,
         R: FnMut() -> bool,
     {
+        embedder_config.validate()?;
         let batch_size = EmbeddingExecutionPolicy::default().batch_size();
         // `open_existing`, not `open`: this standalone pass runs while another daemon may own
         // the workspace, and the migrating constructor could wipe and recreate the owner's
@@ -4205,9 +4269,12 @@ impl SearchEngine {
         }
 
         let pairs: Vec<(&String, &String)> = missing.iter().collect();
+        let inputs: Vec<&str> = pairs.iter().map(|(_, input)| input.as_str()).collect();
+        let ranges = embedder.batch_ranges(&inputs, batch_size)?;
         let mut new_embeddings = HashMap::with_capacity(missing.len());
 
-        for batch in pairs.chunks(batch_size.max(1)) {
+        for range in ranges {
+            let batch = &pairs[range.clone()];
             // Checked between batches, like the collection embed pass: each batch persists
             // vectors to the shared store, and a caller that lost the workspace lease must
             // stop writing over the new owner's rows.
@@ -4220,8 +4287,21 @@ impl SearchEngine {
                 FenceOutcome::Superseded => return Ok(FenceOutcome::Superseded),
                 FenceOutcome::Released => return Ok(FenceOutcome::Released),
             }
-            let inputs: Vec<&str> = batch.iter().map(|(_, input)| input.as_str()).collect();
-            let embeddings = embedder.embed_batch_interactive(&inputs)?;
+            let result = embedder.embed_batch_interactive(&inputs[range]);
+            if !should_continue() {
+                return Ok(FenceOutcome::Released);
+            }
+            let embeddings = match result {
+                Ok(embeddings) => embeddings,
+                Err(error) => {
+                    return match Self::fenced_value_retrying(apply, || Ok(()), retry_transient)? {
+                        FenceOutcome::Applied(()) => Err(error),
+                        FenceOutcome::Released => Ok(FenceOutcome::Released),
+                        FenceOutcome::Superseded => Ok(FenceOutcome::Superseded),
+                        FenceOutcome::TransientRefusal => Ok(FenceOutcome::TransientRefusal),
+                    };
+                }
+            };
 
             let mut batch_persist = HashMap::with_capacity(batch.len());
             for ((embedding_key, _), embedding) in batch.iter().zip(embeddings) {
@@ -4869,8 +4949,7 @@ impl SearchEngine {
             if let Some(p) = progress {
                 p.total_files.store(grouped.len(), Ordering::Relaxed);
                 p.total_chunks.store(total_chunks, Ordering::Relaxed);
-                p.total_batches
-                    .store(total_chunks.div_ceil(self.batch_size.max(1)), Ordering::Relaxed);
+                p.total_batches.store(0, Ordering::Relaxed);
                 p.done_batches.store(0, Ordering::Relaxed);
                 p.done_chunks.store(0, Ordering::Relaxed);
             }
@@ -4911,20 +4990,22 @@ impl SearchEngine {
                         }
                     }
 
-                    let mut cursor = 0usize;
-                    for batch in missing_texts.chunks(self.batch_size.max(1)) {
-                        let refs = batch.iter().map(String::as_str).collect::<Vec<_>>();
-                        let batch_vectors = embedder.embed_batch(&refs)?;
+                    let refs = missing_texts.iter().map(String::as_str).collect::<Vec<_>>();
+                    let ranges = embedder.batch_ranges(&refs, self.batch_size)?;
+                    if let Some(p) = progress {
+                        p.total_batches.fetch_add(ranges.len(), Ordering::Relaxed);
+                    }
+                    for range in ranges {
+                        let batch_vectors = embedder.embed_batch(&refs[range.clone()])?;
                         if let Some(p) = progress {
-                            p.done_chunks.fetch_add(batch.len(), Ordering::Relaxed);
+                            p.done_chunks.fetch_add(range.len(), Ordering::Relaxed);
                             p.done_batches.fetch_add(1, Ordering::Relaxed);
                         }
 
                         for (offset, embedding) in batch_vectors.into_iter().enumerate() {
-                            let idx = missing_indices[cursor + offset];
+                            let idx = missing_indices[range.start + offset];
                             vectors[idx] = embedding;
                         }
-                        cursor += batch.len();
                     }
 
                     Some(vectors)
@@ -5067,6 +5148,7 @@ struct FileTask {
     hash: Vec<u8>,
     chunks: Vec<code_chunk::Chunk>,
     texts: Vec<String>,
+    ranges: Vec<std::ops::Range<usize>>,
     /// Per-chunk graph context (parallel to `chunks`), persisted so a later
     /// reconstruction-from-storage re-embeds with the same enriched text.
     graph_contexts: Vec<Option<String>>,
@@ -5776,6 +5858,7 @@ mod tests {
                 dim: Some(3),
                 api_key: None,
                 provider: None,
+                ..Default::default()
             },
             execution: EmbeddingExecutionPolicy {
                 batch_size: 2,
@@ -5821,6 +5904,7 @@ mod tests {
                 dim: Some(3),
                 api_key: None,
                 provider: None,
+                ..Default::default()
             },
             execution: EmbeddingExecutionPolicy {
                 batch_size: 1,
@@ -6475,6 +6559,7 @@ mod tests {
                 dim: Some(3),
                 api_key: None,
                 provider: None,
+                ..Default::default()
             },
             execution: crate::EmbeddingExecutionPolicy::default(),
         };
@@ -6595,6 +6680,7 @@ mod tests {
                 dim: Some(3),
                 api_key: None,
                 provider: None,
+                ..Default::default()
             },
             execution: crate::EmbeddingExecutionPolicy::default(),
         };
@@ -7025,6 +7111,7 @@ mod tests {
                 dim: Some(3),
                 api_key: None,
                 provider: None,
+                ..Default::default()
             },
             execution: crate::EmbeddingExecutionPolicy::default(),
         };
@@ -7201,6 +7288,7 @@ mod tests {
                 dim: Some(3),
                 api_key: None,
                 provider: None,
+                ..Default::default()
             },
             execution: crate::EmbeddingExecutionPolicy::default(),
         };
@@ -8142,6 +8230,7 @@ mod tests {
                 dim: Some(3),
                 api_key: None,
                 provider: None,
+                ..Default::default()
             },
             execution: crate::EmbeddingExecutionPolicy::default(),
         };

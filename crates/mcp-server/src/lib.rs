@@ -1228,6 +1228,12 @@ impl McpServer {
                 let engine = self.state.search_engine().clone();
                 let semantic_runtime = self.state.semantic_runtime();
                 let workspace_search_mode = self.state.workspace_search_mode();
+                let overlay_failure = self
+                    .state
+                    .overlay_warmup()
+                    .lock()
+                    .ok()
+                    .and_then(|state| state.embedding_failure());
                 // A query landing during the deferred baseline connect gets the retry
                 // envelope, not the gates' "fix config / restart MCP" errors — those are
                 // for resolved-and-broken, this is merely not-resolved-yet. One snapshot
@@ -1239,8 +1245,11 @@ impl McpServer {
                     crate::state::WorkspaceSearchMode::PostgresRemoteOverlay
                 ) && baseline.pending
                 {
-                    return Ok(tools::search::baseline_warming_not_ready(
-                        self.state.index_progress(),
+                    return Ok(tools::search::not_ready_with_failure(
+                        tools::search::baseline_warming_not_ready(self.state.index_progress()),
+                        overlay_failure.or_else(|| {
+                            semantic_runtime.lock().ok().and_then(|state| state.embedding_failure())
+                        }),
                     ));
                 }
                 let configured_baseline = baseline.configured;
@@ -1253,6 +1262,7 @@ impl McpServer {
                         &engine,
                         cancel,
                         &semantic_runtime,
+                        overlay_failure,
                         workspace_search_mode,
                         configured_baseline.as_ref(),
                         external_baseline,
@@ -1278,9 +1288,18 @@ impl McpServer {
             ),
             command @ (SearchCommand::FindDocs { .. } | SearchCommand::SearchDocs { .. }) => {
                 self.state.ensure_reference_loading();
+                let semantic_failure = self
+                    .state
+                    .reference_semantic_runtime()
+                    .lock()
+                    .ok()
+                    .and_then(|state| state.embedding_failure());
                 if let crate::state::ReferenceSearchLifecycle::Failed { message, reason_code } =
                     self.state.reference_lifecycle()
                 {
+                    if let Some(failure) = semantic_failure {
+                        return Err(tools::search::embedding_mcp_error(failure));
+                    }
                     return Err(McpError::internal_error(
                         format!("reference search initialization failed: {message}"),
                         Some(serde_json::json!({"reasonCode": reason_code})),
@@ -1306,6 +1325,7 @@ impl McpServer {
                         tools::search::search_docs(
                             &engine,
                             cancel,
+                            semantic_failure,
                             configured.as_ref(),
                             external,
                             &query,
@@ -1316,6 +1336,7 @@ impl McpServer {
                         tools::search::find_docs(
                             &engine,
                             cancel,
+                            semantic_failure,
                             configured.as_ref(),
                             external,
                             &query,
@@ -2493,7 +2514,7 @@ impl McpServer {
             SearchCommand::Status => {
                 let engine = self.state.search_engine().clone();
                 let progress = self.state.index_progress().clone();
-                let semantic_runtime = self.state.semantic_runtime();
+                let semantic_runtime = self.state.reference_semantic_runtime();
                 let baseline = self.state.baseline_view();
                 // The reference/shared path runs no overlay warmup, so its state is always
                 // `Pending`; the Summary block words this profile as a reference docs index.
@@ -2515,9 +2536,18 @@ impl McpServer {
                 .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?
             }
             command @ (SearchCommand::FindDocs { .. } | SearchCommand::SearchDocs { .. }) => {
+                let semantic_failure = self
+                    .state
+                    .reference_semantic_runtime()
+                    .lock()
+                    .ok()
+                    .and_then(|state| state.embedding_failure());
                 if let crate::state::ReferenceSearchLifecycle::Failed { message, reason_code } =
                     self.state.reference_lifecycle()
                 {
+                    if let Some(failure) = semantic_failure {
+                        return Err(tools::search::embedding_mcp_error(failure));
+                    }
                     return Err(McpError::internal_error(
                         format!("reference search initialization failed: {message}"),
                         Some(serde_json::json!({"reasonCode": reason_code})),
@@ -2543,6 +2573,7 @@ impl McpServer {
                         tools::search::search_docs(
                             &engine,
                             cancel,
+                            semantic_failure,
                             configured_baseline.as_ref(),
                             external_baseline,
                             &query,
@@ -2553,6 +2584,7 @@ impl McpServer {
                         tools::search::find_docs(
                             &engine,
                             cancel,
+                            semantic_failure,
                             configured_baseline.as_ref(),
                             external_baseline,
                             &query,
@@ -4095,3 +4127,6 @@ mod search_cancellation_matrix {
         server.shutdown();
     }
 }
+
+#[cfg(test)]
+mod payload_smoke_tests;
